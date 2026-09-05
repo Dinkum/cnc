@@ -25,7 +25,7 @@ Bring a fresh Ubuntu VPS, Tailscale, and Cloudflare. CNC turns it into a home fo
 - **Cloudflare gated ingress and tailnet gated administration by default.** nginx and UFW restrict public HTTP/S to Cloudflare CIDRs, while the admin interface stays on loopback 
 - **Safe host convergence** that validates your set configuration before applying
 - **Shield (beta)** puts a lean password protecton page in front of any output with just a toggle
-- **Automated container hardening (beta)** observes your app, determines what can be safely locked down, and then applies the changes with your approval. Reccomends Podman flags (Linux capabilities, privledge escalation, seccomp, namespaces, and more). Reccomendations are determined through a mix of runtime profiling and enforcement testing on a disposable clone of the app. 
+- **Automated container hardening (beta)** observes your app, determines what can be safely locked down, and presents recommendations for your review. Reccomends Podman flags (Linux capabilities, privledge escalation, seccomp, namespaces, and more). Reccomendations are determined through a mix of runtime profiling and enforcement testing on a disposable clone of the app. 
 
 ### Operation and Recovery
 
