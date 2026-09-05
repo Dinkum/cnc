@@ -1,0 +1,10 @@
+[Unit]
+Description=cnc auto-size 1-minute metric sample
+
+[Timer]
+OnCalendar=*:0/1
+Persistent=true
+Unit=cnc-auto-size.service
+
+[Install]
+WantedBy=timers.target

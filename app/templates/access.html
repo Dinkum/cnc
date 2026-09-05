@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>cnc | access</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+  <link rel="stylesheet" href="/static/css/app.css?v={{ asset_version }}">
+</head>
+<body>
+  <main class="shell access-shell">
+    <section class="access-stage">
+      <article class="card access-card">
+        <div class="access-hero">
+          <h1>{% if mode == "setup" %}Create access key{% else %}Unlock cnc{% endif %}</h1>
+          <p class="subtle">
+            {% if mode == "setup" %}
+              Create an access key for cnc.
+            {% else %}
+              Enter the access key to continue. Successful sign-in creates a short signed session cookie.
+            {% endif %}
+          </p>
+        </div>
+
+        {% if flash_error %}
+          <section class="banner error">{{ flash_error }}</section>
+        {% endif %}
+        {% if flash_success %}
+          <section class="banner success">{{ flash_success }}</section>
+        {% endif %}
+
+        <div class="access-meta">
+          <span class="summary-pill">session: {{ access_key_settings.ttl_label }}</span>
+        </div>
+
+        <form method="post" action="/access" class="access-form">
+          <input type="hidden" name="next_path" value="{{ next_path }}">
+          <label>Access key
+            <input
+              type="password"
+              name="access_key"
+              value=""
+              autocomplete="{% if mode == 'setup' %}new-password{% else %}current-password{% endif %}"
+              autofocus
+              required
+              spellcheck="false"
+            >
+          </label>
+          {% if mode == "setup" %}
+            <label>Confirm access key
+              <input
+                type="password"
+                name="access_key_confirm"
+                value=""
+                autocomplete="new-password"
+                required
+                spellcheck="false"
+              >
+            </label>
+          {% endif %}
+          <div class="editor-actions">
+            <button type="submit">{% if mode == "setup" %}Create key{% else %}Unlock{% endif %}</button>
+          </div>
+        </form>
+      </article>
+    </section>
+  </main>
+</body>
+</html>

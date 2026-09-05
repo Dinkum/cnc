@@ -1,0 +1,29 @@
+[Unit]
+Description=cnc admin portal
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=root
+Group=root
+UMask=0077
+WorkingDirectory=/var/lib/cnc/current
+EnvironmentFile=-/etc/cnc.env
+ExecStart=/var/lib/cnc/current/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 9090
+Restart=always
+RestartSec=2
+WatchdogSec=45s
+KillMode=mixed
+Delegate=yes
+RuntimeDirectory=cnc
+RuntimeDirectoryMode=0700
+NoNewPrivileges=true
+PrivateTmp=false
+ProtectHome=true
+ProtectSystem=no
+ReadWritePaths=/etc /etc/containers/systemd /usr/local/bin /var/lib/cnc /var/log/cnc
+
+[Install]
+WantedBy=multi-user.target

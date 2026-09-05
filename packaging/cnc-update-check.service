@@ -1,0 +1,18 @@
+[Unit]
+Description=cnc update availability check
+After=network-online.target cnc-admin.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+WorkingDirectory=/var/lib/cnc/current
+EnvironmentFile=-/etc/cnc.env
+ExecStart=/var/lib/cnc/current/.venv/bin/cnc-admin update check
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/etc/cnc.env /var/lib/cnc /var/log/cnc

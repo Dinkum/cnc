@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+backend="${SUDO_USER:-}"
+if [[ -z "${backend}" ]]; then
+  echo "missing backend ssh user" >&2
+  exit 1
+fi
+if [[ ! "${backend}" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]]; then
+  echo "invalid backend ssh user: ${backend}" >&2
+  exit 1
+fi
+
+container="cnc-app-${backend}"
+exec_args=()
+if [[ -n "${SSH_ORIGINAL_COMMAND:-}" || -t 0 ]]; then
+  exec_args+=(-i)
+fi
+if [[ -t 1 ]]; then
+  exec_args+=(-t)
+fi
+
+ssh_client=""
+banner_host="SERVER_IP"
+if [[ -n "${SSH_CONNECTION:-}" ]]; then
+  read -r ssh_client _ssh_client_port banner_host _ssh_server_port <<< "${SSH_CONNECTION}"
+fi
+tty_flag="0"
+if [[ -t 1 ]]; then
+  tty_flag="1"
+fi
+
+session_mode="shell"
+original_args=()
+if [[ -n "${SSH_ORIGINAL_COMMAND:-}" ]]; then
+  session_mode="command"
+  read -r -a original_args <<< "${SSH_ORIGINAL_COMMAND}"
+  if [[ "${original_args[0]:-}" == "llm-help" ]]; then
+    session_mode="llm_help"
+  fi
+fi
+
+# This is deliberately a no-ack local datagram. Audit delivery must never add
+# a process, database query, filesystem write, or waitable dependency to SSH.
+audit_event() {
+  local event="$1"
+  local reason="${2:-}"
+  local exit_code="${3:-}"
+  local duration_ms="${4:-}"
+  {
+    printf 'CNCSSH1\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+      "${event}" "${backend}" "${session_mode}" "${tty_flag}" \
+      "${ssh_client}" "${reason}" "${exit_code}" "${duration_ms}" \
+      >"/dev/udp/127.0.0.1/__CNC_ADMIN_PORT__"
+  } 2>/dev/null || true
+}
+
+if [[ -n "${SSH_ORIGINAL_COMMAND:-}" && "${original_args[0]:-}" == "llm-help" ]]; then
+  json_query=""
+  case "${#original_args[@]}" in
+    1)
+      ;;
+    2)
+      if [[ "${original_args[1]}" == "--json" ]]; then
+        json_query="?json=true"
+      elif [[ "${original_args[1]}" != "${backend}" ]]; then
+        audit_event rejected invalid_llm_help
+        echo "invalid backend llm-help command" >&2
+        exit 64
+      fi
+      ;;
+    3)
+      if [[ "${original_args[1]}" == "${backend}" && "${original_args[2]}" == "--json" ]] || \
+         [[ "${original_args[1]}" == "--json" && "${original_args[2]}" == "${backend}" ]]; then
+        json_query="?json=true"
+      else
+        audit_event rejected invalid_llm_help
+        echo "invalid backend llm-help command" >&2
+        exit 64
+      fi
+      ;;
+    *)
+      audit_event rejected invalid_llm_help
+      echo "invalid backend llm-help command" >&2
+      exit 64
+      ;;
+  esac
+
+  audit_event handoff
+  started_at="${SECONDS}"
+  set +e
+  if [[ -r "/run/cnc/backend-ssh.header" ]]; then
+    llm_help_output="$(
+      /usr/bin/curl -q \
+        --silent \
+        --fail \
+        --noproxy '*' \
+        --proto '=http' \
+        --connect-timeout 0.25 \
+        --max-time 2 \
+        --header @/run/cnc/backend-ssh.header \
+        --header "X-CNC-SSH-Server: ${banner_host}" \
+        "http://127.0.0.1:__CNC_ADMIN_PORT__/internal/backend-ssh/llm-help/${backend}${json_query}" \
+        2>/dev/null
+    )"
+    exit_code=$?
+  else
+    llm_help_output=""
+    exit_code=75
+  fi
+  set -e
+  duration_ms=$(( (SECONDS - started_at) * 1000 ))
+  if (( exit_code == 0 )) && [[ -n "${llm_help_output}" ]]; then
+    printf '%s\n' "${llm_help_output}"
+    audit_event completed "" 0 "${duration_ms}"
+    exit 0
+  fi
+
+  audit_event failed help_unavailable "${exit_code}" "${duration_ms}"
+  printf '%s\n' \
+    "CNC llm-help was unavailable after a bounded 2-second attempt." \
+    "This does not prove the app sandbox is down. Do not retry llm-help in a loop." \
+    "Try one ordinary backend command, or ask the host operator to run:" \
+    "  ssh root@${banner_host} 'cnc-admin app doctor ${backend}'" \
+    >&2
+  exit 75
+fi
+
+audit_event handoff
+if [[ -n "${SSH_ORIGINAL_COMMAND:-}" ]]; then
+  exec /usr/bin/podman exec "${exec_args[@]}" "${container}" /bin/bash -lc "${SSH_ORIGINAL_COMMAND}"
+fi
+
+if [[ -t 0 && -t 1 ]]; then
+  exec /usr/bin/podman exec \
+    "${exec_args[@]}" \
+    --env "CNC_SSH_BACKEND=${backend}" \
+    --env "CNC_SSH_BANNER_HOST=${banner_host}" \
+    "${container}" \
+    /bin/bash -lc 'printf "CNC app shell for %s. Refresh backend guidance with: ssh %s@%s llm-help\n" "$CNC_SSH_BACKEND" "$CNC_SSH_BACKEND" "$CNC_SSH_BANNER_HOST"; exec /bin/bash'
+fi
+
+exec /usr/bin/podman exec "${exec_args[@]}" "${container}" /bin/bash

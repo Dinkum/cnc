@@ -1,0 +1,18 @@
+[Unit]
+Description=cnc Cloudflare CIDR sync
+After=network-online.target cnc-admin.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+WorkingDirectory=/var/lib/cnc/current
+EnvironmentFile=-/etc/cnc.env
+ExecStart=/var/lib/cnc/current/.venv/bin/cnc-admin cloudflare sync
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/etc/cnc.env /etc/nginx/generated /etc/ufw /etc/containers/systemd /etc/systemd/system /usr/local/bin /var/lib/cnc /var/log/cnc

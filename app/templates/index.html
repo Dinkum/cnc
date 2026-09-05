@@ -1,0 +1,1193 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>cnc</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+  <link rel="stylesheet" href="/static/css/app.css?v={{ asset_version }}">
+</head>
+{% set initial_tab = active_tab if (active_tab in ["home", "inputs", "outputs", "settings"] or (active_tab == "routing" and beta_routing)) else "home" %}
+<body data-update-status="{{ status.last_update.status if status.last_update else '' }}" data-initial-tab="{{ initial_tab }}">
+  <main class="shell">
+    <header class="site-header card">
+      <span class="site-wordmark">cnc</span>
+    </header>
+
+    <nav class="tabbar" aria-label="Dashboard tabs">
+      <button class="tab{% if initial_tab == 'home' %} is-active{% endif %}" type="button" data-tab="home" aria-selected="{{ 'true' if initial_tab == 'home' else 'false' }}">home</button>
+      <button class="tab{% if initial_tab == 'inputs' %} is-active{% endif %}" type="button" data-tab="inputs" aria-selected="{{ 'true' if initial_tab == 'inputs' else 'false' }}">inputs</button>
+      {% if beta_routing %}
+        <button class="tab{% if initial_tab == 'routing' %} is-active{% endif %}" type="button" data-tab="routing" aria-selected="{{ 'true' if initial_tab == 'routing' else 'false' }}">routing</button>
+      {% endif %}
+      <button class="tab{% if initial_tab == 'outputs' %} is-active{% endif %}" type="button" data-tab="outputs" aria-selected="{{ 'true' if initial_tab == 'outputs' else 'false' }}">outputs</button>
+      <button class="tab{% if initial_tab == 'settings' %} is-active{% endif %}" type="button" data-tab="settings" aria-selected="{{ 'true' if initial_tab == 'settings' else 'false' }}">settings</button>
+    </nav>
+
+    {% if flash_error %}
+      <section class="banner error">
+        <span>{{ flash_error }}</span>
+        <button type="button" class="banner-close" aria-label="Dismiss message">&times;</button>
+      </section>
+    {% endif %}
+    {% if flash_success %}
+      <section class="banner success">
+        <span>{{ flash_success }}</span>
+        <button type="button" class="banner-close" aria-label="Dismiss message">&times;</button>
+      </section>
+    {% endif %}
+
+    <aside class="floating-save-shell" id="input-save-shell" hidden aria-live="polite">
+      <article class="save-job-card queued floating-save-card" id="input-save-card" data-save-card>
+        <button type="button" class="save-card-close save-card-close-floating" data-save-card-close aria-label="Dismiss save status">&times;</button>
+        <div class="save-narrative">
+          <div class="save-card-top">
+            <strong class="save-action-line" id="input-save-action">Saving input</strong>
+            <div class="save-job-meta" id="input-save-meta"></div>
+          </div>
+          <span class="save-stage-line" id="input-save-stage">Validate input</span>
+          <p id="input-save-note">Checking form and graph rules</p>
+        </div>
+        <div class="save-progress" aria-hidden="true">
+          <span id="input-save-progress-fill"></span>
+        </div>
+      </article>
+    </aside>
+
+    <section class="panel" data-panel="home" data-loaded="{{ '1' if initial_tab == 'home' else '0' }}"{% if initial_tab != "home" %} hidden{% endif %}>
+      <article class="card">
+        <div class="section-head">
+          <h2>Overview</h2>
+        </div>
+        <div class="home-overview-grid">
+          <article class="home-overview-card">
+            <span class="metric-label">Inputs</span>
+            <strong data-home-inputs-enabled>{{ overview.inputs_enabled }}</strong>
+            <p data-home-inputs-total>{{ overview.inputs_total }} configured</p>
+          </article>
+          <article class="home-overview-card">
+            <span class="metric-label">Routing</span>
+            <strong data-home-routes>{{ overview.routes_active }}/{{ overview.routes_total }}</strong>
+            <p>routes currently healthy</p>
+          </article>
+          <article class="home-overview-card">
+            <span class="metric-label">Outputs</span>
+            <strong data-home-backends-enabled>{{ overview.backends_enabled }}</strong>
+            <p data-home-backends-detail>{{ overview.backends_total }} configured</p>
+          </article>
+          <article class="home-overview-card">
+            <span class="metric-label">Isolation</span>
+            <strong class="home-overview-status {{ overview.isolation_status_tone }}" data-home-isolation>{{ overview.isolation_status_label }}</strong>
+          </article>
+        </div>
+        <div class="home-overview-notes">
+          {% if latest_save_job %}
+            <article class="save-job-card home-save-card {{ latest_save_job.tone }}">
+              <div class="compact-card-head">
+                <h3>Most recent save</h3>
+                <span class="pill {{ latest_save_job.tone }}">{{ latest_save_job.status_label }}</span>
+              </div>
+              <div class="compact-save-summary">
+                <strong>{{ latest_save_job.headline }}</strong>
+                <span>{{ latest_save_job.note }}</span>
+              </div>
+              <div class="save-job-meta">
+                {% for item in latest_save_job.meta %}
+                  <span class="summary-pill"><span class="metric-label">{{ item.label }}</span> <span{% if item.raw %} data-local-time="{{ item.raw }}"{% endif %}>{{ item.value }}</span></span>
+                {% endfor %}
+              </div>
+              {% if latest_save_job.change_rows or latest_save_job.phase_rows or latest_save_job.detail_dump %}
+                <details class="save-job-details">
+                  <summary>View save detail</summary>
+                  {% if latest_save_job.change_rows %}
+                    <div class="event-list compact">
+                      {% for item in latest_save_job.change_rows %}
+                        <div class="event-row {{ item.tone }}">
+                          <span class="metric-label">{{ item.label }}</span>
+                          <span class="event-value">{{ item.value }}</span>
+                        </div>
+                      {% endfor %}
+                    </div>
+                  {% endif %}
+                  {% if latest_save_job.phase_rows %}
+                    <div class="event-list compact">
+                      {% for item in latest_save_job.phase_rows %}
+                        <div class="event-row">
+                          <span class="metric-label">{{ item.backend }}</span>
+                          <span class="event-value">{{ item.summary }}</span>
+                        </div>
+                      {% endfor %}
+                    </div>
+                  {% endif %}
+                  {% if latest_save_job.detail_dump %}
+                    <pre>{{ latest_save_job.detail_dump }}</pre>
+                  {% endif %}
+                </details>
+              {% endif %}
+            </article>
+          {% endif %}
+        </div>
+      </article>
+    </section>
+
+    <section class="panel" data-panel="inputs" data-loaded="{{ '1' if initial_tab == 'inputs' else '0' }}"{% if initial_tab != "inputs" %} hidden{% endif %}>
+      <article class="card">
+        <div class="section-head">
+          <h2>Inputs</h2>
+          <div class="section-actions">
+            <span class="summary-pill">{{ overview.inputs_enabled }}/{{ overview.inputs_total }} enabled</span>
+            <button type="button" class="ghost" data-editor-toggle="input-editor">+ add</button>
+          </div>
+        </div>
+
+        <div class="editor" id="input-editor" hidden>
+          <button type="button" class="editor-close-icon" data-editor-close="input-editor" aria-label="Close input editor">&times;</button>
+          <form method="post" action="/ui/inputs" class="editor-grid input-editor-grid" data-input-kind-form data-input-create-form>
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <label>Type
+              <span class="select-wrap">
+                <select name="kind">
+                  <option value="domain" selected>domain</option>
+                  {% if shield_status.server_enabled and shield_status.backend_exists and not shield_status.input_exists %}
+                    <option value="shield">shield</option>
+                  {% endif %}
+                  <option value="tailnet_path">tailnet path</option>
+                  <option value="tailnet_service">tailscale subdomain</option>
+                </select>
+              </span>
+            </label>
+            <label>Value
+              <input
+                name="value"
+                required
+                placeholder="api.example.com"
+                autocomplete="off"
+                autocapitalize="off"
+                spellcheck="false"
+                data-input-value-field
+              >
+            </label>
+            <div class="field-span-2" data-output-attach-form>
+              <span class="picker-label">Attach outputs</span>
+              <div class="output-tags" data-output-tags>
+                <span class="output-tag-empty">No outputs attached</span>
+              </div>
+              {% if backends %}
+                <div class="output-add-wrap" data-output-add-wrap>
+                  <button type="button" class="output-add-btn" data-output-add-toggle>+ Add output</button>
+                  <div class="output-add-dropdown" data-output-dropdown hidden>
+                    <input type="text" class="output-add-search" data-output-search placeholder="Search outputs..." autocomplete="off">
+                    <div class="output-add-list" data-output-list>
+                      {% for backend in backends %}
+                        <button type="button" class="output-add-item" data-output-option data-output-id="{{ backend.id }}" data-output-name="{{ backend.name }}" data-output-kind="{{ backend.kind }}" data-output-enabled="{{ 'enabled' if backend.enabled else 'disabled' }}">
+                          <span class="output-add-item-name">{{ backend.name }}</span>
+                        </button>
+                      {% endfor %}
+                    </div>
+                  </div>
+                </div>
+              {% else %}
+                <div class="picker-empty">No outputs yet &#x2014; add one first.</div>
+              {% endif %}
+            </div>
+            <div class="toggle-group input-enabled-row">
+              <label class="toggle">
+                <input name="enabled" type="checkbox" checked>
+                <span>Enabled</span>
+              </label>
+            </div>
+            <div class="editor-actions">
+              <button type="submit">Create</button>
+              <button type="button" class="ghost" data-editor-close="input-editor">Cancel</button>
+            </div>
+          </form>
+        </div>
+        {% if backends %}
+          <template id="backend-output-option-template">
+            {% for backend in backends %}
+              <button type="button" class="output-add-item" data-output-option data-output-id="{{ backend.id }}" data-output-name="{{ backend.name }}" data-output-kind="{{ backend.kind }}" data-output-enabled="{{ 'enabled' if backend.enabled else 'disabled' }}">
+                <span class="output-add-item-name">{{ backend.name }}</span>
+              </button>
+            {% endfor %}
+          </template>
+        {% endif %}
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Value</th><th>Output</th><th>State</th><th class="th-chevron"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in inputs %}
+                {% set detail = input_details.get(item.id, {}) %}
+                <tr class="click-row row-expand" data-detail-target="input-detail-{{ item.id }}" data-input-row="{{ item.id }}" tabindex="0" role="button" aria-expanded="false">
+                  <td>
+                    <div class="table-primary">
+                      <span class="mono">{{ detail.get("value", item.hostname) }}</span>
+                      {% if detail.get("change_state") == "new" %}
+                        <span class="pill new">new</span>
+                      {% endif %}
+                    </div>
+                  </td>
+                  <td>{{ detail.get("backend_name", "&#x2014;") }}</td>
+                  <td>
+                    <span class="pill {{ 'active' if item.enabled else 'inactive' }}">
+                      {{ "on" if item.enabled else "off" }}
+                    </span>
+                  </td>
+                  <td class="td-chevron"><span class="row-chevron">&#x276F;</span></td>
+                </tr>
+                <tr id="input-detail-{{ item.id }}" class="detail-row" data-input-detail-row="{{ item.id }}" hidden>
+                  <td colspan="4">
+                    <div class="detail-card" data-input-card="{{ item.id }}">
+                      <div class="detail-grid">
+                        <div><span class="label">input state</span><span class="value">{{ detail.get("input_state", "enabled" if item.enabled else "disabled") }}</span></div>
+                        <div><span class="label">type</span><span class="value">{{ detail.get("kind_label", item.kind_label) }}</span></div>
+                        <div><span class="label">created</span><span class="value mono" data-local-time="{{ detail.get("created_at_raw", "") }}">{{ detail.get("created_at", "&#x2014;") }}</span></div>
+                        <div><span class="label">updated</span><span class="value mono" data-local-time="{{ detail.get("updated_at_raw", "") }}">{{ detail.get("updated_at", "&#x2014;") }}</span></div>
+                      </div>
+                      <form method="post" action="/ui/inputs/{{ item.id }}" class="editor-grid input-editor-grid" data-output-attach-form data-input-update-form data-input-id="{{ item.id }}" data-input-update-url="/ui/inputs/{{ item.id }}">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                        <input type="hidden" name="enabled" value="{{ 'true' if item.enabled else 'false' }}">
+                        <div class="field-span-2 input-attachments-card">
+                          <span class="picker-label">Attached outputs</span>
+                          <div class="output-tags" data-output-tags>
+                            {% set attached_ids = detail.get("backend_ids", []) %}
+                            {% for backend in detail.get("backend_tags", []) %}
+                              <span class="output-tag" data-output-id="{{ backend.id }}">
+                                <input name="backend_ids" type="hidden" value="{{ backend.id }}">
+                                <span class="output-tag-name">{{ backend.name }}</span>
+                                <button type="button" class="output-tag-remove" data-remove-output aria-label="Remove {{ backend.name }}">&times;</button>
+                              </span>
+                            {% endfor %}
+                            <span class="output-tag-empty"{% if attached_ids %} hidden{% endif %}>No outputs attached</span>
+                          </div>
+                          {% set attached_count = attached_ids|length %}
+                          <div class="output-add-wrap" data-output-add-wrap>
+                            <button type="button" class="output-add-btn" data-output-add-toggle{% if backends|length <= attached_count %} disabled{% endif %}>+ Add output</button>
+                            <div class="output-add-dropdown" data-output-dropdown hidden>
+                              <input type="text" class="output-add-search" data-output-search placeholder="Search outputs..." autocomplete="off">
+                              <div class="output-add-list" data-output-list data-output-lazy-options="backends" data-attached-ids="{{ attached_ids|join(',') }}"></div>
+                            </div>
+                          </div>
+                        </div>
+                        {% if detail.get("kind") == "domain" %}
+                          <div
+                            class="field-span-2 input-shield-card"
+                            data-shield-code-configured="{{ 'true' if detail.get('shield_code_configured') else 'false' }}"
+                          >
+                            <div class="section-head input-shield-head">
+                              <h3>Shield</h3>
+                              <label class="input-shield-toggle" aria-label="Enable Shield for this input">
+                                <span class="toggle-switch{% if detail.get('shield_enabled') %} is-on{% endif %}">
+                                  <input
+                                    name="shield_enabled"
+                                    type="checkbox"
+                                    value="true"
+                                    {% if detail.get('shield_enabled') %}checked{% endif %}
+                                    {% if (not shield_status.server_enabled or not shield_status.ready) and not detail.get('shield_enabled') %}disabled{% endif %}
+                                  >
+                                  <span class="toggle-switch-track">
+                                    <span class="toggle-switch-thumb"></span>
+                                  </span>
+                                </span>
+                              </label>
+                            </div>
+                            <div class="settings-lines">
+                              <div class="settings-line sf-row">
+                                <label class="settings-key" for="input-shield-code-{{ item.id }}">access key</label>
+                                <input
+                                  id="input-shield-code-{{ item.id }}"
+                                  name="shield_access_code"
+                                  type="text"
+                                  value="{{ detail.get('shield_access_code', '') }}"
+                                  placeholder="{{ 're-enter access key' if detail.get('shield_code_configured') else 'required before enable' }}"
+                                  autocomplete="off"
+                                  spellcheck="false"
+                                >
+                              </div>
+                              {% if not shield_status.server_enabled or not shield_status.ready %}
+                                <div class="settings-line sf-row sf-tall">
+                                  <span class="settings-key">shield prereq</span>
+                                  <span class="settings-value">Enable Shield in Settings, create the reserved shield output, then attach a shield input to it.</span>
+                                </div>
+                              {% endif %}
+                            </div>
+                          </div>
+                        {% endif %}
+                        <div class="editor-actions">
+                          <button type="submit">Save</button>
+                          <button
+                            type="submit"
+                            class="ghost"
+                            name="action"
+                            value="{{ 'disable' if item.enabled else 'enable' }}"
+                          >{{ 'Disable' if item.enabled else 'Enable' }}</button>
+                          <button
+                            type="submit"
+                            class="ghost"
+                            name="action"
+                            value="delete"
+                            formaction="/ui/inputs/{{ item.id }}/delete"
+                            data-confirm-message="Delete this input? This removes the saved route unless save fails and CNC restores it."
+                          >Delete</button>
+                        </div>
+                      </form>
+                    </div>
+                  </td>
+                </tr>
+              {% else %}
+                <tr>
+                  <td colspan="4" class="empty">
+                    No inputs yet &#x2014;
+                    <button type="button" class="link-action" data-editor-toggle="input-editor">add one</button>
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </article>
+    </section>
+
+    {% if beta_routing %}
+    <section class="panel" data-panel="routing" data-loaded="{{ '1' if initial_tab == 'routing' else '0' }}"{% if initial_tab != "routing" %} hidden{% endif %}>
+      <article class="card">
+        <div class="section-head">
+          <h2>Routes</h2>
+          <div class="section-actions">
+            <span class="summary-pill">{{ overview.routes_active }}/{{ overview.routes_total }} healthy</span>
+          </div>
+        </div>
+        <div class="route-graph-shell" data-route-graph data-routes='{{ routing_rows | tojson }}'>
+          <div class="route-graph-canvas" data-route-graph-canvas></div>
+          <div class="route-graph-empty" data-route-graph-empty>No routes yet.</div>
+        </div>
+      </article>
+    </section>
+    {% endif %}
+
+    <section class="panel" data-panel="outputs" data-loaded="{{ '1' if initial_tab == 'outputs' else '0' }}"{% if initial_tab != "outputs" %} hidden{% endif %}>
+      <article class="card">
+        <div class="section-head">
+          <h2>Outputs</h2>
+          <div class="section-actions">
+            <span class="summary-pill" data-outputs-enabled-summary>{{ overview.backends_enabled }}/{{ overview.backends_total }} enabled</span>
+            <span class="summary-pill" data-outputs-unhealthy-summary>{{ overview.outputs_unhealthy }} unhealthy</span>
+            <button type="button" class="ghost" data-editor-toggle="backend-editor">+ add</button>
+          </div>
+        </div>
+
+        <div class="editor" id="backend-editor" hidden>
+          <button type="button" class="editor-close-icon" data-editor-close="backend-editor" aria-label="Close output editor">&times;</button>
+          <form method="post" action="/ui/backends" class="editor-grid output-editor" data-backend-kind-form data-backend-create-form>
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <label>Name<input name="name" required placeholder="api-1"></label>
+            <label>Kind
+              <span class="select-wrap">
+                <select name="kind">
+                  <option value="app" selected>app</option>
+                  <option value="static">static</option>
+                  {% if shield_status.server_enabled and not shield_status.backend_exists %}
+                    <option value="shield">shield</option>
+                  {% endif %}
+                </select>
+              </span>
+            </label>
+            <label data-backend-kind-section="static">Static Root
+              <input name="static_root" placeholder="/srv/site" autocomplete="off" autocapitalize="off" spellcheck="false" title="{{ static_root_hint }}">
+              <small class="field-help">{{ static_root_hint }}</small>
+            </label>
+            <details class="advanced-card field-span-2" data-backend-kind-advanced>
+              <summary><span>+ advanced options</span></summary>
+              <div class="advanced-grid">
+                <label>Handoff Port<input name="port" type="number" placeholder="12000"></label>
+                <label data-backend-kind-section="app">Guest Profile
+                  <span class="select-wrap">
+                    <select name="sandbox_profile">
+                      {% for profile in app_sandbox_profiles %}
+                        <option value="{{ profile.profile_id }}" {% if profile.profile_id == default_app_sandbox_profile %}selected{% endif %}>{{ profile.label }}</option>
+                      {% endfor %}
+                    </select>
+                  </span>
+                </label>
+                <label data-backend-kind-section="app">Healthcheck Mode
+                  <span class="select-wrap">
+                    <select name="healthcheck_mode">
+                      <option value="none" selected>none</option>
+                      <option value="tcp">tcp</option>
+                      <option value="http">http</option>
+                    </select>
+                  </span>
+                </label>
+                <label data-backend-kind-section="app">Healthcheck Path<input name="healthcheck_path" placeholder="/ or /health" value="/"></label>
+                <label data-backend-kind-section="app">Health Host Header<input name="healthcheck_host_header" placeholder="app.example.com"></label>
+                <label data-backend-kind-section="app">Resource Size
+                  <span class="select-wrap">
+                    <select name="resource_size" data-resource-size-control>
+                      <option value="auto" selected>auto</option>
+                      <option value="small">small</option>
+                      <option value="medium">medium</option>
+                      <option value="large">large</option>
+                      <option value="custom">custom</option>
+                    </select>
+                  </span>
+                </label>
+                <label data-backend-kind-section="app" data-custom-resource-limit hidden>MemoryHigh Override<input name="memory_high_override" placeholder="auto" disabled></label>
+                <label data-backend-kind-section="app" data-custom-resource-limit hidden>MemoryMax Override<input name="memory_max_override" placeholder="auto" disabled></label>
+                <label data-backend-kind-section="app" data-custom-resource-limit hidden>CPU Quota Override<input name="cpu_quota_override" placeholder="auto" disabled></label>
+                <label>Volumes JSON<textarea name="volumes_json" rows="4">[]</textarea></label>
+                <label class="field-span-2">Notes<input name="notes" placeholder="purpose / notes"></label>
+              </div>
+            </details>
+            <div class="field-span-2 output-create-attach" data-output-attach-form data-output-hidden-name="input_ids">
+              <div class="picker-head">
+                <span class="picker-label">Attached inputs</span>
+                <span class="summary-pill">{{ input_attach_available_count }} available</span>
+              </div>
+              <div class="output-tags" data-output-tags>
+                <span class="output-tag-empty">No inputs attached</span>
+              </div>
+              <div class="output-create-controls">
+                {% if input_attach_options %}
+                <div class="output-add-wrap" data-output-add-wrap>
+                  <button type="button" class="output-add-btn" data-output-add-toggle>+ Add input</button>
+                  <div class="output-add-dropdown" data-output-dropdown hidden>
+                    <input type="text" class="output-add-search" data-output-search placeholder="Search inputs..." autocomplete="off">
+                    <div class="output-add-list" data-output-list>
+                      {% for item in input_attach_options %}
+                        <button
+                          type="button"
+                          class="output-add-item"
+                          data-output-option
+                          data-output-id="{{ item.id }}"
+                          data-output-name="{{ item.value }}"
+                          data-output-kind="{{ item.kind_label }}"
+                          data-output-enabled=""
+                          {% if not item.attachable %}disabled title="{{ item.unavailable_reason }}"{% endif %}
+                        >
+                          <span class="output-add-item-name">{{ item.value }}</span>
+                          {% if item.unavailable_reason %}
+                            <span class="output-add-item-meta">{{ item.unavailable_reason }}</span>
+                          {% endif %}
+                        </button>
+                      {% endfor %}
+                    </div>
+                  </div>
+                </div>
+                {% else %}
+                  <div class="picker-empty">No inputs yet &#x2014; add one first.</div>
+                {% endif %}
+                <label class="toggle output-create-enabled">
+                  <input name="enabled" type="checkbox" checked>
+                  <span>Enabled</span>
+                </label>
+              </div>
+            </div>
+            <div class="editor-actions">
+              <button type="submit">Create</button>
+              <button type="button" class="ghost" data-editor-close="backend-editor">Cancel</button>
+            </div>
+          </form>
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Name</th><th>Runtime</th><th title="Updated every 15 seconds; CPU and memory show a rolling 1 minute average.">Load (1m avg)</th><th class="th-chevron"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for backend in backends %}
+                {% set detail = output_details.get(backend.id, {}) %}
+                {% set cpu_meter = detail.get("cpu_meter", {}) %}
+                {% set memory_meter = detail.get("memory_meter", {}) %}
+                <tr class="click-row row-navigate" data-row-link="/outputs/{{ backend.id }}" data-output-row="{{ backend.id }}" data-output-name="{{ backend.name }}" data-output-kind="{{ backend.kind }}" data-output-enabled="{{ '1' if backend.enabled else '0' }}" tabindex="0" role="link" aria-label="Open output {{ backend.name }}">
+                  <td>
+                    <div class="table-primary">
+                      <span>{{ backend.name }}</span>
+                      {% if multi_node_enabled %}
+                        <span class="summary-pill">{{ detail.get("placement_label", "leader") }}</span>
+                      {% endif %}
+                    </div>
+                  </td>
+                  <td>
+                    <span class="pill {{ detail.get('status_tone', 'inactive') }}" data-output-runtime-pill>{{ detail.get("status_value", "&#x2014;") }}</span>
+                  </td>
+                  <td>
+                    <div class="output-load-cell">
+                      <div class="output-load-stat {% if cpu_meter.get('compact') %}is-compact{% endif %}" data-output-cpu>
+                        <div class="output-load-head">
+                          <span>CPU</span>
+                          <span data-output-cpu-label>{{ cpu_meter.get("label", "&#x2014;") }}</span>
+                        </div>
+                        <div class="meter large"><span class="meter-fill {% if cpu_meter.get('tone') == 'critical' %}critical{% elif cpu_meter.get('tone') == 'warn' %}warn{% endif %}" data-output-cpu-fill style="width: {{ cpu_meter.get('percent', 0) }}%;"></span></div>
+                      </div>
+                      <div class="output-load-stat {% if memory_meter.get('compact') %}is-compact{% endif %}" data-output-memory>
+                        <div class="output-load-head">
+                          <span>MEM</span>
+                          <span data-output-memory-label>{{ memory_meter.get("label", "&#x2014;") }}</span>
+                        </div>
+                        <div class="meter large"><span class="meter-fill {% if memory_meter.get('tone') == 'critical' %}critical{% elif memory_meter.get('tone') == 'warn' %}warn{% endif %}" data-output-memory-fill style="width: {{ memory_meter.get('percent', 0) }}%;"></span></div>
+                      </div>
+                    </div>
+                  </td>
+                  <td class="td-chevron"><span class="row-chevron">&#x276F;</span></td>
+                </tr>
+              {% else %}
+                <tr>
+                  <td colspan="4" class="empty">
+                    No outputs yet &#x2014;
+                    <button type="button" class="link-action" data-editor-toggle="backend-editor">add one</button>
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </article>
+    </section>
+
+    <section class="panel" data-panel="settings" data-loaded="{{ '1' if initial_tab == 'settings' else '0' }}"{% if initial_tab != "settings" %} hidden{% endif %}>
+      <div class="panel-grid apply-grid">
+        <article class="card span-2">
+          <div class="section-head">
+            <h2>Access key</h2>
+            <span class="summary-pill {% if access_key_settings.configured %}active{% else %}inactive{% endif %}">
+              status: {{ access_key_settings.status_label }}
+            </span>
+          </div>
+          <div class="access-key-card-body">
+            {% if access_key_settings.needs_rehash %}
+              <p class="subtle settings-note-row">Current hash format is older than the active policy. Reset the key once to refresh it.</p>
+            {% endif %}
+            <div class="editor-actions access-key-actions">
+              <button type="button" data-access-key-reset-open>
+                {% if access_key_settings.configured %}Reset key{% else %}Create key{% endif %}
+              </button>
+              {% if access_key_settings.configured %}
+                <form method="post" action="/ui/settings/access-key" class="access-key-disable-form">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <button type="submit" class="ghost" name="action" value="disable">Disable</button>
+                </form>
+              {% endif %}
+            </div>
+            <div class="settings-status-row access-key-status-row">
+              <span class="metric-label">session ttl</span>
+              <span class="settings-status-value mono">{{ access_key_settings.ttl_label }}</span>
+            </div>
+          </div>
+        </article>
+
+        <article class="card span-2">
+          <div class="section-head">
+            <h2>Pushover</h2>
+            <span class="summary-pill {% if notification_settings.configured %}active{% else %}inactive{% endif %}">
+              status: {{ notification_settings.status_label }}
+            </span>
+          </div>
+          <form method="post" action="/ui/settings/notifications" class="editor-grid input-editor-grid">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <label>Pushover app token
+              <input
+                type="password"
+                name="pushover_app_token"
+                value="{{ notification_settings.app_token_display }}"
+                placeholder="Paste app token"
+                autocomplete="off"
+                spellcheck="false"
+              >
+            </label>
+            <label>Pushover user key
+              <input
+                type="password"
+                name="pushover_user_key"
+                value="{{ notification_settings.user_key_display }}"
+                placeholder="Paste user key"
+                autocomplete="off"
+                spellcheck="false"
+              >
+            </label>
+            <div class="editor-actions field-span-2">
+              <button type="submit" name="action" value="save">Save</button>
+              <button type="submit" class="ghost" name="action" value="test">Test</button>
+              <button type="submit" class="ghost" name="action" value="clear">Clear</button>
+            </div>
+            <div class="field-span-2 settings-mini-grid">
+              <span>last delivery</span>
+              <span class="mono">{{ notification_settings.delivery_label }}</span>
+              {% if notification_settings.delivery_at %}
+                <span>observed</span>
+                <span class="mono">{{ notification_settings.delivery_at }}</span>
+              {% endif %}
+              {% if notification_settings.delivery_error %}
+                <span>detail</span>
+                <span class="mono">{{ notification_settings.delivery_error }}</span>
+              {% endif %}
+            </div>
+          </form>
+        </article>
+
+        <article class="card span-2 beta-settings-card">
+          <div class="section-head">
+            <h2>Beta features</h2>
+          </div>
+          <form id="beta-settings-form" method="post" action="/ui/settings/beta" class="beta-settings-form">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <div class="beta-settings-list">
+              <label class="toggle-switch-label beta-settings-toggle">
+                <span class="beta-feature-text">
+                  <span class="beta-feature-name">Routing page</span>
+                </span>
+                <span class="toggle-switch{% if beta_routing %} is-on{% endif %}">
+                  <input name="beta_routing" type="checkbox" value="true" {% if beta_routing %}checked{% endif %}>
+                  <span class="toggle-switch-track">
+                    <span class="toggle-switch-thumb"></span>
+                  </span>
+                </span>
+              </label>
+              <label class="toggle-switch-label beta-settings-toggle">
+                <span class="beta-feature-text">
+                  <span class="beta-feature-name">Enable Shield</span>
+                  {% if shield_status.server_enabled %}
+                    <span class="beta-feature-status">
+                      (Input -
+                      {% if shield_status.input_values %}
+                        {{ shield_status.input_values|join(", ") }}
+                      {% else %}
+                        ⏳
+                      {% endif %}
+                      | Output
+                      {% if shield_status.output_state == "healthy" %}
+                        ✅
+                      {% elif shield_status.output_state == "missing" %}
+                        ⏳
+                      {% else %}
+                        ❌
+                      {% endif %})
+                    </span>
+                  {% endif %}
+                </span>
+                <span class="toggle-switch{% if shield_status.server_enabled %} is-on{% endif %}">
+                  <input name="shield_enabled" type="checkbox" value="true" {% if shield_status.server_enabled %}checked{% endif %}>
+                  <span class="toggle-switch-track">
+                    <span class="toggle-switch-thumb"></span>
+                  </span>
+                </span>
+              </label>
+              <label class="toggle-switch-label beta-settings-toggle">
+                <span class="beta-feature-text">
+                  <span class="beta-feature-name">Netdata</span>
+                  {% if netdata_settings.enabled and netdata_settings.url %}
+                    <span class="beta-feature-status">{{ netdata_settings.url }}</span>
+                  {% endif %}
+                </span>
+                <span class="toggle-switch{% if netdata_settings.enabled %} is-on{% endif %}">
+                  <input name="netdata_enabled" type="checkbox" value="true" {% if netdata_settings.enabled %}checked{% endif %}>
+                  <span class="toggle-switch-track">
+                    <span class="toggle-switch-thumb"></span>
+                  </span>
+                </span>
+              </label>
+            </div>
+            <div class="editor-actions beta-settings-actions">
+              <button type="submit">Save</button>
+            </div>
+          </form>
+        </article>
+
+        <article class="card span-2">
+          {% set update_version = status.get("update_version", {}) %}
+          <div class="section-head">
+            <h2>Update CNC</h2>
+          </div>
+          <div class="version-list">
+            <div class="version-row">
+              <span class="metric-label">current</span>
+              <strong data-update-current-version>{{ update_version.get("current_version", app_version) }}</strong>
+            </div>
+            <div class="version-row">
+              <span class="metric-label">available</span>
+              <strong data-update-available-version>
+                {% if update_version.get("has_update") and update_version.get("available_version") %}
+                  {{ update_version.get("available_version") }}
+                {% elif update_version.get("error") %}
+                  unavailable
+                {% elif not update_version.get("checked_at") %}
+                  not checked
+                {% else %}
+                  up to date
+                {% endif %}
+              </strong>
+            </div>
+            <div class="version-row">
+              <span class="metric-label">last update</span>
+              <strong class="version-status-value">
+                <span data-update-created-at data-local-time="{{ status.last_update.created_at if status.last_update else '' }}">{{ status.last_update.created_at if status.last_update else "never" }}</span>
+                <span class="pill {{ status.last_update.status if status.last_update else 'inactive' }}" data-update-inline-pill {% if not status.last_update or status.last_update.status == "success" %}hidden{% endif %}>{{ status.last_update.status if status.last_update and status.last_update.status != "success" else "" }}</span>
+              </strong>
+            </div>
+          </div>
+          <p class="subtle" data-update-availability-note></p>
+          <div class="action-stack">
+            <form method="post" action="/api/update/check" data-update-check-form>
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <button type="submit" class="ghost" data-update-check-submit>Check for updates</button>
+            </form>
+            <form method="post" action="/ui/update" data-update-form {% if not update_version.get("has_update") %}hidden{% endif %}>
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <button type="submit" class="ghost" data-update-submit>
+                Update to {{ update_version.get("available_version") or "latest" }}
+              </button>
+            </form>
+          </div>
+          {% if status.last_update and status.last_update.status != "success" %}
+          <div class="run-group" data-update-card>
+            <button
+              type="button"
+              class="run-summary {{ status.last_update.status if status.last_update else 'idle' }}"
+              data-run-toggle="update-run-details"
+              data-update-summary-toggle
+              aria-expanded="false"
+            >
+              <span class="run-summary-copy">
+                <span class="run-summary-label">latest update run</span>
+                <span class="run-summary-message" data-update-message>
+                  {% if status.last_update %}
+                    {{ status.last_update.message }}
+                  {% else %}
+                    Checks out the latest configured GitHub revision in a background unit.
+                  {% endif %}
+                </span>
+              </span>
+              <span class="run-summary-meta">
+                <span class="pill {{ status.last_update.status if status.last_update else 'inactive' }}" data-update-pill>
+                  {{ status.last_update.status if status.last_update else "idle" }}
+                </span>
+                <span
+                  class="run-timestamp"
+                  data-update-timestamp
+                  {% if status.last_update %}data-local-time="{{ status.last_update.created_at }}"{% endif %}
+                >{{ status.last_update.created_at if status.last_update else "no runs yet" }}</span>
+              </span>
+            </button>
+            <div id="update-run-details" class="run-details" hidden>
+              {% set update_unit_state = status.last_update.details.get("unit_state", {}) if status.last_update and status.last_update.details else {} %}
+              <div class="update-run-state" data-update-state {% if not update_unit_state %}hidden{% endif %}>
+                <span class="save-stage-line" data-update-state-line>
+                  {% if update_unit_state %}
+                    {{ update_unit_state.get("ActiveState", "-") }} - {{ update_unit_state.get("SubState", "-") }}
+                  {% endif %}
+                </span>
+                <div class="update-state-grid">
+                  <div>
+                    <span class="metric-label">state</span>
+                    <strong data-update-active-state>{{ update_unit_state.get("ActiveState", "-") if update_unit_state else "-" }}</strong>
+                  </div>
+                  <div>
+                    <span class="metric-label">substate</span>
+                    <strong data-update-sub-state>{{ update_unit_state.get("SubState", "-") if update_unit_state else "-" }}</strong>
+                  </div>
+                  <div>
+                    <span class="metric-label">result</span>
+                    <strong data-update-result-state>{{ update_unit_state.get("Result", "-") if update_unit_state else "-" }}</strong>
+                  </div>
+                  <div>
+                    <span class="metric-label">exit</span>
+                    <strong data-update-exit-state>{{ update_unit_state.get("ExecMainStatus", "-") if update_unit_state else "-" }}</strong>
+                  </div>
+                </div>
+              </div>
+              <div class="run-meta" data-update-meta {% if not status.last_update or not status.last_update.details or (not status.last_update.details.get("unit") and not status.last_update.details.get("script")) %}hidden{% endif %}>
+                {% if status.last_update and status.last_update.details and status.last_update.details.get("unit") %}
+                  <span data-update-unit>{{ status.last_update.details.get("unit") }}</span>
+                {% else %}
+                  <span data-update-unit hidden></span>
+                {% endif %}
+                {% if status.last_update and status.last_update.details and status.last_update.details.get("script") %}
+                  <span data-update-script>{{ status.last_update.details.get("script") }}</span>
+                {% else %}
+                  <span data-update-script hidden></span>
+                {% endif %}
+              </div>
+              <div class="code-block compact" data-update-log-block {% if not status.last_update or not status.last_update.details or not status.last_update.details.get("log_excerpt") %}hidden{% endif %}>
+                <div class="code-head">latest update log</div>
+                <pre data-update-log>{% if status.last_update and status.last_update.details %}{{ status.last_update.details.get("log_excerpt", "") }}{% endif %}</pre>
+              </div>
+              {% if not status.last_update %}
+                <p class="run-empty">No update run details yet.</p>
+              {% endif %}
+            </div>
+          </div>
+          {% endif %}
+        </article>
+
+        <article class="card span-2 settings-host-metrics-card">
+          <div class="section-head">
+            <h2>Metrics</h2>
+          </div>
+          <div class="metrics-actions">
+            <label class="metrics-select-field">Metric
+              <select id="host-metric-select">
+                <option value="cpu" selected>cpu</option>
+                <option value="memory">memory</option>
+                <option value="disk">disk</option>
+                <option value="network">network</option>
+              </select>
+            </label>
+            <label class="metrics-select-field">Timeframe
+              <select id="host-timeframe-select">
+                {% for option in metric_history_timeframes %}
+                  <option value="{{ option.key }}" {% if option.key == metric_history_default_timeframe %}selected{% endif %}>{{ option.label }}</option>
+                {% endfor %}
+              </select>
+            </label>
+          </div>
+          <div class="metrics-chart-shell" id="host-metrics-shell" data-host-metrics='{{ status.get("host_metrics", {}) | tojson | forceescape }}'>
+            <div class="metrics-summary-grid host-metrics-summary-grid" id="host-metrics-summary">
+              <div class="metrics-summary-chip">
+                <span class="metrics-summary-label">peak</span>
+                <strong class="metrics-summary-value">collecting</strong>
+              </div>
+              <div class="metrics-summary-chip">
+                <span class="metrics-summary-label">avg</span>
+                <strong class="metrics-summary-value">collecting</strong>
+              </div>
+              <div class="metrics-summary-chip">
+                <span class="metrics-summary-label">last</span>
+                <strong class="metrics-summary-value">collecting</strong>
+              </div>
+            </div>
+            <div class="metrics-chart-frame">
+              <div class="metrics-chart-canvas-wrap">
+                <canvas id="host-metrics-chart" aria-label="Host metrics chart"></canvas>
+              </div>
+              <p class="metrics-chart-empty subtle" id="host-metrics-empty" hidden>No host metric samples yet.</p>
+            </div>
+          </div>
+        </article>
+
+        <article class="card span-2">
+          <div class="section-head">
+            <h2>Settings</h2>
+            <div class="section-actions">
+              <button type="button" class="ghost support-bundle-button" data-support-bundle-button>
+                Download Support Bundle
+              </button>
+            </div>
+          </div>
+          <section class="resource-size-matrix">
+            <h3 class="settings-section-title">
+              <span>App size matrix</span>
+            </h3>
+            <div class="resource-size-table-wrap">
+              <table class="resource-size-table">
+                <thead>
+                  <tr>
+                    <th>
+                      <span class="resource-size-th">
+                        <span>Size</span>
+                        <span class="settings-help-badge" tabindex="0" data-tooltip="Preset app size used by auto sizing and manual resource size selections.">i</span>
+                      </span>
+                    </th>
+                    <th>
+                      <span class="resource-size-th">
+                        <span>RAM target</span>
+                        <span class="settings-help-badge" tabindex="0" data-tooltip="Soft memory target. The host starts applying pressure here before the hard cap.">i</span>
+                      </span>
+                    </th>
+                    <th>
+                      <span class="resource-size-th">
+                        <span>RAM cap</span>
+                        <span class="settings-help-badge" tabindex="0" data-tooltip="Hard memory ceiling for this app size. The app can be stopped if it exceeds this.">i</span>
+                      </span>
+                    </th>
+                    <th>
+                      <span class="resource-size-th">
+                        <span>CPU limit</span>
+                        <span class="settings-help-badge" tabindex="0" data-tooltip="Share of total host CPU capacity assigned to this app size across all cores.">i</span>
+                      </span>
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for row in resource_size_matrix %}
+                    <tr>
+                      <td class="mono">{{ row.size }}</td>
+                      <td class="mono">{{ row.memory_target }}</td>
+                      <td class="mono">{{ row.memory_cap }}</td>
+                      <td class="mono">{{ row.cpu_limit }}</td>
+                    </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          </section>
+          <div class="settings-sections">
+            {% for section in settings_sections %}
+              <section class="settings-section">
+                <h3 class="settings-section-title">
+                  <span>{{ section.title }}</span>
+                </h3>
+                <div class="settings-lines">
+                  {% for row in section.rows %}
+                    {% set key = row[0] %}
+                    {% set value = row[1] %}
+                    {% set time_meta = row[2] if row|length > 2 else {} %}
+                    <div class="settings-line">
+                      <span class="settings-key-wrap">
+                        <span class="settings-key">{{ key }}</span>
+                        {% if settings_help.get(key) %}
+                          <span class="settings-help-badge" tabindex="0" data-tooltip="{{ settings_help.get(key) }}">i</span>
+                        {% endif %}
+                      </span>
+                      <span
+                        class="settings-value mono"
+                        {% if time_meta.raw %}data-local-time="{{ time_meta.raw }}"{% endif %}
+                        {% if time_meta.format %}data-local-time-format="{{ time_meta.format }}"{% endif %}
+                      >{{ value }}</span>
+                    </div>
+                  {% endfor %}
+                </div>
+              </section>
+            {% endfor %}
+          </div>
+        </article>
+
+        <article class="card span-2 node-settings-card">
+          <div class="section-head">
+            <h2>Nodes</h2>
+          </div>
+          <form method="post" action="/ui/settings/nodes" class="node-settings-form">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <div class="settings-lines">
+              <div class="settings-line node-settings-mode-line">
+                <span class="settings-key settings-key-wrap">
+                  multi node mode
+                  <span
+                    class="settings-help-badge"
+                    tabindex="0"
+                    data-tooltip="Turns on node join controls for this CNC install."
+                  >i</span>
+                </span>
+                <span class="settings-value">
+                  <label class="toggle-switch-label node-settings-toggle" aria-label="Enable multi node mode">
+                    <span class="toggle-switch{% if multi_node_enabled %} is-on{% endif %}">
+                      <input name="multi_node_enabled" type="checkbox" value="true" {% if multi_node_enabled %}checked{% endif %}>
+                      <span class="toggle-switch-track">
+                        <span class="toggle-switch-thumb"></span>
+                      </span>
+                    </span>
+                  </label>
+                </span>
+              </div>
+            </div>
+
+            {% if multi_node_enabled %}
+              <div class="node-cluster-head">
+                <h3>Cluster</h3>
+                <button type="button" class="ghost" data-node-add-open>+ add node</button>
+              </div>
+              <div class="node-list">
+                {% for node in cluster_nodes %}
+                <div class="node-row">
+                  <div class="node-name">
+                    <strong>{{ node.name }}</strong>
+                    <span class="node-inline-label">{{ node.label }}</span>
+                  </div>
+                  <div>
+                    <div class="node-label">state</div>
+                    <span class="pill {{ node.state_tone }}">{{ node.state }}</span>
+                  </div>
+                  <div class="node-actions">
+                    <button type="button" class="ghost" data-node-details-open="{{ node.id }}">Details</button>
+                  </div>
+                </div>
+                {% endfor %}
+              </div>
+            {% endif %}
+
+            <div class="editor-actions node-settings-actions">
+              <button type="submit">Save</button>
+            </div>
+          </form>
+        </article>
+      </div>
+
+      <dialog
+        class="confirm-modal access-key-modal"
+        id="access-key-reset-modal"
+        data-access-key-reset-modal
+        {% if access_key_modal_open | default(false) %}data-open-on-load="1"{% endif %}
+      >
+        <form method="post" action="/ui/settings/access-key" class="confirm-modal-card access-key-modal-card">
+          <button type="button" class="modal-close-button" data-access-key-reset-close aria-label="Close reset key dialog">x</button>
+          <div class="confirm-modal-copy">
+            <h2>{% if access_key_settings.configured %}Reset key{% else %}Create key{% endif %}</h2>
+          </div>
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="action" value="save">
+          <div class="editor-grid access-key-modal-grid">
+            <label>New access key
+              <input
+                type="password"
+                name="access_key"
+                value=""
+                placeholder="{% if access_key_settings.configured %}Rotate access key{% else %}Create access key{% endif %}"
+                autocomplete="new-password"
+                spellcheck="false"
+                data-access-key-first-input
+              >
+            </label>
+            <label>Confirm access key
+              <input
+                type="password"
+                name="access_key_confirm"
+                value=""
+                placeholder="Repeat access key"
+                autocomplete="new-password"
+                spellcheck="false"
+              >
+            </label>
+          </div>
+          <div class="editor-actions access-key-modal-actions">
+            <button type="button" class="ghost" data-access-key-reset-close>Cancel</button>
+            <button type="submit">{% if access_key_settings.configured %}Reset key{% else %}Create key{% endif %}</button>
+          </div>
+        </form>
+      </dialog>
+    </section>
+  </main>
+
+  <dialog class="confirm-modal" id="confirm-modal">
+    <form method="dialog" class="confirm-modal-card">
+      <div class="confirm-modal-copy">
+        <h2 id="confirm-modal-title">Confirm action</h2>
+        <p id="confirm-modal-message">Are you sure?</p>
+      </div>
+      <div class="editor-actions">
+        <button type="button" class="ghost" id="confirm-modal-cancel">Cancel</button>
+        <button type="button" id="confirm-modal-accept">OK</button>
+      </div>
+    </form>
+  </dialog>
+
+  {% if multi_node_enabled %}
+  <script type="application/json" id="cluster-nodes-data">{{ cluster_nodes | tojson }}</script>
+  <dialog class="node-modal" id="node-add-modal">
+    <form method="dialog" class="node-modal-card node-add-modal-card">
+      <div class="node-modal-head">
+        <h2>Add node</h2>
+        <div class="node-join-countdown" data-node-join-countdown>
+          <span>join window</span>
+          <strong>15:00</strong>
+        </div>
+      </div>
+      <div class="node-join-steps">
+      <div class="node-join-panel">
+        <div class="node-join-step-head">
+          <div class="node-join-step-title">
+            <span class="node-step-number">1</span>
+            <h3>Connect Tailscale</h3>
+          </div>
+          <button type="button" class="ghost" data-node-tailnet-copy>Copy</button>
+        </div>
+        <div class="code-block compact-block node-join-command">
+          <pre data-node-tailnet-command>curl -fsSL https://tailscale.com/install.sh | sudo sh && sudo tailscale up</pre>
+        </div>
+        <div class="editor-actions node-join-step-actions">
+          <button type="button" data-node-step-one-done>Done</button>
+        </div>
+      </div>
+      <div class="node-join-panel is-pending" data-node-install-step>
+        <div class="node-join-step-head">
+          <div class="node-join-step-title">
+            <span class="node-step-number">2</span>
+            <h3>Install CNC node</h3>
+          </div>
+          <button type="button" class="ghost" data-node-install-copy hidden>Copy</button>
+        </div>
+        <div class="code-block compact-block node-join-command">
+          <pre data-node-install-command>Click Done above to reveal the CNC install command.</pre>
+        </div>
+      </div>
+      </div>
+      <div class="node-join-status" data-node-join-status hidden>
+        <span>Waiting for the new server to check in.</span>
+      </div>
+      <div class="editor-actions node-modal-actions">
+        <button type="button" class="ghost" data-node-add-close>Cancel</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="node-modal" id="node-details-modal">
+    <form method="dialog" class="node-modal-card">
+      <div class="node-modal-head">
+        <div>
+          <h2 data-node-details-name>Node</h2>
+          <p data-node-details-summary></p>
+        </div>
+        <button type="button" class="ghost node-modal-close" data-node-details-close aria-label="Close node details">x</button>
+      </div>
+      <div class="node-detail-grid">
+        <div class="node-detail-line">
+          <span>RAM</span>
+          <strong data-node-detail-ram></strong>
+        </div>
+        <div class="node-detail-line">
+          <span>CPU cores</span>
+          <strong data-node-detail-cpu></strong>
+        </div>
+        <div class="node-detail-line">
+          <span>Disk</span>
+          <strong data-node-detail-disk></strong>
+        </div>
+        <div class="node-detail-line">
+          <span>Tailscale IP</span>
+          <strong data-node-detail-tailnet></strong>
+        </div>
+        <div class="node-detail-line">
+          <span>Tailscale URL</span>
+          <strong><a data-node-detail-tailnet-url target="_blank" rel="noopener">not available</a></strong>
+        </div>
+        <div class="node-detail-line">
+          <span>Latency</span>
+          <strong data-node-detail-latency></strong>
+        </div>
+        <div class="node-detail-line">
+          <span>CNC version</span>
+          <strong data-node-detail-version></strong>
+        </div>
+        <div class="node-detail-line">
+          <span>Last seen</span>
+          <strong data-node-detail-last-seen></strong>
+        </div>
+      </div>
+      <div class="node-remove-note" data-node-remove-note hidden>
+        Removing a node only severs CNC trust and join authentication. It does not delete or modify the remote server.
+      </div>
+      <div class="node-details-actions">
+        <button type="button" class="ghost node-danger" data-node-remove>Remove node</button>
+        <button type="button" data-node-details-done>Done</button>
+      </div>
+    </form>
+  </dialog>
+  {% endif %}
+
+  <script type="application/json" id="dashboard-config">
+    {{ {
+      "createOutputProgressSteps": create_output_progress_steps | default([], true),
+      "inputProgressPipelines": input_progress_pipelines | default({}, true),
+      "operationProgressPipelines": operation_progress_pipelines | default({}, true),
+      "initialUpdateVersion": status.get("update_version") or {}
+    } | tojson }}
+  </script>
+  <script src="/static/js/cnc-ui.js?v={{ asset_version }}"></script>
+  <script src="/static/js/operation-events.js?v={{ asset_version }}"></script>
+  <script src="/static/js/dashboard.js?v={{ asset_version }}"></script>
+</body>
+</html>

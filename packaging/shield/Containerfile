@@ -1,0 +1,32 @@
+FROM docker.io/library/ubuntu:24.04
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV SHIELD_PORT=1026
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      python3 \
+      python3-pip \
+      python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/cnc
+
+COPY pyproject.toml README.md requirements.txt /opt/cnc/
+COPY app /opt/cnc/app
+COPY packaging/shield/start.sh /usr/local/bin/cnc-shield
+
+RUN python3 -m venv /opt/cnc/.venv \
+    && /opt/cnc/.venv/bin/pip install --no-cache-dir --upgrade pip \
+    && /opt/cnc/.venv/bin/pip install --no-cache-dir -r /opt/cnc/requirements.txt \
+    && /opt/cnc/.venv/bin/pip install --no-cache-dir --no-deps .
+
+RUN chmod 0755 /usr/local/bin/cnc-shield \
+    && mkdir -p /var/lib/cnc/shield \
+    && chmod 0700 /var/lib/cnc/shield
+
+EXPOSE 1026
+
+ENTRYPOINT ["/usr/local/bin/cnc-shield"]

@@ -1,0 +1,10 @@
+[Unit]
+Description=cnc update availability check timer
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+Unit=cnc-update-check.service
+
+[Install]
+WantedBy=timers.target

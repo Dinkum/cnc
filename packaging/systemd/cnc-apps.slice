@@ -1,0 +1,6 @@
+[Unit]
+Description=CNC ordinary application aggregate
+
+[Slice]
+MemoryAccounting=yes
+CPUAccounting=yes
