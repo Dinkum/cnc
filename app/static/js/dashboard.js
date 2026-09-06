@@ -1,5 +1,7 @@
 (() => {
   const {
+    bindMetricExport,
+    metricNumber,
     ensureMetricChartAssets,
     escapeHtml,
     formatLocalTimestamp,
@@ -214,8 +216,8 @@
 
   const hostMetricValue = (metrics, metricKey) => {
     const key = normalizeHostMetricKey(metricKey);
-    const value = Number(metrics?.[HOST_METRIC_DATA_KEYS[key]]);
-    return Number.isFinite(value) ? value : null;
+    const value = metricNumber(metrics?.[HOST_METRIC_DATA_KEYS[key]]);
+    return value;
   };
 
   const hostMetricSummaryValue = (value, metricKey) => {
@@ -294,6 +296,12 @@
     Boolean(payload?.metric && payload?.timeframe)
     && normalizeHostMetricKey(payload?.metric?.key) === selectedHostMetricKey()
     && String(payload?.timeframe?.key || "day") === selectedHostTimeframeKey()
+  );
+
+  const syncHostMetricExport = () => bindMetricExport(
+    document.getElementById("host-metric-export"),
+    () => hostPayloadMatchesCurrentSelection(lastHostMetricPayload) ? lastHostMetricPayload : null,
+    "host"
   );
 
   const hostMetricSummaryFromLiveSamples = (metricKey) => {
@@ -400,6 +408,7 @@
     if (!hostMetricsChart || !hostMetricsEmpty) return;
     if (!window.Chart) {
       lastHostMetricPayload = null;
+      syncHostMetricExport();
       hostMetricsEmpty.hidden = false;
       hostMetricsEmpty.textContent = "Chart library unavailable.";
       return;
@@ -413,6 +422,7 @@
     if (!available) {
       if (allowFallback && renderLiveHostMetricsFallback(String(payload?.note || "Host metric history is unavailable. Showing live samples."))) return;
       lastHostMetricPayload = null;
+      syncHostMetricExport();
       hostMetricsEmpty.hidden = false;
       hostMetricsEmpty.textContent = String(payload?.note || "No host metric history is available.");
       return;
@@ -420,6 +430,7 @@
     if (!series.length) {
       if (allowFallback && renderLiveHostMetricsFallback("No host metric history yet. Showing live samples.")) return;
       lastHostMetricPayload = null;
+      syncHostMetricExport();
       hostMetricsEmpty.hidden = false;
       hostMetricsEmpty.textContent = "No host metric samples yet.";
       renderHostMetricsSummary(payload);
@@ -431,6 +442,7 @@
     }
     if (!isFallback && !preservePayload) {
       lastHostMetricPayload = payload;
+      syncHostMetricExport();
     }
     renderHostMetricsSummary(payload);
     hostMetricsEmpty.hidden = !(isFallback && payload?.note);
@@ -663,6 +675,7 @@
 
   const showHostMetricHistoryError = () => {
     lastHostMetricPayload = null;
+    syncHostMetricExport();
     if (renderLiveHostMetricsFallback("Host metric history could not be loaded. Showing live samples.")) return;
     if (!hostMetricsEmpty) return;
     hostMetricsEmpty.hidden = false;
@@ -717,10 +730,12 @@
   const reloadSelectedHostMetricHistory = () => {
     refreshHostMetricRefs();
     lastHostMetricPayload = null;
+    syncHostMetricExport();
     loadHostMetricHistory();
   };
 
   const bindHostMetricControls = (root = document) => {
+    syncHostMetricExport();
     refreshHostMetricRefs();
     if (!settingsMetricsPanelLoaded()) return;
     const scopedSelect = root.querySelector?.("#host-metric-select") || hostMetricSelect;
@@ -2170,15 +2185,25 @@
     const requestId = latestTabRequestId + 1;
     latestTabRequestId = requestId;
     const requestIsCurrent = () => requestId === latestTabRequestId;
+    const selectLoadedPanel = (nextDocument) => {
+      replaceFromDocument(".site-header", nextDocument);
+      syncBannersFromDocument(nextDocument);
+      selectTab(targetName);
+    };
     const currentPanel = document.querySelector(`.panel[data-panel="${CSS.escape(targetName)}"]`);
     if (currentPanel?.dataset.loaded === "1") {
       selectTab(targetName);
       return;
     }
     if (tabLoadRequests.has(targetName)) {
-      await tabLoadRequests.get(targetName);
-      if (requestIsCurrent()) {
-        selectTab(targetName);
+      let nextDocument = null;
+      try {
+        nextDocument = await tabLoadRequests.get(targetName);
+      } catch {
+        return;
+      }
+      if (nextDocument && requestIsCurrent()) {
+        selectLoadedPanel(nextDocument);
       }
       return;
     }
@@ -2189,28 +2214,25 @@
       });
       if (!response.ok) throw new Error(`tab request failed: ${response.status}`);
       const html = await response.text();
-      if (!requestIsCurrent()) return false;
       const nextDocument = new DOMParser().parseFromString(html, "text/html");
-      replaceFromDocument(".site-header", nextDocument);
       const nextPanel = replaceFromDocument(`.panel[data-panel="${CSS.escape(targetName)}"]`, nextDocument);
-      syncBannersFromDocument(nextDocument);
       if (nextPanel) {
         nextPanel.dataset.loaded = "1";
         bindDashboardPanel(nextPanel);
       }
-      return true;
+      return nextPanel ? nextDocument : null;
     })();
     tabLoadRequests.set(targetName, request);
-    let loaded = false;
+    let nextDocument = null;
     try {
-      loaded = await request;
+      nextDocument = await request;
     } catch (error) {
       console.error("dashboard tab load failed", error);
     } finally {
       tabLoadRequests.delete(targetName);
     }
-    if (loaded && requestIsCurrent()) {
-      selectTab(targetName);
+    if (nextDocument && requestIsCurrent()) {
+      selectLoadedPanel(nextDocument);
     }
   };
 

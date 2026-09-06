@@ -49,7 +49,10 @@ from app.security import CNCTrustedHostMiddleware
 from app.static_delivery import build_static_asset_app, stylesheet_asset_version
 from app.services.error_reporting import CNCError, ErrorCode, cnc_error_from_payload
 from app.services.app_hardening import fail_interrupted_hardening_runs
-from app.services.backend_backup_service import fail_interrupted_backend_backups
+from app.services.backend_backup_service import (
+    fail_interrupted_backend_backups,
+    drain_backup_descriptions,
+)
 from app.services.backend_ssh_audit import (
     BACKEND_SSH_INTERNAL_HEADER_PATH,
     BackendSshAuditListener,
@@ -73,7 +76,11 @@ from app.services.self_audit import (
     handle_startup_self_audit_notification,
     run_control_plane_self_audit,
 )
-from app.services.startup_state import initialize_startup_state, set_startup_phase_state
+from app.services.startup_state import (
+    initialize_startup_state,
+    set_startup_phase_state,
+    snapshot_startup_state,
+)
 from app.services.status_service import (
     cancel_status_cache_prefill,
     schedule_status_cache_prefill,
@@ -346,6 +353,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         await cancel_status_cache_prefill()
         if ssh_audit_listener is not None:
             ssh_audit_listener.close()
+        await drain_backup_descriptions()
         await dispose_engine()
         if watchdog:
             watchdog.notify_stopping(status_message="cnc-admin stopping")
@@ -434,12 +442,12 @@ def _schedule_interrupted_cleanup_retry(app: FastAPI, settings) -> None:
     if isinstance(existing, asyncio.Task) and not existing.done():
         return
     app.state.cnc_startup_interrupted_cleanup_task = asyncio.create_task(
-        _retry_interrupted_cleanup_when_unlocked(settings),
+        _retry_interrupted_cleanup_when_unlocked(settings, app),
         name="cnc-startup-interrupted-cleanup",
     )
 
 
-async def _retry_interrupted_cleanup_when_unlocked(settings) -> None:
+async def _retry_interrupted_cleanup_when_unlocked(settings, app: FastAPI) -> None:
     for attempt in range(1, STARTUP_INTERRUPTED_CLEANUP_RETRY_ATTEMPTS + 1):
         await asyncio.sleep(STARTUP_INTERRUPTED_CLEANUP_RETRY_DELAY_SEC)
         cleanup_result = await _run_interrupted_cleanup_if_unlocked(settings)
@@ -451,6 +459,11 @@ async def _retry_interrupted_cleanup_when_unlocked(settings) -> None:
                 reason=cleanup_result,
             )
             continue
+        state = snapshot_startup_state(app)["db"]
+        if state.get("status") == "warning" and state.get("cleanup_deferred_reason"):
+            state.update(status="ok", error="", stage="fail_interrupted_host_mutations")
+            state.pop("cleanup_deferred_reason", None)
+            set_startup_phase_state(app, "db", state)
         logger.info("startup.interrupted_cleanup_completed", attempt=attempt)
         return
     logger.warning(

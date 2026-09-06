@@ -316,8 +316,7 @@ prepare_release() {
 validate_release() {
   log "building virtualenv for new release"
   python3 -m venv "${RELEASE_DIR}/.venv"
-  "${RELEASE_DIR}/.venv/bin/pip" install --upgrade pip
-  "${RELEASE_DIR}/.venv/bin/pip" install -r "${RELEASE_DIR}/requirements.txt"
+  "${RELEASE_DIR}/.venv/bin/pip" install --require-hashes --only-binary=:all: -r "${RELEASE_DIR}/requirements.txt"
   "${RELEASE_DIR}/.venv/bin/pip" install --no-deps -e "${RELEASE_DIR}"
 
   log "running release preflight checks"

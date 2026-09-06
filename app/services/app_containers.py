@@ -6,6 +6,7 @@ import os
 from typing import Any
 from pathlib import Path
 
+from app.services.hardening_policy import read_hardening_policy
 from app.config import Settings
 from app.models.entities import Backend
 from app.services.commands import CommandResult
@@ -139,6 +140,7 @@ def runtime_spec(
     sandbox_profile = get_app_sandbox_profile(backend.sandbox_profile)
     return {
         "runtime_owner": "quadlet",
+        "hardening": read_hardening_policy(backend).model_dump(exclude_defaults=True),
         "quadlet_container_unit": f"{container_name(backend.name)}.container",
         "quadlet_container_service": f"{container_name(backend.name)}.service",
         "quadlet_network_unit": f"{network_name(backend.name)}.network",

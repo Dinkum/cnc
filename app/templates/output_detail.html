@@ -594,6 +594,13 @@
                 </select>
               </span>
             </label>
+            <label class="metrics-select-field metric-export-field">Export
+              <select id="output-metric-export" aria-label="Export output metric history" disabled>
+                <option value="">Download…</option>
+                <option value="csv">CSV</option>
+                <option value="json">JSON</option>
+              </select>
+            </label>
           </div>
         </div>
         <div
@@ -808,6 +815,7 @@
         </article>
       {% endif %}
 
+      {% if beta_hardening and selected_backend.kind == "app" %}
       <article class="card span-2 beta-output-card" data-hardening-card>
         <div class="section-head">
           <h2>Beta features</h2>
@@ -894,11 +902,44 @@
               </table>
             </div>
             <div class="editor-actions hardening-actions">
-              <button type="button" class="ghost" data-hardening-apply-recommended hidden>Apply all recommended</button>
+              <button type="button" class="ghost" data-hardening-apply-recommended hidden>Apply this configuration</button>
             </div>
           </section>
+          <p class="subtle" data-hardening-configuration-status role="status" aria-live="polite"></p>
+          <details class="hardening-editor" data-hardening-editor>
+            <summary>Security flags <span class="subtle">Review or customize</span></summary>
+            <fieldset data-hardening-controls>
+              <div class="hardening-editor-table-wrap">
+                <table class="hardening-editor-table"><thead><tr><th>Control</th><th>Flag</th><th>Configuration</th></tr></thead><tbody data-hardening-control-rows></tbody></table>
+              </div>
+              <div class="editor-actions hardening-actions">
+                <button type="button" data-hardening-review-custom disabled>Review changes</button>
+                <button type="button" class="ghost" data-hardening-restore-previous hidden>Restore previous configuration</button>
+              </div>
+            </fieldset>
+          </details>
+          <dialog class="confirm-modal hardening-confirm" data-hardening-confirm aria-labelledby="hardening-confirm-title">
+            <div class="confirm-modal-card">
+              <button type="button" class="modal-close-button" data-hardening-confirm-close aria-label="Close security review">&times;</button>
+              <div class="confirm-modal-copy">
+                <h2 id="hardening-confirm-title">Review security configuration</h2>
+                <p>Review every recommendation manually. Monitoring and clone tests cover only observed activity; untested workloads or combinations of flags can still fail.</p>
+                <p class="hardening-warning">Applying may restart this app, interrupt connections, prevent startup, or block writes and access. Passing startup checks does not prove the whole app works.</p>
+              </div>
+              <div class="hardening-change-list" data-hardening-changes></div>
+              <details class="hardening-skipped" data-hardening-skipped hidden><summary data-hardening-skipped-label></summary><ul data-hardening-skipped-rows></ul></details>
+              <details class="hardening-exact-config"><summary>Exact flags and mounts</summary><pre data-hardening-exact-config></pre></details>
+              <label class="hardening-review-check"><input type="checkbox" data-hardening-reviewed> I reviewed these changes and accept the possible impact on this app.</label>
+              <p class="subtle" data-hardening-confirm-message role="status"></p>
+              <div class="editor-actions">
+                <button type="button" class="ghost" data-hardening-confirm-close>Cancel</button>
+                <button type="button" data-hardening-confirm-apply disabled>Apply configuration</button>
+              </div>
+            </div>
+          </dialog>
         </section>
       </article>
+      {% endif %}
     </div>
     <dialog class="confirm-modal" id="shield-code-error-modal">
       <form method="dialog" class="confirm-modal-card">
@@ -1196,5 +1237,6 @@
   <script src="/static/js/cnc-ui.js?v={{ asset_version }}"></script>
   <script src="/static/js/operation-events.js?v={{ asset_version }}"></script>
   <script src="/static/js/output-detail.js?v={{ asset_version }}"></script>
+  <script src="/static/js/hardening-configuration.js?v={{ asset_version }}"></script>
 </body>
 </html>

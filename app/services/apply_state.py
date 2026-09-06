@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.services.hardening_policy import read_hardening_policy
 from app.config import Settings
 from app.logger import get_logger
 from app.models.entities import Backend, ClusterNode, Input
@@ -515,6 +516,9 @@ def _backend_contracts(backends: list[Backend]) -> list[dict[str, object]]:
                 "port": backend.port,
                 "handoff_port": backend.handoff_port,
                 "sandbox_profile": backend.sandbox_profile or "",
+                "hardening": read_hardening_policy(backend).model_dump(
+                    exclude_defaults=True
+                ),
                 "healthcheck_path": backend.healthcheck_path or "",
                 "placement_node_uid": _placement_node_uid(backend),
                 "placement_mode": placement.mode,
@@ -611,6 +615,7 @@ def _runtime_graph(
             port=int(backend.port) if backend.port is not None else None,
             handoff_port=int(backend.handoff_port),
             sandbox_profile=str(spec["sandbox_profile"]),
+            hardening=dict(spec["hardening"]),
             sandbox_dir=str(spec["sandbox_dir"]),
             guest_rootfs=str(spec["guest_rootfs"]),
             volumes=tuple(str(volume) for volume in spec.get("volumes", [])),

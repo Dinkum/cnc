@@ -431,7 +431,21 @@ def ensure_cpu_quota(value: str | None, *, field_name: str) -> str | None:
 
 def validate_backend_shape(backend: Backend) -> None:
     settings = get_settings()
-    normalized_updates: dict[str, object] = {}
+    from app.services.hardening_policy import (
+        read_hardening_policy,
+        validate_policy_for_backend,
+    )
+
+    try:
+        policy = read_hardening_policy(backend)
+        validate_policy_for_backend(backend, policy)
+    except ValueError as exc:
+        raise ValidationError(
+            "Invalid hardening configuration; review the security controls."
+        ) from exc
+    normalized_updates: dict[str, object] = {
+        "hardening_config_json": policy.persisted()
+    }
     normalized_name = ensure_backend_name(backend.name)
     if backend.kind not in {"static", "app", "shield"}:
         raise ValidationError(f"invalid kind: {backend.kind}")

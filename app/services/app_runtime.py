@@ -10,6 +10,11 @@ import tempfile
 import time
 from typing import Any
 
+from app.services.hardening_policy import (
+    hardening_podman_args,
+    hardening_volumes,
+    read_hardening_policy,
+)
 from app.config import Settings
 from app.logger import get_logger
 from app.models.entities import Backend
@@ -961,11 +966,13 @@ def build_app_container_create_command(
         )
     sandbox_profile = get_app_sandbox_profile(backend.sandbox_profile)
     dns_servers = configured_app_dns_servers(settings)
-    volume_entries = parse_volumes_json(backend.volumes_json)
+    policy = read_hardening_policy(backend)
+    volume_entries = hardening_volumes(policy, parse_volumes_json(backend.volumes_json))
     resource_profile = backend_resource_profile(backend, base_profile)
     command = [
         "podman",
         "create",
+        *hardening_podman_args(policy),
         "--name",
         container_name(backend.name),
         "--hostname",
@@ -2690,6 +2697,8 @@ def _normalize_saved_spec(
     # Older releases may have persisted a partial runtime spec. Missing keys are
     # schema drift, not a requested rebuild, so backfill them from current state.
     normalized = dict(saved_spec)
+    # A missing policy means the old runtime had no reviewed hardening overrides.
+    normalized.setdefault("hardening", {})
     for key, value in current_spec.items():
         normalized.setdefault(key, value)
     return normalized
@@ -2699,6 +2708,7 @@ def _rebuild_required_spec_keys(
     saved_spec: dict[str, Any], current_spec: dict[str, Any]
 ) -> set[str]:
     immutable_keys = {
+        "hardening",
         "runtime_owner",
         "network",
         "sandbox_profile",

@@ -88,6 +88,10 @@ class Backend(Base):
     ssh_public_key: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     ssh_private_key: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     volumes_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    hardening_config_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="{}", server_default="{}"
+    )
+    hardening_previous_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(

@@ -13,6 +13,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
+from app.logger import redact_sensitive_text
 from app.models.entities import (
     ApplyRun,
     Backend,
@@ -365,6 +366,7 @@ def _backend_payload(backend: Backend) -> dict[str, Any]:
             "healthcheck_path": backend.healthcheck_path,
             "healthcheck_mode": backend.healthcheck_mode,
             "sandbox_profile": backend.sandbox_profile,
+            "hardening_config_json": backend.hardening_config_json or "{}",
             "created_at": _iso(backend.created_at),
         }
     )
@@ -928,7 +930,13 @@ def _redact_log_line(line: str) -> str:
             f"{match.group(1)}{match.group(2)}{match.group(3)}[redacted]{closing_quote}"
         )
 
-    return pattern.sub(replace, line)
+    # Consume the complete header value before generic key/value redaction.
+    line = re.sub(
+        r"(?i)(authorization[\"']?\s*[:=]\s*[\"']?)(?:bearer|basic)\s+[^\s,\"'}]+",
+        r"\1[redacted]",
+        line,
+    )
+    return pattern.sub(replace, redact_sensitive_text(line))
 
 
 def _write_json(bundle: ZipFile, name: str, payload: Any) -> None:
@@ -971,7 +979,7 @@ def _redact(value: Any, *, key: str = "") -> Any:
     if isinstance(value, list):
         return [_redact(item) for item in value]
     if isinstance(value, str):
-        return _clip(value)
+        return _clip(_redact_log_line(value))
     return value
 
 

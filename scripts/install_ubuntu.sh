@@ -642,8 +642,7 @@ EOF
 setup_python_env() {
   [[ -n "${INSTALL_RELEASE_DIR}" ]] || fail "install release directory not prepared"
   run_cmd "${PYTHON_BIN}" -m venv "${INSTALL_RELEASE_DIR}/.venv" || return $?
-  run_cmd "${INSTALL_RELEASE_DIR}/.venv/bin/pip" --disable-pip-version-check -q install --upgrade pip || return $?
-  run_cmd "${INSTALL_RELEASE_DIR}/.venv/bin/pip" --disable-pip-version-check -q install -r "${INSTALL_RELEASE_DIR}/requirements.txt" || return $?
+  run_cmd "${INSTALL_RELEASE_DIR}/.venv/bin/pip" --disable-pip-version-check -q install --require-hashes --only-binary=:all: -r "${INSTALL_RELEASE_DIR}/requirements.txt" || return $?
   run_cmd "${INSTALL_RELEASE_DIR}/.venv/bin/pip" --disable-pip-version-check -q install --no-deps -e "${INSTALL_RELEASE_DIR}" || return $?
 }
 

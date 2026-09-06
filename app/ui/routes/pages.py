@@ -4,17 +4,15 @@ import html
 
 from app.access import (
     ACCESS_ROUTE_PATH,
-    access_attempt_backoff_seconds,
     access_key_is_configured,
     access_origin_guard,
     access_redirect_target,
     access_request_is_authenticated,
     hash_access_key,
     normalize_access_key,
-    record_access_attempt,
     sanitize_next_path,
     set_access_cookie,
-    verify_access_key,
+    verify_access_key_async,
 )
 from app.config import Settings
 from app.dependencies import (
@@ -93,7 +91,9 @@ async def access_submit(
     next_target = sanitize_next_path(next_path or access_redirect_target(request))
     client_host = request.client.host if request.client else None
     if access_key_is_configured(settings):
-        wait_seconds = access_attempt_backoff_seconds(client_host)
+        valid, wait_seconds = await verify_access_key_async(
+            settings, access_key, attempt_key=client_host
+        )
         if wait_seconds > 0:
             context = _access_page_context(
                 settings,
@@ -102,8 +102,7 @@ async def access_submit(
             )
             context["request"] = request
             return _render_access_template(request, context, status_code=429)
-        if not verify_access_key(settings, access_key):
-            record_access_attempt(client_host, success=False)
+        if not valid:
             context = _access_page_context(
                 settings,
                 next_path=next_target,
@@ -111,7 +110,6 @@ async def access_submit(
             )
             context["request"] = request
             return _render_access_template(request, context, status_code=401)
-        record_access_attempt(client_host, success=True)
         response = RedirectResponse(url=next_target, status_code=303)
         set_access_cookie(response, settings, request=request)
         return response

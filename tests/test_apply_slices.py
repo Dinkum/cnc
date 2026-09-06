@@ -192,6 +192,30 @@ async def _apply(session_factory, settings: Settings, recording: RecordingApply)
 
 
 @pytest.mark.asyncio
+async def test_hardening_change_selects_runtime_and_preserves_ingress(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    maker = await _session_factory(tmp_path)
+    await _seed_app(maker)
+    recording = RecordingApply()
+    assert (await _apply(maker, settings, recording)).status == "success"
+    recording.runtime_calls.clear()
+    async with maker() as session:
+        backend = (await session.execute(select(Backend))).scalar_one()
+        backend.hardening_config_json = '{"no_new_privileges":true}'
+        await session.commit()
+    changed = await _apply(maker, settings, recording)
+    assert changed.status == "success"
+    assert changed.details["nginx_skipped"] is True
+    assert changed.details["tailscale_skipped"] is True
+    assert recording.runtime_calls[0]["selected_backend_names"] == {"web"}
+    recording.runtime_calls.clear()
+    assert (await _apply(maker, settings, recording)).status == "success"
+    assert recording.runtime_calls == []
+
+
+@pytest.mark.asyncio
 async def test_noop_apply_skips_runtime_nginx_tailscale_and_host_base(
     tmp_path: Path,
 ) -> None:

@@ -65,6 +65,7 @@ class Settings(BaseSettings):
     backend_auto_fix_enabled: bool = True
     backend_auto_fix_cooldown_sec: int = Field(default=900, ge=0, le=60 * 60 * 24 * 30)
     beta_routing: bool = False
+    beta_hardening: bool = False
     multi_node_enabled: bool = False
     cluster_join_tailnet_base_url: str = ""
     cluster_join_token_ttl_sec: int = Field(default=900, ge=60, le=3600)

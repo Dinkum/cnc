@@ -58,6 +58,7 @@
       <article class="card">
         <div class="section-head">
           <h2>Overview</h2>
+          <button type="button" class="ghost operation-history-trigger" data-operation-history-open aria-haspopup="dialog">History</button>
         </div>
         <div class="home-overview-grid">
           <article class="home-overview-card">
@@ -639,6 +640,13 @@
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <div class="beta-settings-list">
               <label class="toggle-switch-label beta-settings-toggle">
+                <span class="beta-feature-text"><span class="beta-feature-name">Security hardening</span><span class="subtle">Review and apply app security flags. Disabling hides these tools; applied flags stay active.</span></span>
+                <span class="toggle-switch{% if beta_hardening %} is-on{% endif %}">
+                  <input name="beta_hardening" type="checkbox" value="true" {% if beta_hardening %}checked{% endif %}>
+                  <span class="toggle-switch-track"><span class="toggle-switch-thumb"></span></span>
+                </span>
+              </label>
+              <label class="toggle-switch-label beta-settings-toggle">
                 <span class="beta-feature-text">
                   <span class="beta-feature-name">Routing page</span>
                 </span>
@@ -843,6 +851,13 @@
                 {% for option in metric_history_timeframes %}
                   <option value="{{ option.key }}" {% if option.key == metric_history_default_timeframe %}selected{% endif %}>{{ option.label }}</option>
                 {% endfor %}
+              </select>
+            </label>
+            <label class="metrics-select-field metric-export-field">Export
+              <select id="host-metric-export" aria-label="Export host metric history" disabled>
+                <option value="">Download…</option>
+                <option value="csv">CSV</option>
+                <option value="json">JSON</option>
               </select>
             </label>
           </div>
@@ -1178,6 +1193,34 @@
   </dialog>
   {% endif %}
 
+  <dialog class="operation-history-modal" id="operation-history" aria-labelledby="operation-history-title">
+    <div class="operation-history-card">
+      <div class="section-head">
+        <h2 id="operation-history-title">Operation history</h2>
+        <button type="button" class="ghost modal-close-button" data-history-close aria-label="Close operation history">&times;</button>
+      </div>
+      <div class="operation-history-toolbar">
+        <label>Status
+          <select data-history-status>
+            <option value="all">All completed</option>
+            <option value="success">Successful</option>
+            <option value="failed">Failed</option>
+            <option value="partial">Partial</option>
+            <option value="cancelled">Cancelled</option>
+          </select>
+        </label>
+        <button type="button" class="ghost" data-history-refresh>Refresh</button>
+      </div>
+      <p class="subtle operation-history-message" data-history-message role="status"></p>
+      <div class="operation-history-list" data-history-list></div>
+      <div class="operation-history-pagination">
+        <button type="button" class="ghost" data-history-prev disabled>Previous</button>
+        <span class="subtle" data-history-page>Page 1</span>
+        <button type="button" class="ghost" data-history-next disabled>Next</button>
+      </div>
+    </div>
+  </dialog>
+
   <script type="application/json" id="dashboard-config">
     {{ {
       "createOutputProgressSteps": create_output_progress_steps | default([], true),
@@ -1189,5 +1232,6 @@
   <script src="/static/js/cnc-ui.js?v={{ asset_version }}"></script>
   <script src="/static/js/operation-events.js?v={{ asset_version }}"></script>
   <script src="/static/js/dashboard.js?v={{ asset_version }}"></script>
+  <script src="/static/js/operation-history.js?v={{ asset_version }}"></script>
 </body>
 </html>

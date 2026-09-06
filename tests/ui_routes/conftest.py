@@ -8,6 +8,7 @@ from app.config import get_settings
 _RUNTIME_SETTING_KEYS = (
     "ACCESS_KEY_HASH",
     "BETA_ROUTING",
+    "BETA_HARDENING",
     "MULTI_NODE_ENABLED",
     "NETDATA_ENABLED",
     "PUSHOVER_APP_TOKEN",

@@ -231,3 +231,65 @@ async def test_build_support_debug_bundle_includes_redacted_state_and_log_tail(
         assert "access_key=[redacted]" in app_log
         event_log = archive.read("logs/app.events.jsonl").decode("utf-8")
         assert '"password": "[redacted]"' in event_log
+
+
+@pytest.mark.asyncio
+async def test_support_and_error_bundles_redact_credentials_inside_free_text(tmp_path):
+    markers = [
+        "fixture-token-value",
+        "fixture-password-value",
+        "fixture-url-value",
+        "fixture-header-value",
+        "fixture-json-value",
+    ]
+    messages = [
+        f"token={markers[0]}",
+        f"password={markers[1]}",
+        f"https://user:{markers[2]}@example.com/path",
+        f"Authorization: Bearer {markers[3]}",
+        json.dumps({"authorization": f"Basic {markers[4]}", "error_inst": "7K2Q9M4D"}),
+    ]
+    log_path = tmp_path / "app.log"
+    log_path.write_text("\n".join(messages))
+    log_path.with_name("app.events.jsonl").write_text(messages[-1] + "\n")
+    settings = Settings(
+        _env_file=None, log_path=log_path, host_state_path=tmp_path / "state.json"
+    )
+    maker = await _make_session(tmp_path / "app.db")
+    try:
+        async with maker() as session:
+            session.add(
+                Operation(
+                    kind="apply_host",
+                    status="failed",
+                    error="; ".join(messages),
+                    details_json=json.dumps(
+                        {
+                            "message": messages,
+                            "error_inst": "7K2Q9M4D",
+                            "safe_count": 42,
+                        }
+                    ),
+                )
+            )
+            await session.commit()
+            for bundle in [
+                await build_support_debug_bundle(session, settings),
+                await build_error_debug_bundle(
+                    session, settings, error_inst="7K2Q9M4D"
+                ),
+            ]:
+                with ZipFile(BytesIO(bundle.content)) as archive:
+                    contents = {
+                        name: archive.read(name).decode() for name in archive.namelist()
+                    }
+                assert all(
+                    marker not in "\n".join(contents.values()) for marker in markers
+                )
+                row = json.loads(contents["state/operations.json"])[0]
+                assert row["details"]["safe_count"] == 42
+                assert row["details"]["error_inst"] == "7K2Q9M4D"
+                if contents.get("logs/app.events.jsonl", "").strip():
+                    json.loads(contents["logs/app.events.jsonl"])
+    finally:
+        await maker.kw["bind"].dispose()

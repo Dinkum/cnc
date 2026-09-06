@@ -1,12 +1,14 @@
 import asyncio
 from collections.abc import AsyncGenerator
 from pathlib import Path
+from weakref import WeakSet
 
 from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 from alembic.util.exc import CommandError as AlembicCommandError
 from sqlalchemy import event, text
+from sqlalchemy.engine import Engine
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -21,7 +23,7 @@ from app.config import get_settings
 
 engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
-_configured_sync_engines: set[int] = set()
+_configured_sync_engines: WeakSet[Engine] = WeakSet()
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _ALEMBIC_INI = _PROJECT_ROOT / "alembic.ini"
 _ALEMBIC_SCRIPT_LOCATION = _PROJECT_ROOT / "migrations"
@@ -37,8 +39,8 @@ class Base(DeclarativeBase):
 
 
 def _configure_engine(sync_engine) -> None:
-    engine_id = id(sync_engine)
-    if engine_id in _configured_sync_engines:
+    # Engine IDs can be reused after disposal; retain only live engine identities.
+    if sync_engine in _configured_sync_engines:
         return
 
     @event.listens_for(sync_engine, "connect")
@@ -49,7 +51,7 @@ def _configure_engine(sync_engine) -> None:
         cursor.execute("PRAGMA busy_timeout=5000;")
         cursor.close()
 
-    _configured_sync_engines.add(engine_id)
+    _configured_sync_engines.add(sync_engine)
 
 
 def create_configured_async_engine(database_url: str, **kwargs) -> AsyncEngine:

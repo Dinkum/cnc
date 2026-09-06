@@ -444,3 +444,81 @@ async def test_send_pushover_notification_logs_error_type_and_retryable(
         and "retryable: true" in line
         for line in lines
     )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_limit_counts_due_attempts_not_cooldown_entries(
+    tmp_path, monkeypatch
+):
+    from datetime import UTC, datetime, timedelta
+    from app.services.notification_state import NotificationStateTransaction
+
+    settings = Settings(
+        host_state_path=tmp_path / "state.json",
+        pushover_app_token="fixture",
+        pushover_user_key="fixture",
+    )
+    now = datetime.now(UTC)
+    with NotificationStateTransaction(settings) as state:
+        for index in range(10):
+            state.set_pushover_outbox_entry(
+                str(index),
+                {
+                    "id": str(index),
+                    "created_at": str(index),
+                    "next_attempt_at": (
+                        now + timedelta(hours=1)
+                        if index < 5
+                        else now - timedelta(seconds=1)
+                    ).isoformat(),
+                },
+            )
+    attempted = []
+
+    def dispatch(_settings, intent_id):
+        attempted.append(intent_id)
+        return notifications.PushoverResponse(accepted=True)
+
+    monkeypatch.setattr(notifications, "_dispatch_pushover_intent", dispatch)
+    assert (
+        await notifications.dispatch_pending_pushover_notifications_async(
+            settings, limit=5
+        )
+        == 5
+    )
+    assert attempted == ["5", "6", "7", "8", "9"]
+
+
+@pytest.mark.asyncio
+async def test_outbox_lock_does_not_block_event_loop(tmp_path, monkeypatch):
+    import asyncio
+    import threading
+    from app.services.notification_state import NotificationStateTransaction
+
+    settings = Settings(
+        host_state_path=tmp_path / "state.json",
+        pushover_app_token="fixture",
+        pushover_user_key="fixture",
+    )
+    locked, release = threading.Event(), threading.Event()
+
+    def hold_lock():
+        with NotificationStateTransaction(settings):
+            locked.set()
+            release.wait(2)
+
+    holder = threading.Thread(target=hold_lock)
+    holder.start()
+    try:
+        assert await asyncio.to_thread(locked.wait, 1)
+        dispatch = asyncio.create_task(
+            notifications.dispatch_pending_pushover_notifications_async(settings)
+        )
+        await asyncio.sleep(0.02)
+        assert not dispatch.done()
+        assert not release.is_set()
+        release.set()
+        assert await dispatch == 0
+    finally:
+        release.set()
+        await asyncio.to_thread(holder.join)

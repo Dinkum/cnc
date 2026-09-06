@@ -1,5 +1,7 @@
 (() => {
   const {
+    bindMetricExport,
+    metricNumber,
     ensureMetricChartAssets,
     escapeHtml,
     formatLocalTimestamp,
@@ -1962,7 +1964,10 @@
     if (!hardeningFeatures || !hardeningFeatureRows) return;
     const rows = Array.isArray(hardeningState.features) ? hardeningState.features : [];
     hardeningFeatures.hidden = rows.length === 0;
-    if (hardeningApplyRecommended) hardeningApplyRecommended.hidden = true;
+    if (hardeningApplyRecommended) {
+      hardeningApplyRecommended.hidden = !rows.some((row) => row.recommendation === "recommended");
+      hardeningApplyRecommended.disabled = hardeningCard?.dataset.hardeningApplying === "true" || hardeningRunActive(hardeningState.phase1) || hardeningRunActive(hardeningState.phase2);
+    }
     let previousGroup = "";
     hardeningFeatureRows.innerHTML = rows.map((row) => {
       const recommendation = String(row.recommendation || "uncertain");
@@ -2001,6 +2006,7 @@
     if (!hardeningCard) return;
     const phase1 = hardeningState.phase1 || null;
     const phase2 = hardeningState.phase2 || null;
+    const applyingConfiguration = hardeningCard.dataset.hardeningApplying === "true";
     const phaseOneRunning = hardeningRunActive(phase1);
     const phaseTwoRunning = hardeningRunActive(phase2);
     const phaseOneComplete = phase1?.status === "success";
@@ -2013,7 +2019,7 @@
       if (hardeningPhaseOneLabel) hardeningPhaseOneLabel.textContent = phaseOneRunning ? hardeningStatusText(phase1) || "Phase 1 monitor running." : "";
       renderHardeningPhaseOneProgress(phase1, phaseOneRunning);
     }
-    if (hardeningPhaseOneStart) hardeningPhaseOneStart.disabled = phaseOneRunning || phaseTwoRunning;
+    if (hardeningPhaseOneStart) hardeningPhaseOneStart.disabled = applyingConfiguration || phaseOneRunning || phaseTwoRunning;
     if (hardeningPhaseOneStop) hardeningPhaseOneStop.hidden = !phaseOneRunning;
 
     hardeningPhaseTwo?.classList.toggle("is-locked", !phaseTwoUnlocked && !phaseTwoRunning);
@@ -2023,7 +2029,7 @@
     renderHardeningPhaseTwoProgress(phase2);
     if (hardeningPhaseTwoStart) {
       hardeningPhaseTwoStart.textContent = hardeningPhaseTwoCanResume(phase2) ? "Resume Phase 2" : "Start Phase 2";
-      hardeningPhaseTwoStart.disabled = !phaseTwoUnlocked || phaseTwoRunning;
+      hardeningPhaseTwoStart.disabled = applyingConfiguration || !phaseTwoUnlocked || phaseTwoRunning;
     }
     if (hardeningPhaseTwoStop) hardeningPhaseTwoStop.hidden = !phaseTwoRunning;
     renderHardeningFeatures();
@@ -2036,6 +2042,7 @@
       features: Array.isArray(payload.features) ? payload.features : [],
     };
     renderHardeningState();
+    document.dispatchEvent(new CustomEvent("cnc:hardening-status", { detail: payload }));
   };
 
   const closeHardeningPhase2Events = () => {
@@ -2107,6 +2114,8 @@
     applyHardeningPayload(payload);
     scheduleHardeningPoll();
   };
+
+  document.addEventListener("cnc:hardening-refresh", () => loadHardeningStatus());
 
   const loadHardeningStatus = async () => {
     if (!hardeningCard) return;
@@ -2449,16 +2458,15 @@
       disk: metrics.disk_usage_bytes,
       network: metrics.network_total_bps,
     };
-    let value = valueByMetric[metricKey];
-    if (metricKey === "network" && !Number.isFinite(Number(value))) {
-      const rx = Number(metrics.network_rx_bps);
-      const tx = Number(metrics.network_tx_bps);
-      value = (Number.isFinite(rx) || Number.isFinite(tx))
-        ? (Number.isFinite(rx) ? rx : 0) + (Number.isFinite(tx) ? tx : 0)
+    let value = metricNumber(valueByMetric[metricKey]);
+    if (metricKey === "network" && value === null) {
+      const rx = metricNumber(metrics.network_rx_bps);
+      const tx = metricNumber(metrics.network_tx_bps);
+      value = (rx !== null || tx !== null)
+        ? (rx ?? 0) + (tx ?? 0)
         : value;
     }
-    const numericValue = Number(value);
-    return Number.isFinite(numericValue) ? numericValue : null;
+    return value;
   };
 
   const readCachedMetricPayload = () => {
@@ -2550,9 +2558,17 @@
     return renderMetricsFromCachedStatus(outputLiveMetrics);
   };
 
+  const syncOutputMetricExport = () => bindMetricExport(
+    document.getElementById("output-metric-export"),
+    () => lastMetricPayload?.metric?.key === outputMetricKey()
+      && lastMetricPayload?.timeframe?.key === outputTimeframeKey() ? lastMetricPayload : null,
+    `output-${backendId}`
+  );
+
   const renderMetricsChart = (payload) => {
     if (!metricsChart || !metricsEmpty) return;
     lastMetricPayload = payload;
+    syncOutputMetricExport();
     setMetricsLoading(false);
     if (!window.Chart) {
       metricsEmpty.hidden = false;
@@ -2930,13 +2946,14 @@
 
   const loadMetricHistory = async () => {
     if (!metricSelect || !timeframeSelect || !metricsChart || !metricsEmpty) return;
+    lastMetricPayload = null;
+    syncOutputMetricExport();
     const requestId = ++metricsRequestId;
     metricsAbortController?.abort();
     const controller = new AbortController();
     metricsAbortController = controller;
     metricsEmpty.hidden = true;
     setMetricsLoading(true);
-    const loadingStartedAt = performance.now();
     try {
       await ensureMetricChartAssets();
       if (controller.signal.aborted || requestId !== metricsRequestId) return;
@@ -2957,10 +2974,6 @@
       const payload = await response.json();
       if (requestId !== metricsRequestId) return;
       writeCachedMetricPayload(payload);
-      const loadingElapsedMs = performance.now() - loadingStartedAt;
-      if (loadingElapsedMs < 420) {
-        await new Promise((resolve) => setTimeout(resolve, 420 - loadingElapsedMs));
-      }
       if (requestId !== metricsRequestId) return;
       renderMetricsChart(payload);
     } catch (error) {
@@ -2977,18 +2990,19 @@
       loadMetricHistory();
     };
     const initializeOutputMetrics = async () => {
-      try {
-        await ensureMetricChartAssets();
-      } catch {
-        showMetricHistoryError();
-        return;
-      }
       metricSelect.addEventListener("change", () => {
         refreshOutputMetrics();
       });
       timeframeSelect.addEventListener("change", () => {
         refreshOutputMetrics();
       });
+
+      try {
+        await ensureMetricChartAssets();
+      } catch {
+        showMetricHistoryError();
+        return;
+      }
       hydrateOutputMetrics();
       afterInitialLoad(() => loadMetricHistory());
     };

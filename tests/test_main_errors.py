@@ -1056,7 +1056,15 @@ async def test_deferred_interrupted_cleanup_runs_after_lock_clears(monkeypatch) 
         main, "fail_interrupted_backend_backups", fake_fail_interrupted_backend_backups
     )
 
-    await main._retry_interrupted_cleanup_when_unlocked(main.boot_settings)
+    main.initialize_startup_state(main.app)
+    main.set_startup_phase_state(
+        main.app,
+        "db",
+        {"status": "warning", "cleanup_deferred_reason": "host_mutation_lock_busy"},
+    )
+    await main._retry_interrupted_cleanup_when_unlocked(main.boot_settings, main.app)
+    assert main.snapshot_startup_state(main.app)["db"]["status"] == "ok"
+    assert "cleanup_deferred_reason" not in main.snapshot_startup_state(main.app)["db"]
 
     assert calls == ["operations", "hardening", "backups", "released"]
 
@@ -1381,3 +1389,29 @@ async def test_ready_reports_startup_config_failure_as_not_ready(monkeypatch) ->
 @pytest.mark.asyncio
 async def test_live_does_not_probe_database() -> None:
     assert await status_routes.live() == {"status": "ok"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "state",
+    [
+        {"status": "failed", "cleanup_deferred_reason": "cleanup_failed"},
+        {"status": "warning", "error": "unrelated warning"},
+    ],
+)
+async def test_cleanup_retry_does_not_clear_unrelated_startup_failure(
+    monkeypatch, state
+):
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    main.initialize_startup_state(app)
+    main.set_startup_phase_state(app, "db", state)
+
+    async def completed(_settings):
+        return "completed"
+
+    monkeypatch.setattr(main, "_run_interrupted_cleanup_if_unlocked", completed)
+    monkeypatch.setattr(main, "STARTUP_INTERRUPTED_CLEANUP_RETRY_DELAY_SEC", 0)
+    await main._retry_interrupted_cleanup_when_unlocked(main.boot_settings, app)
+    assert main.snapshot_startup_state(app)["db"] == state

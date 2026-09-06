@@ -373,6 +373,7 @@ async def update_beta_settings_form(
     request: Request,
     csrf_token: str = Form(...),
     beta_routing: bool = Form(False),
+    beta_hardening: bool = Form(False),
     shield_enabled: bool = Form(False),
     netdata_enabled: bool = Form(False),
     settings: Settings = Depends(settings_dependency),
@@ -403,6 +404,7 @@ async def update_beta_settings_form(
             settings,
             {
                 "BETA_ROUTING": "true" if beta_routing_enabled else "false",
+                "BETA_HARDENING": "true" if beta_hardening is True else "false",
                 "SHIELD_ENABLED": "true" if shield_server_enabled else "false",
                 "NETDATA_ENABLED": "true" if netdata_server_enabled else "false",
             },

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from weakref import WeakKeyDictionary
 import copy
 from datetime import UTC, datetime
 import hashlib
@@ -20,6 +21,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
+from app.services.thread_workers import BoundedThreadWorker
 from app.config import Settings, get_settings
 from app.database import create_configured_async_engine
 from app.logger import get_logger
@@ -63,6 +65,10 @@ logger = get_logger("backup")
 BackupProgressCallback = Callable[[int, str], None]
 BACKUP_DESCRIPTION_CACHE_TTL_SEC = 300
 BACKUP_DESCRIPTION_CACHE_MAX = 128
+_description_workers = BoundedThreadWorker(2)
+_description_tasks: WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[tuple[object, ...], asyncio.Task]
+] = WeakKeyDictionary()
 _backup_description_cache: dict[tuple[object, ...], tuple[float, dict[str, Any]]] = {}
 BACKUP_RESTART_ERROR = "backup interrupted by CNC restart"
 
@@ -101,6 +107,7 @@ def _metadata_snapshot(backend: Backend) -> dict[str, Any]:
             "cpu_quota_override": backend.cpu_quota_override,
             "inter_app_interfaces_json": backend.inter_app_interfaces_json,
             "volumes_json": backend.volumes_json,
+            "hardening_config_json": backend.hardening_config_json or "{}",
             "enabled": backend.enabled,
             "notes": backend.notes,
         },
@@ -715,13 +722,19 @@ def _backup_tar_filter(*, allow_links: bool):
 
 def _load_bundle_metadata(bundle_path: Path) -> dict[str, Any]:
     with tarfile.open(bundle_path, "r:*") as archive:
-        try:
-            member = archive.getmember(BUNDLE_METADATA_NAME)
-        except KeyError as exc:
-            raise RuntimeError("backup bundle metadata missing") from exc
-        handle = archive.extractfile(member)
-        if handle is None:
-            raise RuntimeError("backup bundle metadata missing")
+        return _metadata_from_open_archive(archive)
+
+
+def _metadata_from_open_archive(archive: tarfile.TarFile) -> dict[str, Any]:
+    # getmember preserves the archive's last-entry-wins metadata semantics.
+    try:
+        member = archive.getmember(BUNDLE_METADATA_NAME)
+    except KeyError as exc:
+        raise RuntimeError("backup bundle metadata missing") from exc
+    handle = archive.extractfile(member)
+    if handle is None:
+        raise RuntimeError("backup bundle metadata missing")
+    with handle:
         payload = json.loads(handle.read().decode("utf-8"))
     if not isinstance(payload, dict):
         raise RuntimeError("backup bundle metadata is invalid")
@@ -891,16 +904,16 @@ def _verify_bundle_contents(
             "backup bundle checksum mismatch",
         )
 
-    metadata = _load_bundle_metadata(bundle_path)
-    backend_payload = metadata.get("backend")
-    if not isinstance(backend_payload, dict):
-        raise RuntimeError("backup metadata missing backend snapshot")
-
-    bundle_format_version = metadata.get("bundle_format_version")
-    if not isinstance(bundle_format_version, int) or bundle_format_version < 1:
-        raise RuntimeError("backup bundle format version is invalid")
-
     with tarfile.open(bundle_path, "r:*") as archive:
+        metadata = _metadata_from_open_archive(archive)
+        backend_payload = metadata.get("backend")
+        if not isinstance(backend_payload, dict):
+            raise RuntimeError("backup metadata missing backend snapshot")
+
+        bundle_format_version = metadata.get("bundle_format_version")
+        if not isinstance(bundle_format_version, int) or bundle_format_version < 1:
+            raise RuntimeError("backup bundle format version is invalid")
+
         member_names: set[str] = set()
         for member in archive.getmembers():
             member_name = member.name.strip()
@@ -1018,6 +1031,7 @@ def _backend_payload_fields() -> tuple[str, ...]:
         "memory_max_override",
         "cpu_quota_override",
         "inter_app_interfaces_json",
+        "hardening_config_json",
         "volumes_json",
         "enabled",
         "notes",
@@ -2316,6 +2330,8 @@ async def restore_backend_backup(
     try:
         _report_backup_progress(progress_callback, 0, "Validating restore payload.")
         _validate_restore_mount_entries(metadata, settings, backend_name=backend.name)
+        # Validate policy before stopping the app or restoring any filesystem data.
+        restored_policy = _backend_from_metadata(metadata).hardening_config_json
         if had_container:
             _report_backup_progress(progress_callback, 0, "Stopping existing runtime.")
             _stop_backend_runtime_if_present(backend.name, settings)
@@ -2324,6 +2340,8 @@ async def restore_backend_backup(
         restored_paths = await asyncio.to_thread(restore_txn.apply)
 
         _report_backup_progress(progress_callback, 0, "Restoring backend config.")
+        backend.hardening_config_json = restored_policy
+        backend.hardening_previous_json = None
         for field in _backend_payload_fields():
             if field in backend_payload:
                 setattr(backend, field, backend_payload.get(field))
@@ -3194,9 +3212,46 @@ async def describe_backend_backup(
     cached = _cached_backup_description(cache_key)
     if cached is not None:
         return cached
+    loop = asyncio.get_running_loop()
+    tasks = _description_tasks.setdefault(loop, {})
+    task = tasks.get(cache_key)
+    if task is None:
+        # Snapshot only the fields needed by the worker, independent of the
+        # request's ORM session and of any caller's cancellation.
+        snapshot = BackendBackup(
+            bundle_path=backup.bundle_path, bundle_sha256=backup.bundle_sha256
+        )
+        backend = (
+            Backend(kind=current_backend.kind) if current_backend is not None else None
+        )
+        task = asyncio.create_task(
+            _describe_backup_uncached(snapshot, backend, cache_key)
+        )
+        tasks[cache_key] = task
+        task.add_done_callback(lambda completed: tasks.pop(cache_key, None))
+    return copy.deepcopy(await asyncio.shield(task))
+
+
+async def drain_backup_descriptions() -> None:
+    tasks = _description_tasks.pop(asyncio.get_running_loop(), {})
+    if tasks:
+        await asyncio.gather(*tasks.values(), return_exceptions=True)
+
+
+async def _describe_backup_uncached(
+    backup, current_backend, cache_key
+) -> dict[str, Any]:
+    payload = await _description_workers.run(
+        _inspect_backup_description, backup, current_backend
+    )
+    if payload["verification_status"] == "verified":
+        _store_backup_description(cache_key, payload)
+    return payload
+
+
+def _inspect_backup_description(backup, current_backend) -> dict[str, Any]:
     try:
-        verification = await asyncio.to_thread(
-            _verify_bundle_contents,
+        verification = _verify_bundle_contents(
             Path(backup.bundle_path),
             expected_sha256=str(backup.bundle_sha256 or ""),
         )
@@ -3209,14 +3264,11 @@ async def describe_backend_backup(
                 verification["metadata"], current_backend=current_backend
             ),
         }
-        _store_backup_description(cache_key, payload)
         return payload
     except Exception:
         metadata: dict[str, Any]
         try:
-            metadata = await asyncio.to_thread(
-                _load_bundle_metadata, Path(backup.bundle_path)
-            )
+            metadata = _load_bundle_metadata(Path(backup.bundle_path))
         except Exception:
             metadata = {}
         fallback_coverage = (
@@ -3240,10 +3292,20 @@ async def describe_backend_backup(
                 "risk_summary": "bundle verification failed",
             }
         )
+        fallback_trust = {
+            **fallback_trust,
+            "restore_readiness": "high_risk",
+            "restore_readiness_label": "high risk",
+            "risk_flags": list(
+                dict.fromkeys(
+                    [*fallback_trust.get("risk_flags", []), "verification_failed"]
+                )
+            ),
+            "risk_summary": "bundle verification failed; restore readiness is unverified",
+        }
         payload = {
             **fallback_coverage,
             **fallback_trust,
             "verification_status": "failed",
         }
-        _store_backup_description(cache_key, payload)
         return payload

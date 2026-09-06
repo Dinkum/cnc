@@ -44,7 +44,11 @@
         script.dataset.loaded = "1";
         resolve();
       }, { once: true });
-      script.addEventListener("error", () => reject(new Error(`failed to load ${src}`)), { once: true });
+      script.addEventListener("error", () => {
+        deferredScripts.delete(src);
+        script.remove();
+        reject(new Error(`failed to load ${src}`));
+      }, { once: true });
       if (!existingScript) {
         script.src = src;
         script.async = true;
@@ -58,6 +62,54 @@
   const ensureMetricChartAssets = async () => {
     await loadDeferredScript("/static/vendor/chart-4.4.7.umd.min.js");
     await loadDeferredScript("/static/js/metric-event-markers.js");
+  };
+
+  const metricNumber = (value) => {
+    if (value == null || typeof value === "boolean" || (typeof value === "string" && !value.trim())) return null;
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+  };
+
+  const metricCsv = (payload, scope) => {
+    const columns = ["scope", "metric", "unit", ...new Set(payload.series.flatMap((point) => Object.keys(point)))];
+    const unit = payload.metric.unit_kind === "rate" ? "bytes_per_second" : payload.metric.unit_kind;
+    const cell = (value) => {
+      let text = String(value ?? "");
+      // Keep text cells inert in spreadsheet applications; numeric negatives
+      // remain numeric and retain their exact value.
+      if (typeof value === "string" && /^[=+@\-\t\r]/.test(text)) text = `'${text}`;
+      return `"${text.replaceAll('"', '""')}"`;
+    };
+    const rows = payload.series.map((point) => {
+      const row = { scope, metric: payload.metric.key, unit, ...point };
+      return columns.map((key) => row[key]);
+    });
+    return [columns, ...rows].map((row) => row.map(cell).join(",")).join("\r\n") + "\r\n";
+  };
+
+  const bindMetricExport = (control, getPayload, scope) => {
+    if (!control) return;
+    const available = () => {
+      const payload = getPayload();
+      return payload?.available && payload?.series?.length ? payload : null;
+    };
+    control.disabled = !available();
+    control.onchange = () => {
+      const format = control.value;
+      control.value = "";
+      const payload = available();
+      if (!payload || !["csv", "json"].includes(format)) return;
+      const content = format === "csv" ? metricCsv(payload, scope) : JSON.stringify(payload, null, 2) + "\n";
+      const blob = new Blob([content], { type: format === "csv" ? "text/csv;charset=utf-8" : "application/json" });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `${scope}-${payload.metric.key}-${payload.timeframe.key}.${format}`.replace(/[^a-zA-Z0-9_.-]/g, "-");
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    };
   };
 
   const normalizeTimestampValue = (value) => {
@@ -97,6 +149,9 @@
   };
 
   window.CNCUI = Object.freeze({
+    bindMetricExport,
+    metricCsv,
+    metricNumber,
     ensureMetricChartAssets,
     escapeHtml,
     formatLocalTimestamp,

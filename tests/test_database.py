@@ -10,7 +10,7 @@ from app import config
 from app import database
 
 
-CURRENT_REVISION = "0037_control_event_target_indexes"
+CURRENT_REVISION = "0038_backend_hardening_config"
 
 
 def test_database_import_does_not_validate_settings_at_import(monkeypatch) -> None:
@@ -399,3 +399,48 @@ async def test_init_db_rejects_unknown_alembic_revision_with_repair_guidance(
     )
     assert "CNC did not modify the database" in message
     assert "deliberate Alembic stamp repair" in message
+
+
+@pytest.mark.asyncio
+async def test_engine_registration_releases_collected_engines_and_preserves_cascades(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import gc
+    import weakref
+    from sqlalchemy.ext.asyncio.engine import create_async_engine as untracked_engine
+
+    # Bypass the suite's engine-retention fixture so collection matches production.
+    monkeypatch.setattr(database, "create_async_engine", untracked_engine)
+    references = []
+    registry_size = len(database._configured_sync_engines)
+    for index in range(4):
+        engine = database.create_configured_async_engine(
+            f"sqlite+aiosqlite:///{tmp_path / 'engine-lifecycle.db'}"
+        )
+        references.append(weakref.ref(engine.sync_engine))
+        listener_count = len(engine.sync_engine.pool.dispatch.connect)
+        database._configure_engine(engine.sync_engine)
+        assert len(engine.sync_engine.pool.dispatch.connect) == listener_count
+        async with engine.begin() as conn:
+            assert (await conn.execute(text("PRAGMA foreign_keys"))).scalar() == 1
+            assert (await conn.execute(text("PRAGMA journal_mode"))).scalar() == "wal"
+            assert (await conn.execute(text("PRAGMA busy_timeout"))).scalar() == 5000
+            await conn.execute(
+                text("CREATE TABLE IF NOT EXISTS parent (id INTEGER PRIMARY KEY)")
+            )
+            await conn.execute(
+                text(
+                    "CREATE TABLE IF NOT EXISTS child (parent_id INTEGER REFERENCES parent(id) ON DELETE CASCADE)"
+                )
+            )
+            await conn.execute(text("INSERT INTO parent VALUES (:id)"), {"id": index})
+            await conn.execute(text("INSERT INTO child VALUES (:id)"), {"id": index})
+            await conn.execute(text("DELETE FROM parent WHERE id = :id"), {"id": index})
+            assert (
+                await conn.execute(text("SELECT count(*) FROM child"))
+            ).scalar() == 0
+        await engine.dispose()
+        del conn, engine
+        gc.collect()
+    assert all(reference() is None for reference in references)
+    assert len(database._configured_sync_engines) <= registry_size

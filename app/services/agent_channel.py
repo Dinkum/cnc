@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 from collections.abc import Awaitable, Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
@@ -21,10 +22,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.websockets import WebSocketDisconnect
 
 from app.access import (
-    access_attempt_backoff_seconds,
     access_key_is_configured,
-    record_access_attempt,
-    verify_access_key,
+    verify_access_key_async,
 )
 from app.config import Settings
 from app.logger import get_logger
@@ -46,11 +45,7 @@ DEFAULT_EXEC_TIMEOUT_SEC = 60
 MAX_EXEC_TIMEOUT_SEC = 60 * 30
 DEFAULT_PTY_IDLE_TIMEOUT_SEC = 60 * 15
 MAX_PTY_IDLE_TIMEOUT_SEC = 60 * 60
-AGENT_AUTH_MAX_CONCURRENT_VERIFICATIONS = 2
 logger = get_logger("agent_channel")
-_AGENT_AUTH_VERIFY_SEMAPHORE = asyncio.BoundedSemaphore(
-    AGENT_AUTH_MAX_CONCURRENT_VERIFICATIONS
-)
 
 
 SendJson = Callable[[dict[str, Any]], Awaitable[None]]
@@ -77,38 +72,6 @@ class AgentChannelFrameError(ValueError):
 
 def _agent_auth_attempt_key(client_host: str) -> str:
     return f"agent:{client_host or 'unknown'}"
-
-
-async def _verify_agent_access_key(
-    settings: Settings,
-    token: str,
-    *,
-    attempt_key: str,
-) -> tuple[bool, int]:
-    retry_after = access_attempt_backoff_seconds(attempt_key)
-    if retry_after > 0:
-        return False, retry_after
-
-    async with _AGENT_AUTH_VERIFY_SEMAPHORE:
-        # A queued handshake rechecks after entering the bounded verifier so a
-        # burst from one peer cannot schedule repeated Argon2 work up front.
-        retry_after = access_attempt_backoff_seconds(attempt_key)
-        if retry_after > 0:
-            return False, retry_after
-
-        verify_task = asyncio.create_task(
-            asyncio.to_thread(verify_access_key, settings, token)
-        )
-        try:
-            valid = await asyncio.shield(verify_task)
-        except asyncio.CancelledError:
-            # Argon2 continues in its worker after caller cancellation. Keep the
-            # semaphore held until it finishes so the concurrency bound is real.
-            valid = await verify_task
-            record_access_attempt(attempt_key, success=valid)
-            raise
-        record_access_attempt(attempt_key, success=valid)
-        return valid, 0
 
 
 def _guest_exec_frame_error(
@@ -334,6 +297,7 @@ class PtySession:
                 )
 
     async def _pump_output(self) -> None:
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         while not self.closed:
             remaining = self.idle_timeout_sec - (time.monotonic() - self.last_activity)
             if remaining <= 0:
@@ -367,15 +331,25 @@ class PtySession:
             except BlockingIOError:
                 continue
             except OSError:
+                tail = decoder.decode(b"", final=True)
+                if tail:
+                    await self.send_json(
+                        {"id": self.frame_id, "type": "pty.output", "data": tail}
+                    )
                 return
             if not chunk:
+                tail = decoder.decode(b"", final=True)
+                if tail:
+                    await self.send_json(
+                        {"id": self.frame_id, "type": "pty.output", "data": tail}
+                    )
                 return
             self.last_activity = time.monotonic()
             await self.send_json(
                 {
                     "id": self.frame_id,
                     "type": "pty.output",
-                    "data": chunk.decode("utf-8", errors="replace"),
+                    "data": decoder.decode(chunk),
                 }
             )
 
@@ -425,7 +399,7 @@ async def authenticate_agent_websocket(
             reason="bearer_token_missing",
         )
         raise AgentChannelAuthError("bearer token required")
-    valid, retry_after = await _verify_agent_access_key(
+    valid, retry_after = await verify_access_key_async(
         settings,
         token.strip(),
         attempt_key=_agent_auth_attempt_key(client_host),
@@ -954,15 +928,19 @@ async def _stream_reader(
     stream: str,
     send_json: SendJson,
 ) -> None:
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     while True:
         chunk = await reader.read(MAX_OUTPUT_CHUNK_BYTES)
         if not chunk:
+            tail = decoder.decode(b"", final=True)
+            if tail:
+                await send_json({"id": frame_id, "type": stream, "data": tail})
             return
         await send_json(
             {
                 "id": frame_id,
                 "type": stream,
-                "data": chunk.decode("utf-8", errors="replace"),
+                "data": decoder.decode(chunk),
             }
         )
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Literal
 
 from app.config import Settings
 from app.dependencies import (
@@ -21,22 +22,28 @@ from app.services.app_hardening import (
     run_phase2_test,
 )
 from app.services.backend_ssh_keys import ensure_backend_ssh_keypair
+from app.services.hardening_policy import hardening_configuration, hardening_preview
 from app.services.error_reporting import ErrorCode
 from app.services.operations import (
     HostMutationLockError,
     host_mutation_operation,
+    create_operation,
 )
 from app.services.ssh_access import reconcile_backend_ssh_access
 from app.ui.errors import operator_error_json as _operator_error_json
 from app.ui.routes.reads import _backend_ssh_key_download_response
-from app.ui.routes.shared import logger
+from app.ui.routes.shared import logger, _host_mutation_preflight_message
+from app.ui.operations.common import operation_backend, operation_response
+from app.ui.operations.hardening import run_hardening_apply
 from fastapi import (
     APIRouter,
     BackgroundTasks,
     Depends,
     Form,
     Request,
+    HTTPException,
 )
+from pydantic import ValidationError as PolicyValidationError
 from fastapi.responses import (
     JSONResponse,
     Response,
@@ -47,6 +54,131 @@ from sqlalchemy.orm import selectinload
 
 
 router = APIRouter(tags=["ui"])
+
+
+def require_hardening_enabled(settings: Settings) -> None:
+    if not settings.beta_hardening:
+        raise HTTPException(
+            status_code=403,
+            detail="Enable Security hardening in CNC Settings → Beta features first.",
+        )
+
+
+async def _hardening_backend(
+    session: AsyncSession, settings: Settings, backend_id: int
+) -> Backend:
+    require_hardening_enabled(settings)
+    try:
+        backend = await operation_backend(session, backend_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="App output not found.") from exc
+    if backend.kind != "app":
+        raise HTTPException(
+            status_code=400, detail="Hardening is only available for app outputs."
+        )
+    return backend
+
+
+def _configuration_preview(
+    backend: Backend, summary: dict, mode: str, configuration: str
+) -> dict:
+    try:
+        return hardening_preview(backend, summary, mode, configuration)
+    except PolicyValidationError as exc:
+        raise HTTPException(
+            status_code=400, detail=exc.errors(include_input=False)[0]["msg"]
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/api/backends/{backend_id}/hardening/configuration")
+async def read_hardening_configuration(
+    backend_id: int,
+    settings: Settings = Depends(settings_dependency),
+    session: AsyncSession = Depends(db_session_dependency),
+) -> dict:
+    backend = await _hardening_backend(session, settings, backend_id)
+    summary = await latest_hardening_summary(session, backend_id)
+    return hardening_configuration(backend, summary)
+
+
+@router.post("/ui/backends/{backend_id}/hardening/preview")
+async def preview_hardening_configuration(
+    backend_id: int,
+    request: Request,
+    csrf_token: str = Form(...),
+    mode: Literal["recommended", "manual", "previous"] = Form(...),
+    configuration: str = Form("{}", max_length=16_384),
+    settings: Settings = Depends(settings_dependency),
+    session: AsyncSession = Depends(db_session_dependency),
+) -> dict:
+    enforce_csrf(request, settings, csrf_token)
+    backend = await _hardening_backend(session, settings, backend_id)
+    return _configuration_preview(
+        backend,
+        await latest_hardening_summary(session, backend_id),
+        mode,
+        configuration,
+    )
+
+
+@router.post("/ui/backends/{backend_id}/hardening/apply")
+async def apply_hardening_configuration(
+    backend_id: int,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    csrf_token: str = Form(...),
+    mode: Literal["recommended", "manual", "previous"] = Form(...),
+    configuration: str = Form("{}", max_length=16_384),
+    revision: str = Form(..., min_length=64, max_length=64),
+    reviewed: bool = Form(False),
+    settings: Settings = Depends(settings_dependency),
+    session: AsyncSession = Depends(db_session_dependency),
+) -> JSONResponse:
+    enforce_csrf(request, settings, csrf_token)
+    backend = await _hardening_backend(session, settings, backend_id)
+    if reviewed is not True:
+        raise HTTPException(
+            status_code=400,
+            detail="Review the recommendations and acknowledge the possible impact before applying.",
+        )
+    plan = _configuration_preview(
+        backend,
+        await latest_hardening_summary(session, backend_id),
+        mode,
+        configuration,
+    )
+    if plan["revision"] != revision:
+        raise HTTPException(
+            status_code=409,
+            detail="The output or recommendations changed. Review the configuration again.",
+        )
+    blocked = await _host_mutation_preflight_message(
+        settings, action="Security configuration apply"
+    )
+    if blocked:
+        raise HTTPException(status_code=409, detail=blocked)
+    # Release the read transaction before the separate operation writer opens SQLite.
+    await session.rollback()
+    operation = await create_operation(
+        settings,
+        kind="ui.backend.hardening",
+        actor="ui",
+        backend_id=backend_id,
+        phase="Apply security configuration",
+        details={"message": "Security configuration queued.", "backend_id": backend_id},
+    )
+    background_tasks.add_task(
+        run_hardening_apply,
+        settings,
+        operation.id,
+        backend_id,
+        mode=mode,
+        configuration=configuration,
+        revision=revision,
+    )
+    return operation_response(operation, message="Security configuration queued.")
 
 
 @router.post("/api/backends/{backend_id}/ssh-key")
@@ -128,6 +260,7 @@ async def start_hardening_phase1(
     session: AsyncSession = Depends(db_session_dependency),
 ) -> JSONResponse:
     enforce_csrf(request, settings, csrf_token)
+    require_hardening_enabled(settings)
     backend = (
         await session.execute(
             select(Backend)
@@ -201,6 +334,7 @@ async def start_hardening_phase2(
     session: AsyncSession = Depends(db_session_dependency),
 ) -> JSONResponse:
     enforce_csrf(request, settings, csrf_token)
+    require_hardening_enabled(settings)
     backend = (
         await session.execute(
             select(Backend)
@@ -264,6 +398,7 @@ async def resume_hardening_phase2(
     session: AsyncSession = Depends(db_session_dependency),
 ) -> JSONResponse:
     enforce_csrf(request, settings, csrf_token)
+    require_hardening_enabled(settings)
     backend = (
         await session.execute(
             select(Backend)

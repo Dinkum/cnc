@@ -19,6 +19,7 @@ async def test_resume_hardening_phase2_seeds_new_run(
 ) -> None:
     maker = await _make_session(tmp_path / "app.db")
     settings = Settings(
+        beta_hardening=True,
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'app.db'}",
         app_control_dir=tmp_path / "app-control",
     )
@@ -88,7 +89,9 @@ async def test_resume_hardening_phase2_reuses_active_run(
     monkeypatch, tmp_path: Path
 ) -> None:
     maker = await _make_session(tmp_path / "app.db")
-    settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path / 'app.db'}")
+    settings = Settings(
+        beta_hardening=True, database_url=f"sqlite+aiosqlite:///{tmp_path / 'app.db'}"
+    )
     monkeypatch.setattr(ui_hardening, "enforce_csrf", lambda *_args, **_kwargs: None)
 
     async with maker() as session:

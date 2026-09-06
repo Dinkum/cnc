@@ -12,6 +12,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from app import access
 from app.access import hash_access_key
 from app.config import Settings
 from app.database import Base
@@ -150,7 +151,7 @@ async def test_agent_websocket_auth_backoff_skips_repeated_argon2_work(
     settings = Settings(access_key_hash="configured")
     client_host = "100.64.0.231"
     attempt_key = agent_channel._agent_auth_attempt_key(client_host)
-    agent_channel.record_access_attempt(attempt_key, success=True)
+    access.record_access_attempt(attempt_key, success=True)
     verify_calls = 0
     events: list[tuple[str, dict[str, object]]] = []
 
@@ -166,7 +167,7 @@ async def test_agent_websocket_auth_backoff_skips_repeated_argon2_work(
         def warning(self, event: str, **context: object) -> None:
             events.append((event, context))
 
-    monkeypatch.setattr(agent_channel, "verify_access_key", fake_verify)
+    monkeypatch.setattr(access, "verify_access_key", fake_verify)
     monkeypatch.setattr(agent_channel, "logger", RecordingLogger())
     websocket = SimpleNamespace(
         headers={"authorization": "Bearer invalid key material"},
@@ -182,7 +183,7 @@ async def test_agent_websocket_auth_backoff_skips_repeated_argon2_work(
     assert events[0][1]["reason"] == "bearer_token_invalid"
     assert events[1][1]["reason"] == "backoff"
     assert int(events[1][1]["retry_after_sec"]) >= 1
-    agent_channel.record_access_attempt(attempt_key, success=True)
+    access.record_access_attempt(attempt_key, success=True)
 
 
 @pytest.mark.asyncio
@@ -202,11 +203,11 @@ async def test_agent_websocket_auth_bounds_parallel_argon2_work(monkeypatch) -> 
             active -= 1
         return True
 
-    monkeypatch.setattr(agent_channel, "verify_access_key", fake_verify)
+    monkeypatch.setattr(access, "verify_access_key", fake_verify)
     monkeypatch.setattr(
-        agent_channel,
-        "_AGENT_AUTH_VERIFY_SEMAPHORE",
-        asyncio.BoundedSemaphore(agent_channel.AGENT_AUTH_MAX_CONCURRENT_VERIFICATIONS),
+        access,
+        "_ACCESS_VERIFY_SEMAPHORE",
+        asyncio.BoundedSemaphore(access.ACCESS_MAX_CONCURRENT_VERIFICATIONS),
     )
     websockets = [
         SimpleNamespace(
@@ -223,7 +224,7 @@ async def test_agent_websocket_auth_bounds_parallel_argon2_work(monkeypatch) -> 
         )
     )
 
-    assert maximum_active == agent_channel.AGENT_AUTH_MAX_CONCURRENT_VERIFICATIONS
+    assert maximum_active == access.ACCESS_MAX_CONCURRENT_VERIFICATIONS
 
 
 @pytest.mark.asyncio
@@ -1119,3 +1120,54 @@ def test_backend_llm_help_includes_agent_channel_guidance() -> None:
     body = render_backend_llm_help_text(payload)
     assert "beta tenant-wide WebSocket channel" in body
     assert '"type":"pty.open"' in body
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("data", ["café 漢字 🙂".encode(), b"\xffbad\xe2\x82"])
+async def test_command_stream_keeps_unicode_between_reads(data):
+    class Reader:
+        def __init__(self):
+            self.chunks = iter([bytes([value]) for value in data] + [b""])
+
+        async def read(self, _size):
+            return next(self.chunks)
+
+    frames = []
+
+    async def send(frame):
+        frames.append(frame)
+
+    await agent_channel._stream_reader(Reader(), "stream", "stdout", send)
+    assert "".join(frame["data"] for frame in frames) == data.decode(
+        "utf-8", errors="replace"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("data", ["café 漢字 🙂".encode(), b"\xffbad\xe2\x82"])
+async def test_pty_stream_keeps_unicode_between_reads(data, monkeypatch):
+    chunks = iter([bytes([value]) for value in data] + [b""])
+    frames = []
+
+    async def ready(*_args, **_kwargs):
+        return None
+
+    async def send(frame):
+        frames.append(frame)
+
+    monkeypatch.setattr(
+        agent_channel, "os", SimpleNamespace(read=lambda *_args: next(chunks))
+    )
+    monkeypatch.setattr(agent_channel, "_wait_for_fd", ready)
+    pty = SimpleNamespace(
+        closed=False,
+        idle_timeout_sec=60,
+        last_activity=time.monotonic(),
+        master_fd=42,
+        frame_id="pty",
+        send_json=send,
+    )
+    await agent_channel.PtySession._pump_output(pty)
+    assert "".join(frame["data"] for frame in frames) == data.decode(
+        "utf-8", errors="replace"
+    )

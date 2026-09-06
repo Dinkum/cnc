@@ -215,6 +215,13 @@ def _backup_summary(
         "available": True,
         "rows": [
             ("covered paths", covered_paths_summary or "-"),
+            ("integrity", str(coverage.get("verification_status") or "checking")),
+            ("restore", str(coverage.get("restore_readiness_label") or "checking")),
+            *(
+                [("note", str(coverage["risk_summary"]))]
+                if coverage.get("risk_summary")
+                else []
+            ),
         ],
     }
 

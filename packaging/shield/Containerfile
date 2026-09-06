@@ -19,8 +19,7 @@ COPY app /opt/cnc/app
 COPY packaging/shield/start.sh /usr/local/bin/cnc-shield
 
 RUN python3 -m venv /opt/cnc/.venv \
-    && /opt/cnc/.venv/bin/pip install --no-cache-dir --upgrade pip \
-    && /opt/cnc/.venv/bin/pip install --no-cache-dir -r /opt/cnc/requirements.txt \
+    && /opt/cnc/.venv/bin/pip install --no-cache-dir --require-hashes --only-binary=:all: -r /opt/cnc/requirements.txt \
     && /opt/cnc/.venv/bin/pip install --no-cache-dir --no-deps .
 
 RUN chmod 0755 /usr/local/bin/cnc-shield \

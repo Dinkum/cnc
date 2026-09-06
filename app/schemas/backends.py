@@ -106,6 +106,7 @@ class BackendOut(BaseModel):
     placement_active_node_uid: Optional[str] = None
     placement_node_uids_json: str = "[]"
     inter_app_interfaces_json: str = "[]"
+    hardening_config_json: str = "{}"
     volumes_json: str
     enabled: bool
     notes: Optional[str]

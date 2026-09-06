@@ -21,13 +21,21 @@
   };
 
   const dispatchPayload = async (payload, handlers, settle) => {
+    if (settle.isTerminal()) return true;
     const status = normalizeStatus(payload);
+    // EOF can arrive while a terminal callback awaits its page refresh.
+    if (TERMINAL_STATUSES.has(status)) settle.beginTerminal();
     if (RUNNING_STATUSES.has(status)) {
       await handlers.onProgress?.(payload);
       return false;
     }
     if (status === "success") {
-      await handlers.onSuccess?.(payload);
+      try {
+        await handlers.onSuccess?.(payload);
+      } catch (error) {
+        settle.reject(error);
+        return true;
+      }
       settle.resolve(payload);
       return true;
     }
@@ -62,6 +70,7 @@
     let pollFailures = 0;
     let usingPoll = false;
     let settled = false;
+    let terminalHandling = false;
 
     const cleanup = () => {
       if (eventSource) {
@@ -75,6 +84,11 @@
     };
 
     const settle = {
+      isTerminal: () => settled || terminalHandling,
+      beginTerminal: () => {
+        terminalHandling = true;
+        cleanup();
+      },
       resolve: (payload) => {
         if (settled) return;
         settled = true;
@@ -90,7 +104,7 @@
     };
 
     const schedulePoll = (delay) => {
-      if (settled) return;
+      if (settle.isTerminal()) return;
       pollTimer = window.setTimeout(poll, delay);
     };
 
@@ -101,6 +115,7 @@
     };
 
     const handleRetry = async (error, meta = {}) => {
+      if (settle.isTerminal()) return;
       pollFailures += 1;
       const nextRetryDelayMs = retryDelay();
       await handlers.onRetry?.({
@@ -115,14 +130,16 @@
     };
 
     const poll = async () => {
-      if (settled) return;
+      if (settle.isTerminal()) return;
       try {
         const response = await fetch(operationUrl(operationId), {
           credentials: "same-origin",
           headers: { Accept: "application/json" },
         });
+        if (settle.isTerminal()) return;
         if (!response.ok) {
           const error = await responseError(response);
+          if (settle.isTerminal()) return;
           if (response.status === 404) {
             await handlers.onError?.(error);
             settle.reject(error);
@@ -141,7 +158,7 @@
     };
 
     const startPolling = async (reason = "") => {
-      if (settled) return;
+      if (settle.isTerminal()) return;
       if (usingPoll) return;
       usingPoll = true;
       if (eventSource) {

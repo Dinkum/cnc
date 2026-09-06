@@ -551,6 +551,52 @@ def test_strict_setting_removes_container_when_start_fails(
     assert commands[-1] == ["podman", "rm", "-f", "cnc-app-demo"]
 
 
+@pytest.mark.parametrize("option", ["ro", "noexec", "nosuid", "nodev"])
+def test_strict_mount_checks_apply_the_actual_volume_option(
+    monkeypatch, tmp_path: Path, option: str
+) -> None:
+    backend = Backend(
+        name="demo",
+        kind="app",
+        port=12000,
+        enabled=True,
+        volumes_json=json.dumps(["/srv/data:/data:rw"]),
+    )
+    settings = Settings(
+        app_sandbox_dir=tmp_path / "sandboxes", app_control_dir=tmp_path / "app-control"
+    )
+    commands = []
+
+    def fake_run_command(command, **_kwargs):
+        commands.append(command)
+        return SimpleNamespace(ok=True, stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(app_hardening, "run_command", fake_run_command)
+    monkeypatch.setattr(
+        app_hardening, "_watch_container", lambda *_args, **_kwargs: (True, "")
+    )
+    setting = next(
+        setting
+        for setting in app_hardening.STRICT_SETTINGS
+        if setting.name == f"existing_mounts_{option}"
+    )
+    rating = app_hardening._test_strict_setting(
+        backend, setting, tmp_path / "evidence", settings
+    )
+
+    assert rating == "certain_safe"
+    create = next(
+        command for command in commands if command[:2] == ["podman", "create"]
+    )
+    volume = create[create.index("--volume") + 1]
+    assert volume.startswith("/srv/data:/data:")
+    assert option in volume.split(":", 2)[2].split(",")
+    if option == "ro":
+        assert "rw" not in volume.split(":", 2)[2].split(",")
+    assert "--read-only" not in create
+    assert "--security-opt=no-new-privileges" not in create
+
+
 def test_phase2_network_create_failure_is_fatal(monkeypatch, tmp_path: Path) -> None:
     settings = Settings()
     evidence_dir = tmp_path / "evidence"

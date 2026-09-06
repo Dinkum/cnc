@@ -3047,6 +3047,18 @@ def _dashboard_scope(active_tab: str | None) -> _DashboardScope:
     return _DashboardScope(tab)
 
 
+async def _latest_successful_apply_at(session: AsyncSession) -> datetime | None:
+    # Page freshness needs only a timestamp, not the potentially large snapshots.
+    return (
+        await session.execute(
+            select(ApplyRun.created_at)
+            .where(ApplyRun.status == "success")
+            .order_by(ApplyRun.id.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+
 async def _load_dashboard_rows(
     session: AsyncSession, *, scope: _DashboardScope
 ) -> _DashboardRows:
@@ -3058,24 +3070,11 @@ async def _load_dashboard_rows(
         input_query = input_query.options(selectinload(Input.backends))
     backends = list((await session.execute(backend_query)).scalars().all())
     inputs = list((await session.execute(input_query)).scalars().all())
-    last_successful_apply = (
-        (
-            await session.execute(
-                select(ApplyRun)
-                .where(ApplyRun.status == "success")
-                .order_by(ApplyRun.id.desc())
-                .limit(1)
-            )
-        )
-        .scalars()
-        .first()
-    )
+    last_applied_at = await _latest_successful_apply_at(session)
     return _DashboardRows(
         backends=backends,
         inputs=inputs,
-        last_applied_at=(
-            last_successful_apply.created_at if last_successful_apply else None
-        ),
+        last_applied_at=last_applied_at,
     )
 
 
@@ -3548,6 +3547,7 @@ async def _dashboard_context(
         "flash_error": None,
         "flash_success": None,
         "beta_routing": settings.beta_routing,
+        "beta_hardening": settings.beta_hardening,
         "multi_node_enabled": settings.multi_node_enabled,
         "cluster_nodes": cluster_nodes,
     }
@@ -3612,21 +3612,7 @@ async def _output_page_context(
     ).scalar_one_or_none()
     if backend is None:
         raise LookupError("backend not found")
-    last_successful_apply = (
-        (
-            await session.execute(
-                select(ApplyRun)
-                .where(ApplyRun.status == "success")
-                .order_by(ApplyRun.id.desc())
-                .limit(1)
-            )
-        )
-        .scalars()
-        .first()
-    )
-    last_applied_at = (
-        last_successful_apply.created_at if last_successful_apply else None
-    )
+    last_applied_at = await _latest_successful_apply_at(session)
     base_profile = build_resource_profile(
         settings, await _enabled_runtime_backends_for_resource_profile(session)
     )
@@ -3787,6 +3773,7 @@ async def _output_page_context(
         "flash_error": None,
         "flash_success": None,
         "beta_routing": settings.beta_routing,
+        "beta_hardening": settings.beta_hardening,
         "multi_node_enabled": settings.multi_node_enabled,
         "multi_node_transfer_enabled": multi_node_app_enabled,
         "cluster_nodes": cluster_nodes,

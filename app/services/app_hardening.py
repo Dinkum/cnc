@@ -19,6 +19,7 @@ from app.config import Settings
 from app.database import create_configured_async_engine
 from app.logger import get_logger
 from app.models.entities import Backend, BackendHardeningRun
+from app.services.hardening_policy import HardeningPolicy, hardening_volumes
 from app.schemas.backends import BackendCloneIn
 from app.services import backend_commands
 from app.services.app_healthchecks import probe_backend_health
@@ -245,9 +246,9 @@ STRICT_SETTINGS: tuple[StrictSetting, ...] = (
     StrictSetting("tmpfs_noexec", ("--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=128m",)),
     StrictSetting("tmpfs_nosuid", ("--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=128m",)),
     StrictSetting("tmpfs_nodev", ("--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=128m",)),
-    StrictSetting("existing_mounts_ro", ("--read-only",)),
-    StrictSetting("existing_mounts_noexec", ("--security-opt=no-new-privileges",)),
-    StrictSetting("existing_mounts_nosuid", ("--security-opt=no-new-privileges",)),
+    StrictSetting("existing_mounts_ro", ()),
+    StrictSetting("existing_mounts_noexec", ()),
+    StrictSetting("existing_mounts_nosuid", ()),
     StrictSetting("existing_mounts_nodev", ()),
     StrictSetting("mount_idmap_or_U_only_if_needed", ()),
     StrictSetting("no_extra_host_devices", ()),
@@ -1061,6 +1062,7 @@ async def _run_phase2_test_async(
         )
         ratings = _phase2_seed_ratings(run)
         details = _phase2_runtime_details(_json_loads_dict(run.details_json), ratings)
+        details["mount_test_version"] = 1
         completed_names = _phase2_completed_setting_names(ratings, details)
         completed_settings = sum(
             1 for setting in STRICT_SETTINGS if setting.name in completed_names
@@ -1149,6 +1151,7 @@ async def _run_phase2_test_async(
             clone_backend = result["backend"]
             if not isinstance(clone_backend, Backend):
                 raise RuntimeError("clone did not return backend")
+            clone_backend.hardening_config_json = "{}"
             logger.info(
                 "app_hardening.phase2.clone.created",
                 backend_id=backend_id,
@@ -1965,6 +1968,13 @@ def _test_strict_setting(
         flags.append(f"--security-opt=seccomp={profile}")
     try:
         command = _strict_create_command(backend, settings, flags)
+        if setting.name.startswith("existing_mounts_"):
+            policy = HardeningPolicy.model_validate({setting.name: True})
+            for index, argument in enumerate(command[:-1]):
+                if argument == "--volume":
+                    command[index + 1] = hardening_volumes(
+                        policy, [command[index + 1]]
+                    )[0]
         _write_json(setting_dir / "command.json", command)
         logger.info(
             "app_hardening.phase2.setting.create",
@@ -2352,6 +2362,12 @@ def _phase2_run_resumable(run: BackendHardeningRun) -> bool:
 def _phase2_seed_ratings(run: BackendHardeningRun) -> dict[str, str]:
     ratings = _json_loads_dict(run.ratings_json)
     known_settings = set(HARDENING_SETTINGS)
+    if _json_loads_dict(run.details_json).get("mount_test_version") != 1:
+        known_settings = {
+            setting
+            for setting in known_settings
+            if not setting.startswith("existing_mounts_")
+        }
     known_ratings = set(PHASE2_RATINGS)
     return {
         str(setting): str(rating)
@@ -2403,6 +2419,8 @@ def _phase2_runtime_details(
         seen.add(setting)
 
     details: dict[str, Any] = {"tested": tested, "skipped": skipped}
+    if raw_details.get("mount_test_version") == 1:
+        details["mount_test_version"] = 1
     resumed_from = raw_details.get("resumed_from_run_id")
     if isinstance(resumed_from, int):
         details["resumed_from_run_id"] = resumed_from
@@ -2638,6 +2656,13 @@ def _feature_rows(
     rows = []
     for setting in HARDENING_SETTINGS:
         phase2_rating = str(phase2_ratings.get(setting) or "")
+        if (
+            setting.startswith("existing_mounts_")
+            and phase2 is not None
+            and _json_loads_dict(phase2.details_json).get("mount_test_version") != 1
+        ):
+            # Older clone tests changed rootfs/privilege flags rather than mount options.
+            phase2_rating = ""
         phase1_rating = str(phase1_ratings.get(setting) or "")
         rating = phase2_rating or phase1_rating
         if not rating:

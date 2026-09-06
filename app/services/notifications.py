@@ -13,6 +13,7 @@ from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 
+from app.services.thread_workers import BoundedThreadWorker
 from app.config import Settings
 from app.logger import get_logger, redact_sensitive_text
 from app.services.file_locks import FileLock
@@ -36,6 +37,7 @@ SENSITIVE_FACT_LABEL_RE = re.compile(
 )
 
 logger = get_logger("notifications")
+_notification_workers = BoundedThreadWorker(4)
 
 
 @dataclass(frozen=True)
@@ -124,7 +126,8 @@ async def send_pushover_notification_async(
         logger.info(
             "notification.pushover.skipped", reason="not_configured", **log_context
         )
-        _record_pushover_delivery_state(
+        await _notification_workers.run(
+            _record_pushover_delivery_state,
             settings,
             status="skipped",
             event=normalized_event,
@@ -141,7 +144,8 @@ async def send_pushover_notification_async(
     safe_url = _redact_notification_url(url)
     safe_url_title = redact_sensitive_text(url_title or "") or None
     try:
-        intent_id, already_delivered = _enqueue_pushover_notification(
+        intent_id, already_delivered = await _notification_workers.run(
+            _enqueue_pushover_notification,
             settings,
             title=safe_title,
             message=safe_message,
@@ -181,11 +185,11 @@ async def send_pushover_notification_async(
     )
     try:
         if intent_id:
-            response = await asyncio.to_thread(
+            response = await _notification_workers.run(
                 _dispatch_pushover_intent, settings, intent_id
             )
         else:
-            direct_result = await asyncio.to_thread(
+            direct_result = await _notification_workers.run(
                 _send_pushover_notification,
                 settings,
                 title=safe_title,
@@ -210,7 +214,8 @@ async def send_pushover_notification_async(
             receipt=response.receipt,
             **log_context,
         )
-        _record_pushover_delivery_state(
+        await _notification_workers.run(
+            _record_pushover_delivery_state,
             settings,
             status="sent",
             event=normalized_event,
@@ -231,7 +236,8 @@ async def send_pushover_notification_async(
             **_notification_error_context(exc),
             **log_context,
         )
-        _record_pushover_delivery_state(
+        await _notification_workers.run(
+            _record_pushover_delivery_state,
             settings,
             status="queued" if deferred else "failed",
             event=normalized_event,
@@ -329,7 +335,9 @@ def _enqueue_pushover_notification(
         explicit=dedupe_key,
     )
     now = datetime.now(UTC)
-    with NotificationStateTransaction(settings) as state:
+    with NotificationStateTransaction(
+        settings, lock_timeout_sec=PUSHOVER_STATE_RETRY_TIMEOUT_SEC
+    ) as state:
         for intent_id, entry in state.get_pushover_outbox().items():
             if entry.get("dedupe_key") == normalized_dedupe_key:
                 return intent_id, False
@@ -381,7 +389,9 @@ def _dispatch_pushover_intent(settings: Settings, intent_id: str) -> PushoverRes
         lock_path=_pushover_dispatch_lock_path(settings),
         timeout_sec=PUSHOVER_STATE_RETRY_TIMEOUT_SEC,
     ):
-        with NotificationStateTransaction(settings) as state:
+        with NotificationStateTransaction(
+            settings, lock_timeout_sec=PUSHOVER_STATE_RETRY_TIMEOUT_SEC
+        ) as state:
             intent = state.get_pushover_outbox().get(intent_id)
         if not isinstance(intent, dict):
             return PushoverResponse(accepted=True)
@@ -415,7 +425,9 @@ def _dispatch_pushover_intent(settings: Settings, intent_id: str) -> PushoverRes
                 else PushoverResponse(accepted=bool(result))
             )
         except Exception as exc:
-            with NotificationStateTransaction(settings) as state:
+            with NotificationStateTransaction(
+                settings, lock_timeout_sec=PUSHOVER_STATE_RETRY_TIMEOUT_SEC
+            ) as state:
                 current = state.get_pushover_outbox().get(intent_id)
                 if isinstance(current, dict):
                     if _pushover_error_is_retryable(exc):
@@ -432,7 +444,9 @@ def _dispatch_pushover_intent(settings: Settings, intent_id: str) -> PushoverRes
                         state.remove_pushover_outbox_entry(intent_id)
             raise
 
-        with NotificationStateTransaction(settings) as state:
+        with NotificationStateTransaction(
+            settings, lock_timeout_sec=PUSHOVER_STATE_RETRY_TIMEOUT_SEC
+        ) as state:
             state.remove_pushover_outbox_entry(intent_id)
             normalized_dedupe_key = str(intent.get("dedupe_key") or "")
             if normalized_dedupe_key:
@@ -457,19 +471,25 @@ def _dispatch_pushover_intent(settings: Settings, intent_id: str) -> PushoverRes
         return response
 
 
+def _pending_pushover_intents(settings: Settings) -> list[dict[str, Any]]:
+    from app.services.notification_state import NotificationStateTransaction
+
+    with NotificationStateTransaction(
+        settings, lock_timeout_sec=PUSHOVER_STATE_RETRY_TIMEOUT_SEC
+    ) as state:
+        return sorted(
+            state.get_pushover_outbox().values(),
+            key=lambda entry: str(entry.get("created_at") or ""),
+        )
+
+
 async def dispatch_pending_pushover_notifications_async(
     settings: Settings, *, limit: int = 5
 ) -> int:
     if not pushover_is_configured(settings):
         return 0
-    from app.services.notification_state import NotificationStateTransaction
-
     try:
-        with NotificationStateTransaction(settings) as state:
-            pending = sorted(
-                state.get_pushover_outbox().values(),
-                key=lambda entry: str(entry.get("created_at") or ""),
-            )
+        pending = await _notification_workers.run(_pending_pushover_intents, settings)
     except Exception as exc:
         logger.error(
             "notification.pushover.outbox_read_failed",
@@ -479,15 +499,21 @@ async def dispatch_pending_pushover_notifications_async(
 
     delivered = 0
     now = datetime.now(UTC)
-    for intent in pending[: max(0, limit)]:
+    attempted = 0
+    for intent in pending:
+        if attempted >= max(0, limit):
+            break
         next_attempt_at = _parse_timestamp(intent.get("next_attempt_at"))
         if next_attempt_at is not None and next_attempt_at > now:
             continue
         intent_id = str(intent.get("id") or "")
         if not intent_id:
             continue
+        attempted += 1
         try:
-            await asyncio.to_thread(_dispatch_pushover_intent, settings, intent_id)
+            await _notification_workers.run(
+                _dispatch_pushover_intent, settings, intent_id
+            )
             delivered += 1
         except Exception as exc:
             logger.warning(
@@ -605,7 +631,7 @@ async def cancel_pushover_emergency_async(
     if not normalized_key or not pushover_is_configured(settings):
         return False
     try:
-        cancelled = await asyncio.to_thread(
+        cancelled = await _notification_workers.run(
             _cancel_pushover_emergency, settings, normalized_key
         )
     except Exception as exc:
@@ -631,7 +657,9 @@ def _cancel_pushover_emergency(settings: Settings, emergency_key: str) -> bool:
         lock_path=_pushover_dispatch_lock_path(settings),
         timeout_sec=PUSHOVER_STATE_RETRY_TIMEOUT_SEC,
     ):
-        with NotificationStateTransaction(settings) as state:
+        with NotificationStateTransaction(
+            settings, lock_timeout_sec=PUSHOVER_STATE_RETRY_TIMEOUT_SEC
+        ) as state:
             pending_removed = False
             for intent_id, intent in state.get_pushover_outbox().items():
                 if str(intent.get("emergency_key") or "") == emergency_key:
@@ -662,7 +690,9 @@ def _cancel_pushover_emergency(settings: Settings, emergency_key: str) -> bool:
                 raise PushoverTransientError(
                     f"pushover receipt cancellation unavailable (HTTP {exc.code})"
                 ) from exc
-            with NotificationStateTransaction(settings) as state:
+            with NotificationStateTransaction(
+                settings, lock_timeout_sec=PUSHOVER_STATE_RETRY_TIMEOUT_SEC
+            ) as state:
                 state.remove_pushover_receipt(emergency_key)
             raise PushoverRejectedError(
                 f"pushover rejected receipt cancellation (HTTP {exc.code})"
@@ -679,7 +709,9 @@ def _cancel_pushover_emergency(settings: Settings, emergency_key: str) -> bool:
             ) from exc
         if int(decoded.get("status") or 0) != 1:
             raise PushoverRejectedError("pushover rejected receipt cancellation")
-        with NotificationStateTransaction(settings) as state:
+        with NotificationStateTransaction(
+            settings, lock_timeout_sec=PUSHOVER_STATE_RETRY_TIMEOUT_SEC
+        ) as state:
             state.remove_pushover_receipt(emergency_key)
         return True
 

@@ -63,7 +63,7 @@ def test_shield_image_installs_pinned_requirements_before_local_package() -> Non
 
     assert "COPY pyproject.toml README.md requirements.txt /opt/cnc/" in containerfile
     assert (
-        "/opt/cnc/.venv/bin/pip install --no-cache-dir -r /opt/cnc/requirements.txt"
+        "/opt/cnc/.venv/bin/pip install --no-cache-dir --require-hashes --only-binary=:all: -r /opt/cnc/requirements.txt"
         in containerfile
     )
     assert "/opt/cnc/.venv/bin/pip install --no-cache-dir --no-deps ." in containerfile
@@ -1350,7 +1350,7 @@ def test_installer_uses_release_layout_for_initial_cutover() -> None:
     )
     assert 'run_cmd cp -a "${APP_DIR}/." "${INSTALL_RELEASE_DIR}/"' in script_text
     assert (
-        'run_cmd "${INSTALL_RELEASE_DIR}/.venv/bin/pip" --disable-pip-version-check -q install -r "${INSTALL_RELEASE_DIR}/requirements.txt"'
+        'run_cmd "${INSTALL_RELEASE_DIR}/.venv/bin/pip" --disable-pip-version-check -q install --require-hashes --only-binary=:all: -r "${INSTALL_RELEASE_DIR}/requirements.txt"'
         in script_text
     )
     assert (
@@ -1449,15 +1449,35 @@ def test_installer_validates_supported_python_and_infers_update_repo() -> None:
 
 def test_deploy_runtime_dependencies_are_pinned() -> None:
     requirements_path = Path("requirements.txt")
-    lines = [
-        line.strip()
-        for line in requirements_path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+    import re
+    import tomllib
 
-    assert requirements_path.exists()
-    assert all("==" in line for line in lines)
-    assert all(not line.startswith("#") for line in lines)
+    manifest = requirements_path.read_text(encoding="utf-8")
+    entries = manifest.replace("\\\n", " ").splitlines()
+    packages = {
+        item["name"]: item
+        for item in tomllib.loads(Path("uv.lock").read_text())["package"]
+    }
+    assert entries
+    for entry in entries:
+        match = re.match(r"([a-z0-9-]+)==([^ ;]+)", entry)
+        assert match, entry
+        name, version = match.groups()
+        assert packages[name]["version"] == version
+        hashes = re.findall(r"--hash=sha256:([0-9a-f]{64})", entry)
+        assert hashes, name
+        locked_hashes = {
+            item["hash"].removeprefix("sha256:")
+            for item in packages[name].get("wheels", [])
+        }
+        if packages[name].get("sdist"):
+            locked_hashes.add(packages[name]["sdist"]["hash"].removeprefix("sha256:"))
+        assert set(hashes) <= locked_hashes
+    project = tomllib.loads(Path("pyproject.toml").read_text())["project"]
+    for dependency in project["dependencies"]:
+        name, version = dependency.split("==")
+        assert packages[name]["version"] == version
+        assert f"{name}=={version}" in manifest
 
 
 def test_updater_syncs_managed_cli_wrappers() -> None:
@@ -1476,7 +1496,7 @@ def test_updater_syncs_managed_cli_wrappers() -> None:
     )
     assert 'log "syncing managed CLI wrappers"' in script_text
     assert (
-        '"${RELEASE_DIR}/.venv/bin/pip" install -r "${RELEASE_DIR}/requirements.txt"'
+        '"${RELEASE_DIR}/.venv/bin/pip" install --require-hashes --only-binary=:all: -r "${RELEASE_DIR}/requirements.txt"'
         in script_text
     )
     assert (

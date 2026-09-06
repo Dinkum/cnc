@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Literal
 
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import Settings
@@ -52,6 +52,7 @@ HOST_MUTATION_OPERATION_KINDS = (
     "ui.backend.placement",
     "ui.backend.state",
     "ui.backend.update",
+    "ui.backend.hardening",
     "ui.input.create",
     "ui.input.delete",
     "ui.input.update",
@@ -84,17 +85,54 @@ class HostMutationBlocker:
     phase: str
 
 
+@dataclass
+class _OperationSessionOwner:
+    database_url: str
+    loop: asyncio.AbstractEventLoop
+    engine: AsyncEngine
+    factory: async_sessionmaker[AsyncSession]
+    closed: bool = False
+
+
+_SESSION_OWNER: ContextVar[_OperationSessionOwner | None] = ContextVar(
+    "operation_session_owner", default=None
+)
+
+
+@asynccontextmanager
+async def operation_session_scope(database_url: str) -> AsyncIterator[None]:
+    owner = _SESSION_OWNER.get()
+    loop = asyncio.get_running_loop()
+    if (
+        owner is not None
+        and not owner.closed
+        and owner.database_url == database_url
+        and owner.loop is loop
+    ):
+        yield
+        return
+    engine = create_configured_async_engine(database_url, future=True, echo=False)
+    owner = _OperationSessionOwner(
+        database_url, loop, engine, async_sessionmaker(engine, expire_on_commit=False)
+    )
+    token = _SESSION_OWNER.set(owner)
+    try:
+        yield
+    finally:
+        # Child tasks may inherit the context, but must never reuse an owner
+        # after the operation that created it has finished.
+        owner.closed = True
+        _SESSION_OWNER.reset(token)
+        await engine.dispose()
+
+
 @asynccontextmanager
 async def _operation_session(database_url: str) -> AsyncIterator[AsyncSession]:
-    engine = create_configured_async_engine(database_url, future=True, echo=False)
-    factory = async_sessionmaker(
-        bind=engine, expire_on_commit=False, class_=AsyncSession
-    )
-    try:
-        async with factory() as session:
+    async with operation_session_scope(database_url):
+        owner = _SESSION_OWNER.get()
+        assert owner is not None
+        async with owner.factory() as session:
             yield session
-    finally:
-        await engine.dispose()
 
 
 def _json_dumps(payload: dict[str, Any] | None) -> str:
@@ -653,113 +691,118 @@ async def host_mutation_operation(
     operation: OperationHandle | None = None,
     defer_on_update_blocker: bool = False,
 ) -> AsyncIterator[OperationHandle]:
-    operation = operation or await create_operation(
-        settings,
-        kind=kind,
-        actor=actor,
-        backend_id=backend_id,
-        phase=phase,
-        details=details,
-    )
-    lock: FileLock | None = None
-    token = None
+    async with operation_session_scope(settings.database_url):
+        operation = operation or await create_operation(
+            settings,
+            kind=kind,
+            actor=actor,
+            backend_id=backend_id,
+            phase=phase,
+            details=details,
+        )
+        lock: FileLock | None = None
+        token = None
 
-    async def complete_safely(
-        status: OperationStatus,
-        *,
-        complete_phase: str | None = None,
-        error: str | None = None,
-        details: dict[str, Any] | None = None,
-    ) -> None:
-        task = asyncio.create_task(
-            operation.complete(
-                status, phase=complete_phase, error=error, details=details
+        async def complete_safely(
+            status: OperationStatus,
+            *,
+            complete_phase: str | None = None,
+            error: str | None = None,
+            details: dict[str, Any] | None = None,
+        ) -> None:
+            task = asyncio.create_task(
+                operation.complete(
+                    status, phase=complete_phase, error=error, details=details
+                )
             )
-        )
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            await task
-            raise
-
-    async def complete_update_blocker(
-        update_blocker: HostMutationBlocker,
-    ) -> HostMutationLockError:
-        blocker_details = {
-            "blocker_id": update_blocker.id,
-            "blocker_kind": update_blocker.kind,
-            "blocker_status": update_blocker.status,
-            "blocker_phase": update_blocker.phase,
-        }
-        if defer_on_update_blocker:
-            blocker_details.update(
-                {
-                    "deferred": True,
-                    "deferred_reason": "control_plane_update_running",
-                    "requested_phase": phase,
-                }
-            )
-        await complete_safely(
-            "partial" if defer_on_update_blocker else "failed",
-            complete_phase=(
-                "deferred"
-                if defer_on_update_blocker
-                else phase or update_blocker.phase or "lock"
-            ),
-            error=(
-                None
-                if defer_on_update_blocker
-                else "a control-plane update is already running"
-            ),
-            details=blocker_details,
-        )
-        return HostMutationLockError(
-            "a control-plane update is already running",
-            blocker=update_blocker,
-        )
-
-    try:
-        if _LOCK_DEPTH.get() == 0:
-            if kind != "update_control_plane":
-                update_blocker = await _active_update_run_blocker(settings)
-                if update_blocker is not None:
-                    blocker_error = await complete_update_blocker(update_blocker)
-                    raise blocker_error
-            lock_path = _host_lock_path(settings)
-            lock = FileLock(lock_path, blocking=False, lock_path=lock_path)
             try:
-                lock.__enter__()
-            except BlockingIOError as exc:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                await task
+                raise
+
+        async def complete_update_blocker(
+            update_blocker: HostMutationBlocker,
+        ) -> HostMutationLockError:
+            blocker_details = {
+                "blocker_id": update_blocker.id,
+                "blocker_kind": update_blocker.kind,
+                "blocker_status": update_blocker.status,
+                "blocker_phase": update_blocker.phase,
+            }
+            if defer_on_update_blocker:
+                blocker_details.update(
+                    {
+                        "deferred": True,
+                        "deferred_reason": "control_plane_update_running",
+                        "requested_phase": phase,
+                    }
+                )
+            await complete_safely(
+                "partial" if defer_on_update_blocker else "failed",
+                complete_phase=(
+                    "deferred"
+                    if defer_on_update_blocker
+                    else phase or update_blocker.phase or "lock"
+                ),
+                error=(
+                    None
+                    if defer_on_update_blocker
+                    else "a control-plane update is already running"
+                ),
+                details=blocker_details,
+            )
+            return HostMutationLockError(
+                "a control-plane update is already running",
+                blocker=update_blocker,
+            )
+
+        try:
+            if _LOCK_DEPTH.get() == 0:
                 if kind != "update_control_plane":
                     update_blocker = await _active_update_run_blocker(settings)
                     if update_blocker is not None:
                         blocker_error = await complete_update_blocker(update_blocker)
-                        raise blocker_error from exc
-                await complete_safely(
-                    "failed",
-                    complete_phase=phase or "lock",
-                    error="another host mutation is already running",
-                    details={"lock_path": str(lock_path)},
-                )
-                raise HostMutationLockError(
-                    "another host mutation is already running"
-                ) from exc
-        token = _LOCK_DEPTH.set(_LOCK_DEPTH.get() + 1)
-        await operation.update(status="running", phase=phase)
-        yield operation
-        if not operation.completed:
-            await complete_safely("success", complete_phase=phase)
-    except BaseException as exc:
-        if not operation.completed:
-            if isinstance(exc, asyncio.CancelledError):
-                await complete_safely(
-                    "cancelled", complete_phase=phase, error="operation cancelled"
-                )
-            else:
-                await complete_safely("failed", complete_phase=phase, error=str(exc))
-        raise
-    finally:
-        if token is not None:
-            _LOCK_DEPTH.reset(token)
-        if lock is not None:
-            lock.__exit__(None, None, None)
+                        raise blocker_error
+                lock_path = _host_lock_path(settings)
+                lock = FileLock(lock_path, blocking=False, lock_path=lock_path)
+                try:
+                    lock.__enter__()
+                except BlockingIOError as exc:
+                    if kind != "update_control_plane":
+                        update_blocker = await _active_update_run_blocker(settings)
+                        if update_blocker is not None:
+                            blocker_error = await complete_update_blocker(
+                                update_blocker
+                            )
+                            raise blocker_error from exc
+                    await complete_safely(
+                        "failed",
+                        complete_phase=phase or "lock",
+                        error="another host mutation is already running",
+                        details={"lock_path": str(lock_path)},
+                    )
+                    raise HostMutationLockError(
+                        "another host mutation is already running"
+                    ) from exc
+            token = _LOCK_DEPTH.set(_LOCK_DEPTH.get() + 1)
+            await operation.update(status="running", phase=phase)
+            yield operation
+            if not operation.completed:
+                await complete_safely("success", complete_phase=phase)
+        except BaseException as exc:
+            if not operation.completed:
+                if isinstance(exc, asyncio.CancelledError):
+                    await complete_safely(
+                        "cancelled", complete_phase=phase, error="operation cancelled"
+                    )
+                else:
+                    await complete_safely(
+                        "failed", complete_phase=phase, error=str(exc)
+                    )
+            raise
+        finally:
+            if token is not None:
+                _LOCK_DEPTH.reset(token)
+            if lock is not None:
+                lock.__exit__(None, None, None)

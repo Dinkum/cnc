@@ -6,6 +6,11 @@ import shlex
 import time
 from typing import Any
 
+from app.services.hardening_policy import (
+    hardening_podman_args,
+    hardening_volumes,
+    read_hardening_policy,
+)
 from app.config import Settings
 from app.logger import get_logger
 from app.models.entities import Backend
@@ -187,8 +192,10 @@ def render_quadlet_container(
     rootfs = rootfs_path or app_sandbox_rootfs_path(settings, backend.name)
     publish_address = str(publish_host or "127.0.0.1").strip() or "127.0.0.1"
 
+    policy = read_hardening_policy(backend)
     podman_args = [
         "--systemd=always",
+        *hardening_podman_args(policy),
         f"--cpu-shares={resource_profile.cpu_shares or 1024}",
         f"--cpus={_cpu_quota_to_cpus(resource_profile.cpu_quota, resource_profile.host_cpu_count)}",
     ]
@@ -224,7 +231,7 @@ def render_quadlet_container(
         lines.append(f"Environment={link.env_key}={link.url}")
     for dns_server in configured_app_dns_servers(settings):
         lines.append(f"DNS={dns_server}")
-    for volume in parse_volumes_json(backend.volumes_json):
+    for volume in hardening_volumes(policy, parse_volumes_json(backend.volumes_json)):
         lines.append(f"Volume={volume}")
     health_cmd = _healthcheck_command(backend)
     if health_cmd:

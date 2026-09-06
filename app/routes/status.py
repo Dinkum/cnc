@@ -1,5 +1,6 @@
 import asyncio
 import json
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -33,6 +34,7 @@ DASHBOARD_OPERATION_KINDS = (
     "ui.input.update",
 )
 OUTPUT_DETAIL_OPERATION_KINDS = (
+    "ui.backend.hardening",
     "backup_backend",
     "clone_backend",
     "delete_backend",
@@ -108,6 +110,35 @@ async def active_operations(
     return {"operations": operations}
 
 
+@router.get("/operations")
+async def operation_history(
+    before: int | None = Query(default=None, ge=1),
+    limit: int = Query(default=8, ge=1, le=50),
+    status: Literal["all", "success", "failed", "partial", "cancelled"] = Query(
+        default="all"
+    ),
+    settings: Settings = Depends(settings_dependency),
+    session: AsyncSession = Depends(db_session_dependency),
+) -> dict[str, object]:
+    query = select(Operation).where(
+        Operation.status.in_(("success", "failed", "partial", "cancelled"))
+    )
+    if status != "all":
+        query = query.where(Operation.status == status)
+    if before is not None:
+        query = query.where(Operation.id < before)
+    records = list(
+        (
+            await session.execute(query.order_by(Operation.id.desc()).limit(limit + 1))
+        ).scalars()
+    )
+    page = records[:limit]
+    return {
+        "operations": [operation_payload(operation, settings) for operation in page],
+        "next_cursor": page[-1].id if len(records) > limit else None,
+    }
+
+
 @router.get("/operations/{operation_id}")
 async def operation_status(
     operation_id: int,
@@ -134,6 +165,10 @@ async def operation_status_payload(
     ).scalar_one_or_none()
     if operation is None:
         raise HTTPException(status_code=404, detail="operation not found")
+    return operation_payload(operation, settings)
+
+
+def operation_payload(operation: Operation, settings: Settings) -> dict:
     try:
         details = json.loads(operation.details_json or "{}")
     except json.JSONDecodeError:

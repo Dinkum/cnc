@@ -50,7 +50,12 @@ def test_backup_summary_includes_covered_paths() -> None:
     )
 
     assert payload["available"] is True
-    assert payload["rows"] == [("covered paths", "/srv/web-data")]
+    assert payload["rows"] == [
+        ("covered paths", "/srv/web-data"),
+        ("integrity", "verified"),
+        ("restore", "review before restore"),
+        ("note", "app bundle does not include a container snapshot"),
+    ]
     assert not any(
         key in {"latest backup", "size", "file"} for key, _value in payload["rows"]
     )
@@ -943,6 +948,7 @@ async def test_output_detail_renders_fast_page_shell_with_lazy_backup_hydration(
 ) -> None:
     maker = await _make_session(tmp_path / "app.db")
     settings = Settings(
+        beta_hardening=True,
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'app.db'}",
         nginx_generated_dir=tmp_path / "nginx",
         apply_backup_dir=tmp_path / "backups",

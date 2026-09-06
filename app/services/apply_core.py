@@ -48,6 +48,7 @@ class RuntimeAppBackend:
     healthcheck_mode: str
     healthcheck_path: str
     healthcheck_host_header: str
+    hardening: dict[str, Any] = field(default_factory=dict)
     inter_app_interfaces: tuple[dict[str, Any], ...] = ()
     interface_networks: tuple[dict[str, Any], ...] = ()
 
@@ -60,6 +61,7 @@ class RuntimeAppBackend:
             "port": self.port,
             "handoff_port": self.handoff_port,
             "sandbox_profile": self.sandbox_profile,
+            "hardening": self.hardening,
             "sandbox_dir": self.sandbox_dir,
             "guest_rootfs": self.guest_rootfs,
             "volumes": list(self.volumes),

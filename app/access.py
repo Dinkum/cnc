@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import ipaddress
@@ -31,6 +32,8 @@ _PASSWORD_HASHER = PasswordHasher(
 )
 _ATTEMPT_WINDOW_SEC = 600
 _ATTEMPT_LOCK = threading.Lock()
+ACCESS_MAX_CONCURRENT_VERIFICATIONS = 2
+_ACCESS_VERIFY_SEMAPHORE = asyncio.BoundedSemaphore(ACCESS_MAX_CONCURRENT_VERIFICATIONS)
 
 
 @dataclass
@@ -70,6 +73,43 @@ def verify_access_key(settings: Settings, value: str) -> bool:
         return bool(_PASSWORD_HASHER.verify(stored_hash, normalize_access_key(value)))
     except (InvalidHashError, VerificationError, VerifyMismatchError, ValueError):
         return False
+
+
+async def verify_access_key_async(
+    settings: Settings,
+    token: str,
+    *,
+    attempt_key: str | None,
+) -> tuple[bool, int]:
+    retry_after = access_attempt_backoff_seconds(attempt_key)
+    if retry_after > 0:
+        return False, retry_after
+
+    async with _ACCESS_VERIFY_SEMAPHORE:
+        # A queued login rechecks after entering the bounded verifier so a
+        # burst from one peer cannot schedule repeated Argon2 work up front.
+        retry_after = access_attempt_backoff_seconds(attempt_key)
+        if retry_after > 0:
+            return False, retry_after
+
+        verify_task = asyncio.create_task(
+            asyncio.to_thread(verify_access_key, settings, token)
+        )
+        try:
+            valid = await asyncio.shield(verify_task)
+        except asyncio.CancelledError:
+            # Argon2 continues in its worker after caller cancellation. Keep the
+            # semaphore held until it finishes so the concurrency bound is real.
+            while not verify_task.done():
+                try:
+                    await asyncio.shield(verify_task)
+                except asyncio.CancelledError:
+                    continue
+            valid = verify_task.result()
+            record_access_attempt(attempt_key, success=valid)
+            raise
+        record_access_attempt(attempt_key, success=valid)
+        return valid, 0
 
 
 def access_key_needs_rehash(settings: Settings) -> bool:

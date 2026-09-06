@@ -979,3 +979,36 @@ def test_operation_progress_snapshot_metadata_preserves_progress(tmp_path) -> No
         "steps": [],
     }
     assert payload["details"]["changed_slices"] == ["nginx.managed"]
+
+
+@pytest.mark.asyncio
+async def test_host_operation_reuses_engine_and_disposes_owner(tmp_path, monkeypatch):
+    from app.services import operations
+
+    maker = await _make_session(tmp_path / "app.db")
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'app.db'}",
+        apply_lock_path=tmp_path / "host.lock",
+        app_control_dir=tmp_path / "control",
+    )
+    original = operations.create_configured_async_engine
+    engines = []
+
+    def tracked(*args, **kwargs):
+        engine = original(*args, **kwargs)
+        engines.append(engine)
+        return engine
+
+    monkeypatch.setattr(operations, "create_configured_async_engine", tracked)
+    async with host_mutation_operation(settings, kind="apply_host") as handle:
+        owner = operations._SESSION_OWNER.get()
+        for value in range(10):
+            await handle.update(phase="apply", details={"progress": value})
+    assert len(engines) == 1
+    assert owner.closed
+    assert operations._SESSION_OWNER.get() is None
+    async with maker() as session:
+        row = await session.get(Operation, handle.id)
+        assert row.status == "success"
+        assert json.loads(row.details_json)["progress"] == 9
+    await maker.kw["bind"].dispose()
