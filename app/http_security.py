@@ -6,7 +6,9 @@ from starlette.datastructures import MutableHeaders
 SECURITY_RESPONSE_HEADERS = {
     "X-Frame-Options": "DENY",
     "X-Content-Type-Options": "nosniff",
-    "Referrer-Policy": "no-referrer",
+    # Native form POSTs need their same-origin identity for the origin guard.
+    # no-referrer makes browsers send Origin: null even to our own access page.
+    "Referrer-Policy": "same-origin",
 }
 
 

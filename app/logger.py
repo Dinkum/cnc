@@ -1,4 +1,7 @@
 import atexit
+import asyncio
+import fcntl
+import math
 from contextlib import asynccontextmanager, contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -23,12 +26,16 @@ SAFE_CTX_VALUE_RE = re.compile(r"^[A-Za-z0-9._:/@-]+$")
 EVENT_NAME_RE = re.compile(r"^[a-z0-9.]+$")
 EVENT_TOKEN_RE = re.compile(r"^[a-z0-9._]+$")
 SENSITIVE_CONTEXT_KEY_RE = re.compile(
-    r"(?:^|_)(?:authorization|cookie|password|secret|token|access_key|api_key|csrf)(?:$|_)",
+    r"(?:^|[_-])(?:authorization|cookie|password|passwd|secret|token|access[_-](?:key|code)|api[_-]key|csrf|shield[_-]code|private[_-]key)(?:$|[_-])",
     re.IGNORECASE,
 )
+AUTHORIZATION_TEXT_RE = re.compile(
+    r"(?i)(\bauthorization[\"']?\s*[:=]\s*)(?:Bearer|Basic)\s+[^\s,;\"'\)\]\}]+"
+)
 SENSITIVE_TEXT_RE = re.compile(
-    r"(?i)\b(token|secret|password|authorization|api[_-]?key|access[_-]?key)"
-    r"(\s*[:=]\s*)([^,\s&]+)"
+    r"(?i)(\b(?:[a-z0-9]+[_-])*(?:token|secret|password|passwd|authorization|cookie|csrf|api[_-]?key|access[_-]?(?:key|code)|shield[_-]?code|private[_-]?key)"
+    r"[\"']?\s*[:=]\s*)"
+    r"(\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|\[redacted\]|[^,\s&\"'\)\]\};]+)"
 )
 URL_CREDENTIALS_RE = re.compile(r"(://)[^/\s:@]+:[^/\s@]+@")
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -58,6 +65,25 @@ LEVEL_SYMBOLS = {
     "CRITICAL": "(X)",
 }
 NAME_COLUMN_WIDTH = 20
+MAX_CONTEXT_NODES = 256
+MAX_RECORD_TEXT = 8192
+RESERVED_RECORD_FIELDS = frozenset(
+    {
+        "ts",
+        "level",
+        "app_id",
+        "category",
+        "message",
+        "name",
+        "block_id",
+        "seq",
+        "depth",
+        "log_kind",
+        "timing_only",
+        "exception",
+        "context_fields",
+    }
+)
 NOISY_DEPENDENCY_LOGGERS = (
     "aiosqlite",
     "sqlalchemy.engine",
@@ -79,12 +105,6 @@ class _FlushRequest:
     done: threading.Event
 
 
-@dataclass(frozen=True)
-class _StopRequest:
-    flush_incomplete: bool
-    done: threading.Event
-
-
 @dataclass
 class _LoggingPipeline:
     queue_handler: "FlushableQueueHandler"
@@ -92,14 +112,8 @@ class _LoggingPipeline:
     managed_handlers: list[logging.Handler] = field(default_factory=list)
 
     def stop(self) -> None:
-        self.queue_handler.flush()
         self.listener.stop(flush_incomplete=True)
         self.queue_handler.close()
-        for handler in self.managed_handlers:
-            try:
-                handler.close()
-            except Exception:
-                continue
 
 
 _logging_runtime = LoggingRuntime(app_id="cnc.admin", env="local", version="unknown")
@@ -141,10 +155,8 @@ class StreamRecordFormatter(UTCIsoFormatter):
         if suffix:
             rendered.append(suffix)
         line = " ".join(part for part in rendered if part)
-        if record.exc_info:
-            exception_text = self.formatException(record.exc_info)
-            if exception_text:
-                line = f"{line}\n{_ascii_text(exception_text)}"
+        if exception_text := _exception_text(record):
+            line = f"{line}\n{exception_text}"
         return line
 
 
@@ -174,61 +186,150 @@ class JSONLFormatter(UTCIsoFormatter):
             payload["log_kind"] = str(getattr(record, "log_kind"))
         if getattr(record, "timing_only", False):
             payload["timing_only"] = True
-        if record.exc_info:
-            payload["exception"] = _ascii_text(
-                "".join(traceback.format_exception(*record.exc_info)).rstrip("\n")
-            )
-        payload.update(_json_safe_context(_record_context(record)))
+        if exception_text := _exception_text(record):
+            payload["exception"] = exception_text
+        context = _json_safe_context(_record_context(record))
+        collisions = {
+            key: value
+            for key, value in context.items()
+            if key in RESERVED_RECORD_FIELDS and key != "context_fields"
+        }
+        payload.update(
+            {
+                key: value
+                for key, value in context.items()
+                if key not in RESERVED_RECORD_FIELDS or key == "context_fields"
+            }
+        )
+        if collisions:
+            payload["context_fields"] = collisions
         return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
 
 
 class PrivateRotatingFileHandler(RotatingFileHandler):
-    """Rotating file handler whose active log is readable only by CNC."""
+    """One serialized check/rotate/write transaction across local CNC processes."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        kwargs["delay"] = True
+        self.write_failures = 0
+        self.last_write_error = ""
+        self.last_successful_write: float | None = None
+        super().__init__(*args, **kwargs)
+        path = Path(self.baseFilename)
+        self.lock_path = path.with_name(f".{path.name}.lock")
 
     def _open(self):
         stream = super()._open()
-        with suppress(OSError):
-            os.chmod(self.baseFilename, 0o600)
+        os.fchmod(stream.fileno(), 0o600)
         return stream
+
+    @contextmanager
+    def _writer_lock(self):
+        descriptor = os.open(
+            self.lock_path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600
+        )
+        try:
+            deadline = time.monotonic() + 1.0
+            while True:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("log writer lock timed out") from None
+                    time.sleep(0.01)
+            yield
+        finally:
+            os.close(descriptor)
+
+    def _reopen_current_file(self) -> None:
+        if self.stream is not None:
+            try:
+                active = os.stat(self.baseFilename)
+                opened = os.fstat(self.stream.fileno())
+                current = (active.st_dev, active.st_ino) == (
+                    opened.st_dev,
+                    opened.st_ino,
+                )
+            except FileNotFoundError:
+                current = False
+            if not current:
+                self.stream.close()
+                self.stream = None
+        if self.stream is None:
+            self.stream = self._open()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            with self._writer_lock():
+                self._reopen_current_file()
+                if self.shouldRollover(record):
+                    self._rollover_locked()
+                previous_failures = self.write_failures
+                logging.FileHandler.emit(self, record)
+                if self.write_failures == previous_failures:
+                    self.last_successful_write = time.time()
+        except Exception:
+            self.handleError(record)
+
+    def handleError(self, record: logging.LogRecord) -> None:  # noqa: N802
+        # StreamHandler swallows I/O failures here; never echo raw records to stderr.
+        self.write_failures += 1
+        error_type = sys.exc_info()[0]
+        self.last_write_error = error_type.__name__ if error_type else "WriteError"
+
+    def doRollover(self) -> None:  # noqa: N802
+        with self._writer_lock():
+            self._reopen_current_file()
+            self._rollover_locked()
+
+    def _rollover_locked(self) -> None:
+        super().doRollover()
 
 
 class GZipRotatingFileHandler(PrivateRotatingFileHandler):
     """Size-based rotating handler that compresses rolled files as .gz."""
 
-    def doRollover(self) -> None:  # noqa: N802
+    def _reopen_current_file(self) -> None:
+        self._finish_pending_compression()
+        super()._reopen_current_file()
+
+    def _finish_pending_compression(self) -> None:
+        import gzip
+
+        plain = f"{self.baseFilename}.1"
+        if not os.path.exists(plain):
+            return
+        destination = f"{plain}.gz"
+        temporary = f"{destination}.tmp"
+        # Keep the source until the complete gzip is published; a killed writer
+        # leaves a recoverable segment for the next lock owner.
+        with open(plain, "rb") as source:
+            descriptor = os.open(
+                temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600
+            )
+            with os.fdopen(descriptor, "wb") as raw:
+                with gzip.GzipFile(fileobj=raw, mode="wb") as compressed:
+                    shutil.copyfileobj(source, compressed)
+        os.replace(temporary, destination)
+        os.remove(plain)
+
+    def _rollover_locked(self) -> None:
         if self.stream:
             self.stream.close()
             self.stream = None
-
+        self._finish_pending_compression()
         if self.backupCount > 0:
             oldest = f"{self.baseFilename}.{self.backupCount}.gz"
             if os.path.exists(oldest):
                 os.remove(oldest)
-
             for index in range(self.backupCount - 1, 0, -1):
                 source = f"{self.baseFilename}.{index}.gz"
                 dest = f"{self.baseFilename}.{index + 1}.gz"
                 if os.path.exists(source):
-                    if os.path.exists(dest):
-                        os.remove(dest)
-                    os.rename(source, dest)
-
-            rolled_plain = f"{self.baseFilename}.1"
-            rolled_gz = f"{rolled_plain}.gz"
-            if os.path.exists(rolled_plain):
-                os.remove(rolled_plain)
-            if os.path.exists(rolled_gz):
-                os.remove(rolled_gz)
-            self.rotate(self.baseFilename, rolled_plain)
-            with open(rolled_plain, "rb") as source:
-                import gzip
-
-                with gzip.open(rolled_gz, "wb") as dest:
-                    shutil.copyfileobj(source, dest)
-            with suppress(OSError):
-                os.chmod(rolled_gz, 0o600)
-            os.remove(rolled_plain)
-
+                    os.replace(source, dest)
+            self.rotate(self.baseFilename, f"{self.baseFilename}.1")
+            self._finish_pending_compression()
         if not self.delay:
             self.stream = self._open()
 
@@ -278,97 +379,196 @@ class FlushableQueueHandler(QueueHandler):
         self.addFilter(ContextSnapshotFilter())
 
     def prepare(self, record: logging.LogRecord) -> logging.LogRecord:
-        prepared = logging.makeLogRecord(record.__dict__.copy())
+        # Ignore arbitrary third-party extras: only bounded canonical fields cross
+        # the queue boundary, so unrelated objects cannot retain application state.
+        fields = {}
+        for key in (
+            "name",
+            "levelname",
+            "app_id",
+            "category",
+            "event_name",
+            "block_id",
+            "log_kind",
+        ):
+            value = getattr(record, key, None)
+            if value is not None:
+                fields[key] = _ascii_text(redact_sensitive_text(value))[:256]
+        for key in (
+            "created",
+            "msecs",
+            "relativeCreated",
+            "levelno",
+            "seq",
+            "depth",
+            "timing_only",
+        ):
+            value = getattr(record, key, None)
+            if isinstance(value, bool | int | float):
+                fields[key] = value
+        prepared = logging.makeLogRecord(fields)
         prepared.msg = _ascii_text(
             str(getattr(record, "message_text", record.getMessage()))
         )
+        prepared.context = _json_safe_context(_record_context(record))
+        collisions = {
+            key: prepared.context.pop(key)
+            for key in list(prepared.context)
+            if key in RESERVED_RECORD_FIELDS
+        }
+        if collisions:
+            prepared.context["context_fields"] = collisions
+        prepared.msg = redact_sensitive_text(prepared.msg)[:MAX_RECORD_TEXT]
+        prepared.message_text = prepared.msg
+        prepared.exception_text = _exception_text(record)
+        prepared.exc_text = None
+        # Tracebacks retain frames and mutable application state; queue only safe text.
+        prepared.exc_info = None
         prepared.args = None
+        prepared.stack_info = None
         return prepared
 
+    def enqueue(self, record: logging.LogRecord) -> None:
+        self._listener.enqueue(record)
+
     def flush(self) -> None:
-        if self._listener is not None:
+        if self._listener is not None and not _in_async_context():
             self._listener.flush()
 
 
 class _RecordQueueListener:
-    def __init__(self, handlers: list[logging.Handler]) -> None:
+    def __init__(self, handlers: list[logging.Handler], *, capacity: int = 512) -> None:
         self._handlers = handlers
-        self._queue: queue.Queue[object] = queue.Queue()
+        self._queue: queue.Queue[object] = queue.Queue(maxsize=max(1, capacity))
         self._thread = threading.Thread(
             target=self._run, name="cnc-log-listener", daemon=True
         )
         self._started = False
+        self._stopping = threading.Event()
+        self._state_lock = threading.Lock()
         self._handler_failures = 0
         self._last_handler_error = ""
+        self._dropped_records = 0
+        self._dropped_by_level: dict[str, int] = {}
+        self._last_drop_at: float | None = None
+        self._flush_timeouts = 0
+        self._flush_failures = 0
 
     @property
     def queue(self) -> queue.Queue[object]:
         return self._queue
 
     def start(self) -> None:
-        if self._started:
-            return
-        self._started = True
-        self._thread.start()
+        if not self._started:
+            self._started = True
+            self._thread.start()
 
     def is_alive(self) -> bool:
         return self._started and self._thread.is_alive()
+
+    def enqueue(self, record: logging.LogRecord) -> None:
+        # Linearize acceptance with shutdown so no accepted record arrives after drain.
+        with self._state_lock:
+            if self._stopping.is_set():
+                self._record_drop(record)
+                return
+            try:
+                self._queue.put_nowait(record)
+            except queue.Full:
+                self._record_drop(record)
+
+    def _record_drop(self, record: logging.LogRecord) -> None:
+        self._dropped_records += 1
+        level = record.levelname
+        self._dropped_by_level[level] = self._dropped_by_level.get(level, 0) + 1
+        self._last_drop_at = time.time()
 
     def failure_status(self) -> dict[str, Any]:
         return {
             "handler_failures": self._handler_failures,
             "last_handler_error": self._last_handler_error,
+            "queue_depth": self._queue.qsize(),
+            "queue_capacity": self._queue.maxsize,
+            "dropped_records": self._dropped_records,
+            "dropped_by_level": dict(self._dropped_by_level),
+            "last_drop_at": self._last_drop_at,
+            "flush_timeouts": self._flush_timeouts,
+            "flush_failures": self._flush_failures,
         }
 
-    def flush(self) -> None:
-        if not self._started:
-            return
+    def flush(self, *, timeout: float = 2.0) -> bool:
         done = threading.Event()
-        self._queue.put(_FlushRequest(done=done))
-        done.wait(timeout=2.0)
+        with self._state_lock:
+            if not self.is_alive() or self._stopping.is_set():
+                return False
+            try:
+                self._queue.put_nowait(_FlushRequest(done=done))
+            except queue.Full:
+                self._flush_timeouts += 1
+                return False
+        if not done.wait(timeout=max(0, timeout)):
+            with self._state_lock:
+                self._flush_timeouts += 1
+            return False
+        return self._handler_failures == 0 and all(
+            getattr(getattr(handler, "_sink", handler), "write_failures", 0) == 0
+            for handler in self._handlers
+        )
 
-    def stop(self, *, flush_incomplete: bool) -> None:
-        if not self._started:
-            return
-        done = threading.Event()
-        self._queue.put(_StopRequest(flush_incomplete=flush_incomplete, done=done))
-        done.wait(timeout=2.0)
-        self._thread.join(timeout=2.0)
-        self._started = False
+    def stop(self, *, flush_incomplete: bool) -> bool:
+        with self._state_lock:
+            self._flush_incomplete_on_stop = flush_incomplete
+            self._stopping.set()
+        if self._started:
+            self._thread.join(timeout=2.0)
+        return not self.is_alive()
+
+    def _failure(self, handler: logging.Handler, *, flushing: bool = False) -> None:
+        with self._state_lock:
+            self._handler_failures += 1
+            self._last_handler_error = f"{type(handler).__name__} failed"
+            if flushing:
+                self._flush_failures += 1
 
     def _run(self) -> None:
         while True:
-            item = self._queue.get()
+            try:
+                item = self._queue.get(timeout=0.1)
+            except queue.Empty:
+                if self._stopping.is_set():
+                    break
+                continue
             if isinstance(item, _FlushRequest):
                 self._flush_handlers()
                 item.done.set()
                 continue
-            if isinstance(item, _StopRequest):
-                if item.flush_incomplete:
-                    for handler in self._handlers:
-                        flush_incomplete = getattr(handler, "flush_incomplete", None)
-                        if callable(flush_incomplete):
-                            try:
-                                flush_incomplete()
-                            except Exception:
-                                continue
-                self._flush_handlers()
-                item.done.set()
-                return
             for handler in self._handlers:
                 try:
                     handler.handle(item)
                 except Exception:
-                    self._handler_failures += 1
-                    self._last_handler_error = f"{type(handler).__name__} failed"
-                    continue
+                    self._failure(handler)
+        if self._flush_incomplete_on_stop:
+            for handler in self._handlers:
+                flush_incomplete = getattr(handler, "flush_incomplete", None)
+                if callable(flush_incomplete):
+                    try:
+                        flush_incomplete()
+                    except Exception:
+                        self._failure(handler, flushing=True)
+        self._flush_handlers()
+        # The writer owns closure, even when a caller's bounded stop times out.
+        for handler in self._handlers:
+            try:
+                handler.close()
+            except Exception:
+                self._failure(handler, flushing=True)
 
     def _flush_handlers(self) -> None:
         for handler in self._handlers:
             try:
                 handler.flush()
             except Exception:
-                continue
+                self._failure(handler, flushing=True)
 
 
 class BlockBufferedHandler(logging.Handler):
@@ -400,27 +600,50 @@ class BlockBufferedHandler(logging.Handler):
         self._sink.setFormatter(logging.Formatter("%(message)s"))
         self._blocks: dict[str, list[logging.LogRecord]] = {}
         self._lock = threading.Lock()
+        self.incomplete_blocks = 0
+        self._buffered_records = 0
 
     def emit(self, record: logging.LogRecord) -> None:
         block_id = str(getattr(record, "block_id", "") or "").strip()
         if not block_id:
             self._write_rendered(self._render_single_event(record), record.levelno)
             return
+        evicted = []
+        records = None
         with self._lock:
+            if block_id not in self._blocks and len(self._blocks) >= 128:
+                evicted.append(self._blocks.pop(next(iter(self._blocks))))
             bucket = self._blocks.setdefault(block_id, [])
             bucket.append(record)
+            self._buffered_records += 1
             if (
                 bool(getattr(record, "timing_only", False))
                 or str(getattr(record, "log_kind", "")) == "timing"
             ):
-                records = self._blocks.pop(block_id, [])
-        if "records" in locals():
+                records = self._blocks.pop(block_id)
+            elif len(bucket) >= 128:
+                evicted.append(self._blocks.pop(block_id))
+            self._buffered_records -= sum(len(partial) for partial in evicted)
+            if records:
+                self._buffered_records -= len(records)
+            while self._buffered_records > 512:
+                partial = self._blocks.pop(next(iter(self._blocks)))
+                self._buffered_records -= len(partial)
+                evicted.append(partial)
+        for partial in evicted:
+            self.incomplete_blocks += 1
+            self._write_rendered(
+                self._render_block(partial, incomplete=True),
+                _max_levelno(partial, default=logging.WARNING),
+            )
+        if records:
             self._write_rendered(self._render_block(records), _max_levelno(records))
 
     def flush_incomplete(self) -> None:
         with self._lock:
             pending = list(self._blocks.values())
             self._blocks.clear()
+            self._buffered_records = 0
         for records in pending:
             self._write_rendered(
                 self._render_block(records, incomplete=True),
@@ -655,24 +878,73 @@ def current_log_context() -> dict[str, Any]:
 
 def logging_pipeline_status() -> dict[str, Any]:
     root = logging.getLogger()
-    managed_handlers = (
-        _logging_pipeline.managed_handlers if _logging_pipeline is not None else []
+    pipeline = _logging_pipeline
+    handlers = (
+        [_handler_status(handler) for handler in pipeline.managed_handlers]
+        if pipeline
+        else []
+    )
+    failures = pipeline.listener.failure_status() if pipeline else {}
+    attached = bool(pipeline and pipeline.queue_handler in root.handlers)
+    alive = bool(pipeline and pipeline.listener.is_alive())
+    disabled = sorted(
+        name
+        for name, logger in logging.root.manager.loggerDict.items()
+        if isinstance(logger, logging.Logger) and logger.disabled
+    )
+    operational = (
+        attached
+        and alive
+        and bool(handlers)
+        and not root.disabled
+        and root.getEffectiveLevel() <= logging.INFO
+        and root.manager.disable < logging.INFO
+        and not disabled
+    )
+    degraded = (
+        not operational
+        or any(
+            failures.get(key, 0)
+            for key in ("handler_failures", "dropped_records", "flush_timeouts")
+        )
+        or any(handler.get("write_failures", 0) for handler in handlers)
     )
     return {
-        "configured": _logging_pipeline is not None,
+        "configured": pipeline is not None,
+        "status": "degraded" if degraded else "ok",
+        "operational": operational,
+        "queue_handler_attached": attached,
         "root_handler_count": len(root.handlers),
-        "listener_alive": bool(
-            _logging_pipeline and _logging_pipeline.listener.is_alive()
-        ),
-        **(_logging_pipeline.listener.failure_status() if _logging_pipeline else {}),
-        "managed_handlers": [_handler_status(handler) for handler in managed_handlers],
+        "root_level": logging.getLevelName(root.getEffectiveLevel()),
+        "global_disable_level": root.manager.disable,
+        "disabled_loggers": disabled,
+        "listener_alive": alive,
+        **failures,
+        "managed_handlers": handlers,
+        "sink_write_failures": sum(handler["write_failures"] for handler in handlers),
     }
 
 
-def flush_logging_pipeline() -> None:
-    """Flush queued log records so operator-facing diagnostics are immediately visible."""
+def _in_async_context() -> bool:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
+def flush_logging_pipeline() -> bool:
+    """Synchronous CLI durability boundary; async callers use the awaited variant."""
     if _logging_pipeline is not None:
-        _logging_pipeline.listener.flush()
+        return _logging_pipeline.listener.flush()
+    return False
+
+
+async def flush_logging_pipeline_async() -> bool:
+    pipeline = _logging_pipeline
+    if pipeline is None:
+        return False
+    return await asyncio.to_thread(pipeline.listener.flush)
 
 
 def _should_flush_immediate_event(
@@ -818,18 +1090,46 @@ def _ascii_text(value: str) -> str:
 
 
 def _json_safe_context(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {
-            str(key): _json_safe_context(item)
-            for key, item in _redact_context(value).items()
-        }
-    if isinstance(value, list | tuple):
-        return [_json_safe_context(item) for item in value]
-    if isinstance(value, str):
-        return _ascii_text(redact_sensitive_text(value))
-    if value is None or isinstance(value, bool | int | float):
-        return value
-    return _ascii_text(redact_sensitive_text(value))
+    # A shared budget bounds cycles, depth, width and text across the entire snapshot.
+    nodes = MAX_CONTEXT_NODES
+    characters = MAX_RECORD_TEXT
+
+    def snapshot(item: Any, depth: int = 0) -> Any:
+        nonlocal nodes, characters
+        nodes -= 1
+        if nodes < 0 or depth > 8 or characters <= 0:
+            return "[truncated]"
+        if isinstance(item, dict):
+            result = {}
+            for raw_key, child in item.items():
+                if nodes <= 0 or characters <= 0:
+                    result["_truncated"] = True
+                    break
+                key = redact_sensitive_text(raw_key)[:256]
+                characters -= len(key)
+                result[key] = (
+                    "[redacted]"
+                    if SENSITIVE_CONTEXT_KEY_RE.search(key)
+                    else snapshot(child, depth + 1)
+                )
+            return result
+        if isinstance(item, list | tuple):
+            result = []
+            for child in item:
+                if nodes <= 0 or characters <= 0:
+                    result.append("[truncated]")
+                    break
+                result.append(snapshot(child, depth + 1))
+            return result
+        if item is None or isinstance(item, bool | int):
+            return item
+        if isinstance(item, float) and math.isfinite(item):
+            return item
+        text = _ascii_text(redact_sensitive_text(item))[: max(0, characters)]
+        characters -= len(text)
+        return text
+
+    return snapshot(value)
 
 
 def _redact_context(context: dict[str, Any]) -> dict[str, Any]:
@@ -853,7 +1153,14 @@ def _redact_context(context: dict[str, Any]) -> dict[str, Any]:
 def redact_sensitive_text(value: object) -> str:
     text = str(value or "")
     text = URL_CREDENTIALS_RE.sub(r"\1[redacted]@", text)
-    return SENSITIVE_TEXT_RE.sub(r"\1\2[redacted]", text)
+    text = AUTHORIZATION_TEXT_RE.sub(r"\1[redacted]", text)
+
+    def replace(match: re.Match[str]) -> str:
+        value = match.group(2)
+        quote = value[0] if value.startswith(('"', "'")) else ""
+        return f"{match.group(1)}{quote}[redacted]{quote}"
+
+    return SENSITIVE_TEXT_RE.sub(replace, text)
 
 
 def _events_log_path(log_path: Path) -> Path:
@@ -886,13 +1193,17 @@ def _step_prefix(depth: int) -> str:
     return f"{'>> ' * (depth - 1)}>> "
 
 
+def _exception_text(record: logging.LogRecord) -> str:
+    rendered = getattr(record, "exception_text", "") or record.exc_text or ""
+    if not rendered and record.exc_info:
+        rendered = "".join(
+            traceback.format_exception(*record.exc_info, limit=32)
+        ).rstrip("\n")
+    return _ascii_text(redact_sensitive_text(rendered))[:MAX_RECORD_TEXT]
+
+
 def _render_exception_dump(record: logging.LogRecord) -> list[str]:
-    if not record.exc_info:
-        return []
-    rendered = "".join(traceback.format_exception(*record.exc_info)).rstrip("\n")
-    if not rendered:
-        return []
-    return [f"~~ {_ascii_text(line)}" for line in rendered.splitlines()]
+    return [f"~~ {line}" for line in _exception_text(record).splitlines()]
 
 
 def _max_levelno(records: list[logging.LogRecord], default: int = logging.INFO) -> int:
@@ -923,6 +1234,14 @@ def _handler_status(handler: logging.Handler) -> dict[str, Any]:
         sink_filename = getattr(sink, "baseFilename", None)
         if sink_filename:
             status["sink_path"] = str(sink_filename)
+    sink = getattr(handler, "_sink", handler)
+    status["write_failures"] = getattr(sink, "write_failures", 0)
+    status["last_write_error"] = getattr(sink, "last_write_error", "")
+    status["last_successful_write"] = getattr(sink, "last_successful_write", None)
+    if isinstance(handler, BlockBufferedHandler):
+        status["buffered_blocks"] = len(handler._blocks)
+        status["buffered_records"] = handler._buffered_records
+        status["incomplete_blocks"] = handler.incomplete_blocks
     return status
 
 
@@ -1052,7 +1371,9 @@ class AppLogger:
             },
             exc_info=exc_info,
         )
-        if _should_flush_immediate_event(resolved_event_name, context, level):
+        if not _in_async_context() and _should_flush_immediate_event(
+            resolved_event_name, context, level
+        ):
             flush_logging_pipeline()
 
     def debug(self, message: str, **kwargs: Any) -> None:
@@ -1105,7 +1426,15 @@ class AppLogger:
         )
         try:
             yield operation
-        except Exception as exc:
+        except asyncio.CancelledError:
+            if not operation.result_emitted:
+                operation.result(
+                    "Cancelled",
+                    level=logging.WARNING,
+                    **{**kwargs, "status": "cancelled"},
+                )
+            raise
+        except BaseException as exc:
             if not operation.result_emitted:
                 operation.failed(
                     "Failed",
@@ -1113,11 +1442,11 @@ class AppLogger:
                     error_type=type(exc).__name__,
                     **kwargs,
                 )
-            operation.finish_timing()
             raise
         else:
             if not operation.result_emitted:
                 operation.result("Completed", **kwargs)
+        finally:
             operation.finish_timing()
 
 

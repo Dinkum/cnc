@@ -20,12 +20,13 @@ import uvicorn
 from app.access import build_access_required_response
 from app.config import Settings, get_settings
 from app.database import dispose_engine, init_db, verify_db_connection
+from app.ui.diagnostics import cancel_runtime_diagnostics
 from app.http_security import SecurityHeadersMiddleware
 from app.logger import (
     bind_log_context,
     configure_logging,
     current_app_id,
-    flush_logging_pipeline,
+    flush_logging_pipeline_async,
     get_logger,
     logging_pipeline_status,
     resolve_log_version,
@@ -351,6 +352,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             with suppress(asyncio.CancelledError):
                 await notification_dispatch_task
         await cancel_status_cache_prefill()
+        await cancel_runtime_diagnostics()
         if ssh_audit_listener is not None:
             ssh_audit_listener.close()
         await drain_backup_descriptions()
@@ -927,6 +929,7 @@ async def request_logging_middleware(request: Request, call_next):
                 "http.request.completed",
                 **log_context,
             )
+            await flush_logging_pipeline_async()
             return access_response
         response = await call_next(request)
         response.headers["X-Request-ID"] = request_id
@@ -944,6 +947,12 @@ async def request_logging_middleware(request: Request, call_next):
             "http.request.completed",
             **log_context,
         )
+        if response.status_code >= 400 or request.method not in {
+            "GET",
+            "HEAD",
+            "OPTIONS",
+        }:
+            await flush_logging_pipeline_async()
         return response
 
 
@@ -970,7 +979,7 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
         detail=str(error),
         allow=str(response_headers.get("allow") or response_headers.get("Allow") or ""),
     )
-    flush_logging_pipeline()
+    await flush_logging_pipeline_async()
     if not _request_prefers_html(request):
         return JSONResponse(
             status_code=exc.status_code,

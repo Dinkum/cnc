@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import Settings
+from app.services.clone_defaults import next_clone_name, next_clone_port
 from app.models.entities import Backend, Input
 from app.schemas.backends import BackendCloneIn, BackendIn, BackendUpdate
 from app.services.backend_backup_service import (
@@ -12,11 +13,10 @@ from app.services.backend_backup_service import (
     clone_backend_as_new_backend,
 )
 from app.services.netdata_constants import NETDATA_PORT
-from app.services.port_preflight import ensure_loopback_port_free, is_loopback_port_free
+from app.services.port_preflight import ensure_loopback_port_free
 from app.services.queries import load_inputs_by_ids
 from app.services.validators import (
     ValidationError,
-    ensure_backend_name,
     validate_backend_collection,
     validate_backend_shape,
     validate_input_bindings,
@@ -182,57 +182,6 @@ async def set_backend_enabled(
     )
 
 
-async def _next_clone_backend_name(session: AsyncSession, source_name: str) -> str:
-    counter = 1
-    while True:
-        prefix = "clone-"
-        suffix = "" if counter == 1 else f"-{counter}"
-        reserved_length = len(prefix) + len(suffix)
-        max_base_length = 63 - reserved_length
-        trimmed = source_name[:max_base_length].rstrip("-") or "backend"
-        candidate = ensure_backend_name(f"{prefix}{trimmed}{suffix}")
-        existing = (
-            await session.execute(
-                select(Backend.id).where(Backend.name == candidate).limit(1)
-            )
-        ).scalar_one_or_none()
-        if existing is None:
-            return candidate
-        counter += 1
-
-
-async def _next_clone_backend_port(
-    session: AsyncSession, source_port: int | None, settings: Settings
-) -> int:
-    existing_ports = {
-        port
-        for port in (
-            await session.execute(
-                select(Backend.port).where(
-                    Backend.kind == "app", Backend.port.is_not(None)
-                )
-            )
-        ).scalars()
-        if isinstance(port, int)
-    }
-    existing_ports.add(NETDATA_PORT)
-    candidate = (
-        source_port + 1
-        if isinstance(source_port, int) and source_port > 0
-        else settings.port_range_start
-    )
-    candidate = max(candidate, settings.port_range_start)
-    while candidate <= settings.port_range_end and (
-        candidate in existing_ports or not is_loopback_port_free(candidate)
-    ):
-        candidate += 1
-    if candidate > settings.port_range_end:
-        raise ValidationError(
-            f"no free app ports in range {settings.port_range_start}-{settings.port_range_end}"
-        )
-    return candidate
-
-
 async def clone_backend(
     session: AsyncSession,
     backend_id: int,
@@ -242,12 +191,16 @@ async def clone_backend(
     progress_callback: BackupProgressCallback | None = None,
 ) -> dict[str, object]:
     backend = await require_backend(session, backend_id)
-    clone_name = payload.name or await _next_clone_backend_name(session, backend.name)
-    clone_port = (
-        payload.port
-        if payload.port is not None
-        else await _next_clone_backend_port(session, backend.port, settings)
-    )
+    clone_name = payload.name or await next_clone_name(session, backend.name)
+    clone_port = None
+    if backend.kind == "app":
+        clone_port = payload.port
+        if clone_port is None:
+            clone_port = await next_clone_port(session, backend.port, settings)
+        if clone_port is None:
+            raise ValidationError(
+                f"no free app ports in range {settings.port_range_start}-{settings.port_range_end}"
+            )
     if backend.kind == "app" and clone_port == NETDATA_PORT:
         raise ValidationError(
             f"clone {clone_name} port uses reserved host port: {clone_port}"

@@ -10,7 +10,7 @@ from app import config
 from app import database
 
 
-CURRENT_REVISION = "0038_backend_hardening_config"
+CURRENT_REVISION = "0040_backend_ssh_keys"
 
 
 def test_database_import_does_not_validate_settings_at_import(monkeypatch) -> None:
@@ -82,6 +82,7 @@ async def test_init_db_runs_alembic_upgrade_for_fresh_database(
         "backend_resource_samples",
         "host_resource_samples",
         "operations",
+        "command_jobs",
         "host_apply_state",
         "update_checks",
         "backend_hardening_runs",
@@ -444,3 +445,42 @@ async def test_engine_registration_releases_collected_engines_and_preserves_casc
         gc.collect()
     assert all(reference() is None for reference in references)
     assert len(database._configured_sync_engines) <= registry_size
+
+
+async def test_ssh_key_migration_preserves_public_access_and_discards_private_material(
+    tmp_path,
+):
+    from test_backend_ssh_keys import public_key
+
+    database_url = f"sqlite+aiosqlite:///{tmp_path / 'legacy-ssh.db'}"
+    migration_config = database._alembic_config(database_url)
+    await asyncio.to_thread(
+        database.command.upgrade, migration_config, "0039_command_jobs"
+    )
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO backends (name, kind, enabled, volumes_json, ssh_public_key, ssh_private_key) VALUES ('web', 'app', 1, '[]', :public, 'legacy-secret')"
+                ),
+                {"public": public_key()},
+            )
+        await asyncio.to_thread(database.command.upgrade, migration_config, "head")
+        async with engine.connect() as connection:
+            backend = (
+                await connection.execute(
+                    text("SELECT ssh_public_key, ssh_private_key FROM backends")
+                )
+            ).one()
+            key = (
+                await connection.execute(
+                    text("SELECT name, public_key, filename FROM backend_ssh_keys")
+                )
+            ).one()
+        assert backend == (public_key(), None)
+        assert key.name == "Existing shared key"
+        assert key.public_key == public_key()
+        assert key.filename.startswith("cnc-web-ssh-")
+    finally:
+        await engine.dispose()

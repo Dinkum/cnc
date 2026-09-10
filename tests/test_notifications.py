@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import logging
 from urllib import error as urllib_error
 
 import pytest
 
-from app.logger import configure_logging
+from app.logger import configure_logging, flush_logging_pipeline_async
 from app.config import Settings
 from app.services import notifications
 from app.services.notification_state import read_notification_state
@@ -181,8 +180,7 @@ async def test_send_pushover_notification_logs_event_context(
     )
 
     assert sent is True
-    for handler in logging.getLogger().handlers:
-        handler.flush()
+    await flush_logging_pipeline_async()
     lines = log_path.read_text(encoding="utf-8").splitlines()
     assert any(
         "notification.pushover.attempt" in line and "event: apply_failed" in line
@@ -222,8 +220,7 @@ async def test_send_notification_test_suite_logs_each_scenario(
     )
 
     assert payload["ok"] is True
-    for handler in logging.getLogger().handlers:
-        handler.flush()
+    await flush_logging_pipeline_async()
     lines = log_path.read_text(encoding="utf-8").splitlines()
     assert any(
         "notification.test.started" in line and "backend: web" in line for line in lines
@@ -435,8 +432,7 @@ async def test_send_pushover_notification_logs_error_type_and_retryable(
     )
 
     assert sent is False
-    for handler in logging.getLogger().handlers:
-        handler.flush()
+    await flush_logging_pipeline_async()
     lines = log_path.read_text(encoding="utf-8").splitlines()
     assert any(
         "notification.pushover.failed" in line

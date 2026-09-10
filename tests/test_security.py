@@ -117,6 +117,19 @@ def test_enforce_origin_policy_rejects_cross_origin_host() -> None:
         enforce_origin_policy(request, settings)
 
 
+def test_enforce_origin_policy_rejects_opaque_origin_with_same_origin_referer() -> None:
+    settings = Settings(admin_host="127.0.0.1", admin_port=9090)
+    request = _request(
+        headers={
+            "origin": "null",
+            "referer": "http://127.0.0.1:9090/access",
+            "host": "127.0.0.1:9090",
+        }
+    )
+    with pytest.raises(HTTPException, match="invalid request origin"):
+        enforce_origin_policy(request, settings)
+
+
 def test_enforce_origin_policy_rejects_non_default_port_without_forwarded_proto() -> (
     None
 ):

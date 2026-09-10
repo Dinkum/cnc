@@ -4,11 +4,20 @@ from pydantic import ValidationError as PydanticValidationError
 
 from app.schemas.backends import BackendCloneIn, BackendIn, BackendUpdate
 from app.schemas.inputs import InputIn, InputUpdate
-from app.services.resource_profile import RESOURCE_SIZES
+from app.services.error_reporting import ErrorCode
 from app.services.renderers import SHIELD_PROFILE
+from app.services.resource_profile import RESOURCE_SIZES
 from app.services.sandbox_profiles import default_app_sandbox_profile
 from app.services.validators import ValidationError
+from app.ui.errors import operator_coded_error as _operator_coded_error
 
+DOMAIN_INPUT_HINT = "Use a lowercase hostname like api.example.com. Letters, digits, hyphens, and dots only."
+TAILNET_PATH_HINT = "Use a private path like /app1 or /docs/api. Each segment must stay lowercase and hyphen-safe."
+STATIC_ROOT_HINT = "Use an absolute host path like /srv/site or /var/www/docs. Static roots cannot contain spaces."
+VOLUME_BOUNDARY_HINT = (
+    "Use app-owned data paths only. Volumes cannot point at CNC-managed host paths, host runtime paths, "
+    "or CNC control paths inside the container."
+)
 
 DEFAULT_UI_APP_SANDBOX_PROFILE = default_app_sandbox_profile()
 
@@ -288,3 +297,25 @@ def _input_update_payload_from_form(
         )
     except PydanticValidationError as exc:
         raise ValidationError(_schema_validation_message(exc)) from exc
+
+
+
+def operator_validation_error(exc: ValidationError) -> str:
+    message = str(exc)
+    if message.startswith("hostname"):
+        message = f"{message}. {DOMAIN_INPUT_HINT}"
+    elif message.startswith("tailnet path") or message.startswith(
+        "invalid tailnet path"
+    ):
+        message = f"{message}. {TAILNET_PATH_HINT}"
+    elif message.startswith("tailnet service") or message.startswith(
+        "invalid tailnet service"
+    ):
+        message = f"{message}. Use a Tailscale service name like app-dev."
+    elif message.startswith("static_root"):
+        message = f"{message}. {STATIC_ROOT_HINT}"
+    elif message.startswith("volume source path") or message.startswith(
+        "volume target path"
+    ):
+        message = f"{message}. {VOLUME_BOUNDARY_HINT}"
+    return _operator_coded_error(message, ErrorCode.VALIDATION_FAILED)

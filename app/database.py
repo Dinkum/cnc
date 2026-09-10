@@ -116,6 +116,8 @@ def _alembic_config(database_url: str) -> Config:
     config.set_main_option("script_location", str(_ALEMBIC_SCRIPT_LOCATION))
     config.set_main_option("sqlalchemy.url", database_url)
     config.attributes["database_url"] = database_url
+    # CNC owns logging when migrations run inside the service or admin CLI.
+    config.attributes["configure_logger"] = False
     return config
 
 

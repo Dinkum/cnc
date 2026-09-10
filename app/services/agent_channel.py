@@ -18,6 +18,7 @@ from typing import Any, AsyncContextManager
 
 from fastapi import WebSocket
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.websockets import WebSocketDisconnect
 
@@ -38,7 +39,7 @@ from app.services.renderers import container_name
 
 
 AGENT_CHANNEL_PATH = "/api/agent/channel"
-AGENT_CHANNEL_VERSION = "beta.1"
+AGENT_CHANNEL_VERSION = "beta.2"
 MAX_FRAME_BYTES = 64 * 1024
 MAX_OUTPUT_CHUNK_BYTES = 16 * 1024
 DEFAULT_EXEC_TIMEOUT_SEC = 60
@@ -447,6 +448,8 @@ async def run_agent_channel(
             "type": "ready",
             "version": AGENT_CHANNEL_VERSION,
             "modes": ["exec", "pty"],
+            "background": True,
+            "operations": ["list", "show", "logs", "cancel"],
             "scope": "tenant",
         }
     )
@@ -471,7 +474,41 @@ async def run_agent_channel(
                 frame = _parse_frame(raw_frame)
                 frame_type = str(frame.get("type") or "")
                 frame_id = _frame_id(frame)
+                if frame_type in {
+                    "operation.list",
+                    "operation.show",
+                    "operation.logs",
+                    "operation.cancel",
+                }:
+                    await _run_operation_frame(
+                        frame, frame_id, settings, session_factory, send_json
+                    )
+                    continue
                 if frame_type == "exec":
+                    if "background" in frame and type(frame["background"]) is not bool:
+                        raise AgentChannelFrameError(
+                            "invalid_background", "background must be a boolean"
+                        )
+                    if frame.get("background"):
+                        from app.services.command_jobs import (
+                            CommandJobError,
+                            submit_job,
+                        )
+
+                        backend = await _resolve_backend(session_factory, frame)
+                        try:
+                            payload = await submit_job(
+                                settings,
+                                backend.name,
+                                frame,
+                                request_key=frame.get("request_key"),
+                            )
+                        except CommandJobError as exc:
+                            raise AgentChannelFrameError(exc.code, str(exc)) from exc
+                        await send_json(
+                            {"id": frame_id, "type": "operation", **payload}
+                        )
+                        continue
                     if frame_id in exec_tasks:
                         raise AgentChannelFrameError(
                             "duplicate_id",
@@ -620,6 +657,17 @@ async def run_agent_channel(
                 if frame is not None and frame.get("id"):
                     payload["id"] = str(frame.get("id"))
                 await send_json(payload)
+            except (OSError, SQLAlchemyError):
+                # Keep storage failures structured without echoing SQL parameters
+                # or command text. A persisted request key resolves lost replies.
+                await send_json(
+                    {
+                        "id": frame.get("id") if frame else None,
+                        "type": "error",
+                        "code": "operation_unavailable",
+                        "message": "operation storage or runtime observation is unavailable; inspect before retrying",
+                    }
+                )
     finally:
         for task in exec_tasks.values():
             task.cancel()
@@ -627,6 +675,69 @@ async def run_agent_channel(
             await asyncio.gather(*exec_tasks.values(), return_exceptions=True)
         if pty_session is not None:
             await pty_session.close(reason="disconnect")
+
+
+async def _run_operation_frame(
+    frame: dict[str, Any],
+    frame_id: str,
+    settings: Settings,
+    session_factory: SessionFactory,
+    send_json: SendJson,
+) -> None:
+    from app.models.entities import CommandJob
+    from app.services.command_jobs import (
+        CommandJobError,
+        cancel_job,
+        get_job,
+        job_logs,
+        list_jobs,
+    )
+
+    if frame["type"] == "operation.list":
+        backend = await _resolve_backend(session_factory, frame)
+        try:
+            payload = await list_jobs(
+                settings, backend.name, limit=frame.get("limit", 20)
+            )
+        except CommandJobError as exc:
+            raise AgentChannelFrameError(exc.code, str(exc)) from exc
+        await send_json({"id": frame_id, "type": "operation", **payload})
+        return
+
+    operation_id = frame.get("operation_id")
+    if type(operation_id) is not int or operation_id < 1:
+        raise AgentChannelFrameError(
+            "invalid_operation", "operation_id must be a positive integer"
+        )
+    # Validate output eligibility afresh, and check operation scope before any
+    # read or cancellation. A socket's previous exec is not authorization state.
+    backend = await _resolve_backend(session_factory, frame)
+    async with session_factory() as session:
+        job = await session.get(CommandJob, operation_id)
+        if job is None or job.output_name != backend.name:
+            raise AgentChannelFrameError(
+                "operation_not_found", "command operation not found for this output"
+            )
+    try:
+        if frame["type"] == "operation.cancel":
+            payload = await cancel_job(settings, operation_id)
+        elif frame["type"] == "operation.logs":
+            offset = frame.get("offset", 0)
+            if type(offset) is not int or offset < 0:
+                raise AgentChannelFrameError(
+                    "invalid_offset", "offset must be a nonnegative integer"
+                )
+            payload = await job_logs(
+                settings,
+                operation_id,
+                stream=frame.get("stream", "stdout"),
+                offset=offset,
+            )
+        else:
+            payload = await get_job(settings, operation_id)
+    except CommandJobError as exc:
+        raise AgentChannelFrameError(exc.code, str(exc)) from exc
+    await send_json({"id": frame_id, "type": "operation", **payload})
 
 
 async def _resolve_backend(

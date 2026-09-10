@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
@@ -31,6 +32,13 @@ from app.services.app_quadlet import (
 )
 from app.services.apply_service import run_apply
 from app.services.commands import run_command
+from app.services.guest_isolation import (
+    archive_guest,
+    extract_guest,
+    guest_helper_bytes,
+    validate_guest_hardening,
+)
+from app.services.hardening_policy import read_hardening_policy
 from app.services.renderers import container_name, network_name
 from app.services.resource_profile import build_resource_profile
 from app.services.replica_readiness import (
@@ -581,17 +589,22 @@ def _archive_local_backend(
     sandbox = app_sandbox_dir(settings, backend.name)
     if not sandbox.exists():
         raise RuntimeError(f"source sandbox is missing: {sandbox}")
-    _run_checked(
-        [
-            "tar",
-            "-C",
-            str(settings.app_sandbox_dir),
-            "-czf",
-            str(bundle_path),
-            backend.name,
-        ],
-        settings,
-    )
+    archive_guest(sandbox, bundle_path, container_name(backend.name))
+
+
+def _remote_guest_helper_script() -> str:
+    encoded = base64.b64encode(guest_helper_bytes()).decode("ascii")
+    return f"""python3 - <<'CNC_GUEST_HELPER'
+import base64, os
+from pathlib import Path
+path = Path('/usr/local/bin/cnc-prepare-guest')
+if path.is_symlink():
+    raise RuntimeError('Guest helper cannot be a symlink')
+temporary = path.with_name('.cnc-prepare-guest.tmp')
+temporary.write_bytes(base64.b64decode('{encoded}'))
+temporary.chmod(0o755)
+os.replace(temporary, path)
+CNC_GUEST_HELPER"""
 
 
 def _archive_remote_backend(
@@ -604,9 +617,10 @@ def _archive_remote_backend(
     script = "\n".join(
         [
             "set -Eeuo pipefail",
+            _remote_guest_helper_script(),
             "install -d -m 0755 /var/lib/cnc/cluster-transfers",
             f"test -d {shlex.quote(str(Path('/var/lib/cnc/sandboxes') / backend.name))}",
-            f"tar -C /var/lib/cnc/sandboxes -czf {shlex.quote(remote_path)} {shlex.quote(backend.name)}",
+            f"/usr/local/bin/cnc-prepare-guest --archive /var/lib/cnc/sandboxes/{shlex.quote(backend.name)} --destination {shlex.quote(remote_path)} --name {shlex.quote(backend.name)}",
         ]
     )
     try:
@@ -630,11 +644,9 @@ def _restore_local_backend(
     service_was_active = _local_backend_service_active(backend, settings)
     shutil.rmtree(stage_parent, ignore_errors=True)
     shutil.rmtree(rollback, ignore_errors=True)
-    stage_parent.mkdir(parents=True, exist_ok=False)
+    stage_parent.mkdir(parents=True, mode=0o700, exist_ok=False)
     try:
-        _run_checked(
-            ["tar", "-C", str(stage_parent), "-xzf", str(bundle_path)], settings
-        )
+        extract_guest(bundle_path, stage_parent, backend.name)
         staged = stage_parent / backend.name
         if not staged.is_dir():
             raise RuntimeError(
@@ -806,6 +818,10 @@ def _remote_rollback_state(
 def _remote_quadlet_assets(
     backend: Backend, settings: Settings, node: ClusterNode
 ) -> tuple[str, str]:
+    validate_guest_hardening(read_hardening_policy(backend).model_dump())
+    settings = settings.model_copy(
+        update={"guest_runtime_helper_path": Path("/usr/local/bin/cnc-prepare-guest")}
+    )
     rootfs = Path("/var/lib/cnc/sandboxes") / backend.name / "rootfs"
     base_profile = build_resource_profile(settings, [backend])
     return (
@@ -838,10 +854,12 @@ def _remote_restore_script(
     target_sandbox = str(Path("/var/lib/cnc/sandboxes") / backend.name)
     return f"""set -Eeuo pipefail
 export DEBIAN_FRONTEND=noninteractive
-if ! command -v podman >/dev/null 2>&1; then
+if ! command -v podman >/dev/null 2>&1 || ! command -v apparmor_parser >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
   apt-get -qq update
-  apt-get -qq install -y podman curl ca-certificates >/dev/null
+  apt-get -qq install -y podman curl ca-certificates apparmor python3 >/dev/null
 fi
+{_remote_guest_helper_script()}
+/usr/local/bin/cnc-prepare-guest
 install -d -m 0755 /var/lib/cnc/sandboxes /var/lib/cnc/cluster-transfers /etc/containers/systemd
 stage_dir="$(mktemp -d /var/lib/cnc/sandboxes/.cnc-transfer-stage-{shlex.quote(backend.name)}.XXXXXX)"
 rollback_dir={shlex.quote(rollback.rollback_path)}
@@ -899,7 +917,7 @@ for asset in "$network_asset" "$container_asset"; do
     cp -a "$asset" "$unit_backup_dir/$(basename "$asset")"
   fi
 done
-tar -C "$stage_dir" -xzf {shlex.quote(remote_path)}
+/usr/local/bin/cnc-prepare-guest --extract {shlex.quote(remote_path)} --destination "$stage_dir" --name {shlex.quote(backend.name)}
 test -d "$stage_dir/{shlex.quote(backend.name)}"
 if [ -e "$target_sandbox" ]; then
   mv "$target_sandbox" "$rollback_dir"
@@ -963,10 +981,12 @@ def _remote_fresh_setup_script(
     sandbox_dir = str(Path("/var/lib/cnc/sandboxes") / backend.name)
     return f"""set -Eeuo pipefail
 export DEBIAN_FRONTEND=noninteractive
-if ! command -v podman >/dev/null 2>&1; then
+if ! command -v podman >/dev/null 2>&1 || ! command -v apparmor_parser >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
   apt-get -qq update
-  apt-get -qq install -y podman curl ca-certificates >/dev/null
+  apt-get -qq install -y podman curl ca-certificates apparmor python3 >/dev/null
 fi
+{_remote_guest_helper_script()}
+/usr/local/bin/cnc-prepare-guest
 install -d -m 0755 /var/lib/cnc/sandboxes /etc/containers/systemd
 stage_dir="$(mktemp -d /var/lib/cnc/sandboxes/.cnc-fresh-stage-{container}.XXXXXX)"
 stage_sandbox="$stage_dir/{shlex.quote(backend.name)}"
@@ -1030,9 +1050,11 @@ for asset in "$network_asset" "$container_asset"; do
   fi
 done
 mkdir -p "$stage_rootfs"
+chmod 0700 "$stage_sandbox"
 podman pull {shlex.quote(profile.seed_image)} >/dev/null
 podman create --name "$seed_container" {shlex.quote(profile.seed_image)} /bin/true >/dev/null
-podman export "$seed_container" | tar -C "$stage_rootfs" -xf -
+podman export "$seed_container" > "$stage_dir/seed.tar"
+/usr/local/bin/cnc-prepare-guest --extract-rootfs "$stage_dir/seed.tar" --destination "$stage_rootfs"
 podman rm -f "$seed_container" >/dev/null
 mkdir -p "$stage_rootfs/etc"
 test -e "$stage_rootfs/etc/machine-id" || : > "$stage_rootfs/etc/machine-id"

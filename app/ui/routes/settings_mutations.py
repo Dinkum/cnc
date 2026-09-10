@@ -2,6 +2,19 @@ from __future__ import annotations
 
 import json
 
+from fastapi import (
+    APIRouter,
+    Depends,
+    Form,
+    Header,
+    Request,
+)
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+)
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.access import (
     clear_access_cookie,
     hash_access_key,
@@ -13,6 +26,7 @@ from app.dependencies import (
     db_session_dependency,
     settings_dependency,
 )
+from app.logger import get_logger
 from app.security import enforce_csrf
 from app.services.apply_service import run_apply
 from app.services.cluster_nodes import (
@@ -31,31 +45,15 @@ from app.services.update_service import (
     UpdateRejectedError,
     run_update,
 )
-from app.ui.errors import (
-    operator_coded_error as _operator_coded_error,
-    operator_error_message as _operator_error_message,
-)
+from app.ui.dashboard.context import cached_dashboard_context
+from app.ui.errors import operator_coded_error as _operator_coded_error
+from app.ui.errors import operator_error_message as _operator_error_message
 from app.ui.forms import _form_string_or_default
+from app.ui.http import dashboard_redirect, render_dashboard_template
+from app.ui.mutation_feedback import host_mutation_preflight_message
 from app.ui.settings import _resolve_masked_secret_submission
-from app.ui.routes.shared import (
-    _cached_dashboard_context,
-    _dashboard_redirect,
-    _host_mutation_preflight_message,
-    _render_dashboard_template,
-    logger,
-)
-from fastapi import (
-    APIRouter,
-    Depends,
-    Form,
-    Header,
-    Request,
-)
-from fastapi.responses import (
-    HTMLResponse,
-    JSONResponse,
-)
-from sqlalchemy.ext.asyncio import AsyncSession
+
+logger = get_logger("ui")
 
 
 router = APIRouter(tags=["ui"])
@@ -73,15 +71,15 @@ async def update_form(
     try:
         response = await run_update(session, settings)
     except UpdateRejectedError as exc:
-        context = await _cached_dashboard_context(
+        context = await cached_dashboard_context(
             session, settings, active_tab="settings"
         )
         context["request"] = request
         context["active_tab"] = "settings"
         context["flash_error"] = _operator_error_message(str(exc), exc.log_context())
-        return _render_dashboard_template(request, context, status_code=409)
+        return render_dashboard_template(request, context, status_code=409)
     logger.info("ui.update.completed", status=response.status)
-    context = await _cached_dashboard_context(session, settings, active_tab="settings")
+    context = await cached_dashboard_context(session, settings, active_tab="settings")
     context["request"] = request
     context["active_tab"] = "settings"
     if response.status in {"queued", "running"}:
@@ -90,7 +88,7 @@ async def update_form(
         context["flash_success"] = "Update completed."
     else:
         context["flash_error"] = f"Update failed: {json.dumps(response.details)}"
-    return _render_dashboard_template(request, context, status_code=200)
+    return render_dashboard_template(request, context, status_code=200)
 
 
 @router.post("/ui/settings/access-key")
@@ -127,29 +125,29 @@ async def update_access_key_settings_form(
                 url=admin_dashboard_url(next_settings, tab="settings"),
                 url_title="Open settings",
             )
-            context = await _cached_dashboard_context(
+            context = await cached_dashboard_context(
                 session, next_settings, active_tab="settings"
             )
             context["request"] = request
             context["active_tab"] = "settings"
             context["flash_success"] = "Access key disabled."
-            response = _render_dashboard_template(request, context, status_code=200)
+            response = render_dashboard_template(request, context, status_code=200)
             clear_access_cookie(response, request=request)
             return response
 
         try:
             normalized_key = normalize_access_key(access_key)
         except ValueError as exc:
-            context = await _cached_dashboard_context(
+            context = await cached_dashboard_context(
                 session, settings, active_tab="settings"
             )
             context["request"] = request
             context["active_tab"] = "settings"
             context["access_key_modal_open"] = True
             context["flash_error"] = str(exc)
-            return _render_dashboard_template(request, context, status_code=400)
+            return render_dashboard_template(request, context, status_code=400)
         if normalized_key != str(access_key_confirm or "").strip():
-            context = await _cached_dashboard_context(
+            context = await cached_dashboard_context(
                 session, settings, active_tab="settings"
             )
             context["request"] = request
@@ -159,7 +157,7 @@ async def update_access_key_settings_form(
                 "Access key confirmation must match.",
                 ErrorCode.VALIDATION_FAILED,
             )
-            return _render_dashboard_template(request, context, status_code=400)
+            return render_dashboard_template(request, context, status_code=400)
 
         next_settings = apply_managed_env_updates(
             settings, {"ACCESS_KEY_HASH": hash_access_key(normalized_key)}
@@ -179,20 +177,20 @@ async def update_access_key_settings_form(
             url=admin_dashboard_url(next_settings, tab="settings"),
             url_title="Open settings",
         )
-        context = await _cached_dashboard_context(
+        context = await cached_dashboard_context(
             session, next_settings, active_tab="settings"
         )
         context["request"] = request
         context["active_tab"] = "settings"
         context["flash_success"] = "Access key saved."
-        response = _render_dashboard_template(request, context, status_code=200)
+        response = render_dashboard_template(request, context, status_code=200)
         set_access_cookie(response, next_settings, request=request)
         return response
     except Exception as exc:
         logger.warning(
             "ui.settings.access_key.failed", error=str(exc), action=normalized_action
         )
-        context = await _cached_dashboard_context(
+        context = await cached_dashboard_context(
             session, settings, active_tab="settings"
         )
         context["request"] = request
@@ -200,7 +198,7 @@ async def update_access_key_settings_form(
         if normalized_action not in {"clear", "disable"}:
             context["access_key_modal_open"] = True
         context["flash_error"] = f"failed to save access key: {exc}"
-        return _render_dashboard_template(request, context, status_code=400)
+        return render_dashboard_template(request, context, status_code=400)
 
 
 @router.post("/ui/settings/notifications")
@@ -247,13 +245,13 @@ async def update_notification_settings_form(
                 url=admin_dashboard_url(settings, tab="settings"),
                 url_title="Open settings",
             )
-            context = await _cached_dashboard_context(
+            context = await cached_dashboard_context(
                 session, next_settings, active_tab="settings"
             )
             context["request"] = request
             context["active_tab"] = "settings"
             context["flash_success"] = "Pushover notifications cleared."
-            return _render_dashboard_template(request, context, status_code=200)
+            return render_dashboard_template(request, context, status_code=200)
 
         updates: dict[str, str | None] = {}
         effective_app_token, app_token_changed = _resolve_masked_secret_submission(
@@ -286,7 +284,7 @@ async def update_notification_settings_form(
                 }
             )
         else:
-            context = await _cached_dashboard_context(
+            context = await cached_dashboard_context(
                 session, settings, active_tab="settings"
             )
             context["request"] = request
@@ -294,9 +292,9 @@ async def update_notification_settings_form(
             context["flash_error"] = (
                 "Enter a Pushover app token or user key, or use Clear."
             )
-            return _render_dashboard_template(request, context, status_code=400)
+            return render_dashboard_template(request, context, status_code=400)
 
-        context = await _cached_dashboard_context(
+        context = await cached_dashboard_context(
             session, next_settings, active_tab="settings"
         )
         context["request"] = request
@@ -307,7 +305,7 @@ async def update_notification_settings_form(
                 context["flash_error"] = (
                     "Pushover test requires both the app token and the user key."
                 )
-                return _render_dashboard_template(request, context, status_code=400)
+                return render_dashboard_template(request, context, status_code=400)
             sent = await send_pushover_notification_async(
                 next_settings,
                 title="CNC test alert",
@@ -324,9 +322,9 @@ async def update_notification_settings_form(
             )
             if sent:
                 context["flash_success"] = "Pushover test alert sent."
-                return _render_dashboard_template(request, context, status_code=200)
+                return render_dashboard_template(request, context, status_code=200)
             context["flash_error"] = "Pushover test alert could not be delivered."
-            return _render_dashboard_template(request, context, status_code=502)
+            return render_dashboard_template(request, context, status_code=502)
 
         if updates:
             await send_pushover_notification_async(
@@ -354,18 +352,18 @@ async def update_notification_settings_form(
             context["flash_success"] = (
                 "Pushover settings saved. Add both values to enable delivery."
             )
-        return _render_dashboard_template(request, context, status_code=200)
+        return render_dashboard_template(request, context, status_code=200)
     except Exception as exc:
         logger.warning(
             "ui.settings.notifications.failed", error=str(exc), action=normalized_action
         )
-        context = await _cached_dashboard_context(
+        context = await cached_dashboard_context(
             session, settings, active_tab="settings"
         )
         context["request"] = request
         context["active_tab"] = "settings"
         context["flash_error"] = f"failed to save Pushover settings: {exc}"
-        return _render_dashboard_template(request, context, status_code=400)
+        return render_dashboard_template(request, context, status_code=400)
 
 
 @router.post("/ui/settings/beta")
@@ -389,17 +387,17 @@ async def update_beta_settings_form(
     )
     try:
         if bool(settings.netdata_enabled) != netdata_server_enabled:
-            blocked_message = await _host_mutation_preflight_message(
+            blocked_message = await host_mutation_preflight_message(
                 settings, action="Netdata setting save"
             )
             if blocked_message is not None:
-                context = await _cached_dashboard_context(
+                context = await cached_dashboard_context(
                     session, settings, active_tab="settings"
                 )
                 context["request"] = request
                 context["active_tab"] = "settings"
                 context["flash_error"] = blocked_message
-                return _render_dashboard_template(request, context, status_code=409)
+                return render_dashboard_template(request, context, status_code=409)
         next_settings = apply_managed_env_updates(
             settings,
             {
@@ -450,7 +448,7 @@ async def update_beta_settings_form(
                 apply_flash_error = (
                     f"Netdata setting could not be applied: {apply_error}"
                 )
-        return _dashboard_redirect(
+        return dashboard_redirect(
             request,
             active_tab="settings",
             flash_success=flash_success,
@@ -463,13 +461,13 @@ async def update_beta_settings_form(
             beta_routing=beta_routing_enabled,
             netdata_enabled=netdata_server_enabled,
         )
-        context = await _cached_dashboard_context(
+        context = await cached_dashboard_context(
             session, settings, active_tab="settings"
         )
         context["request"] = request
         context["active_tab"] = "settings"
         context["flash_error"] = f"failed to save beta settings: {exc}"
-        return _render_dashboard_template(request, context, status_code=400)
+        return render_dashboard_template(request, context, status_code=400)
 
 
 @router.post("/ui/settings/nodes")
@@ -486,7 +484,7 @@ async def update_node_settings_form(
             settings,
             {"MULTI_NODE_ENABLED": "true" if multi_node_enabled else "false"},
         )
-        return _dashboard_redirect(
+        return dashboard_redirect(
             request,
             active_tab="settings",
             flash_success="Node settings saved.",
@@ -497,13 +495,13 @@ async def update_node_settings_form(
             error=str(exc),
             multi_node_enabled=multi_node_enabled,
         )
-        context = await _cached_dashboard_context(
+        context = await cached_dashboard_context(
             session, settings, active_tab="settings"
         )
         context["request"] = request
         context["active_tab"] = "settings"
         context["flash_error"] = f"failed to save node settings: {exc}"
-        return _render_dashboard_template(request, context, status_code=400)
+        return render_dashboard_template(request, context, status_code=400)
 
 
 @router.post("/ui/settings/nodes/join-command")

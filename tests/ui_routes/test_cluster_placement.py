@@ -1,3 +1,10 @@
+import app.services.operations as app_services_operations
+import app.ui.cluster as ui_cluster
+import app.ui.dashboard.data as ui_dashboard_data
+import app.ui.http as ui_http
+import app.ui.outputs.context as ui_outputs_context
+import app.ui.outputs.data as ui_outputs_data
+
 from .support import (
     ApplyResponse,
     Backend,
@@ -7,19 +14,18 @@ from .support import (
     Path,
     Settings,
     SimpleNamespace,
-    _PostedRequest,
     _healthy_status,
     _make_session,
     _mark_replica_ready,
+    _PostedRequest,
     _request,
     json,
+    output_save_operations,
     select,
     ui_backup,
     ui_output,
     ui_pages,
     ui_settings,
-    ui_shared,
-    output_save_operations,
 )
 
 
@@ -45,8 +51,8 @@ async def test_dashboard_non_settings_tabs_skip_cluster_nodes_when_multi_node_en
             "non-settings dashboard tabs should not build node summaries"
         )
 
-    monkeypatch.setattr(ui_shared, "collect_status", fake_collect_status)
-    monkeypatch.setattr(ui_shared, "_cluster_nodes", fail_cluster_nodes)
+    monkeypatch.setattr(ui_dashboard_data, "collect_status", fake_collect_status)
+    monkeypatch.setattr(ui_cluster, "cluster_nodes", fail_cluster_nodes)
 
     async with maker() as session:
         for tab in ("home", "outputs"):
@@ -80,7 +86,7 @@ async def test_update_node_settings_form_persists_multi_node_toggle(
         assert response.headers["location"] == "/?tab=settings"
         assert next_settings.multi_node_enabled is True
         assert "MULTI_NODE_ENABLED=true" in env_path.read_text(encoding="utf-8")
-        assert ui_shared.FLASH_SUCCESS_COOKIE in response.headers["set-cookie"]
+        assert ui_http.FLASH_SUCCESS_COOKIE in response.headers["set-cookie"]
     finally:
         monkeypatch.delenv("MULTI_NODE_ENABLED", raising=False)
 
@@ -157,7 +163,7 @@ async def test_output_page_context_includes_minimal_multi_node_placement(
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'app.db'}",
         multi_node_enabled=True,
     )
-    monkeypatch.setattr(ui_shared, "peek_cached_status", lambda: {"services": []})
+    monkeypatch.setattr(ui_outputs_data, "peek_cached_status", lambda: {"services": []})
 
     async with maker() as session:
         backend = Backend(
@@ -188,7 +194,7 @@ async def test_output_page_context_includes_minimal_multi_node_placement(
         session.add_all([backend, target_backend, node])
         await session.commit()
 
-        context = await ui_shared._output_page_context(
+        context = await ui_outputs_context.output_page_context(
             session,
             settings,
             backend.id,
@@ -391,7 +397,7 @@ async def test_update_backend_placement_form_rejects_active_host_mutation(
     monkeypatch.setattr(ui_backup, "enforce_csrf", lambda *_args, **_kwargs: None)
 
     async def fake_active_host_mutation_blocker(_settings):
-        return ui_shared.HostMutationBlocker(
+        return app_services_operations.HostMutationBlocker(
             id=7,
             kind="transfer_backend",
             status="running",

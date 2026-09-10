@@ -1,25 +1,24 @@
+import app.ui.dashboard.context as ui_dashboard_context
+import app.ui.http as ui_http
+import app.ui.settings as ui_settings_view
+
 from .support import (
     ACCESS_COOKIE_NAME,
-    Backend,
     HTMLResponse,
     Path,
     Settings,
     SimpleNamespace,
-    _PostedRequest,
     _cookie_values,
-    _make_session,
+    _PostedRequest,
     _request,
     _set_cookie_headers,
     access_cookie_is_valid,
     access_key_is_configured,
     hash_access_key,
-    select,
     set_access_cookie,
-    ui_hardening,
     ui_pages,
     ui_reads,
     ui_settings,
-    ui_shared,
     verify_access_key,
 )
 
@@ -50,7 +49,7 @@ def test_flash_cookies_are_secure_for_forwarded_https_admin() -> None:
         ],
     )
 
-    ui_shared._set_flash_cookies(response, request, flash_success="Saved")
+    ui_http._set_flash_cookies(response, request, flash_success="Saved")
 
     assert "Secure" in response.headers["set-cookie"]
 
@@ -71,8 +70,8 @@ async def test_dashboard_reads_flash_cookies_and_tab_from_request(monkeypatch) -
         captured["status_code"] = status_code
         return HTMLResponse("ok", status_code=status_code)
 
-    monkeypatch.setattr(ui_pages, "_dashboard_context", fake_dashboard_context)
-    monkeypatch.setattr(ui_shared.templates, "TemplateResponse", fake_template_response)
+    monkeypatch.setattr(ui_pages, "dashboard_context", fake_dashboard_context)
+    monkeypatch.setattr(ui_http.templates, "TemplateResponse", fake_template_response)
 
     request = _request(
         path="/?tab=inputs",
@@ -99,7 +98,11 @@ async def test_download_support_debug_bundle_returns_zip(monkeypatch) -> None:
         "build_support_debug_bundle",
         fake_build_support_debug_bundle,
     )
-    monkeypatch.setattr(ui_reads, "flush_logging_pipeline", lambda: None)
+
+    async def flush_logs():
+        return True
+
+    monkeypatch.setattr(ui_reads, "flush_logging_pipeline_async", flush_logs)
 
     response = await ui_reads.download_support_debug_bundle(
         settings=Settings(),
@@ -116,124 +119,6 @@ async def test_download_support_debug_bundle_returns_zip(monkeypatch) -> None:
     )
 
 
-async def test_provision_backend_ssh_key_generates_key_and_reconciles(
-    monkeypatch, tmp_path: Path
-) -> None:
-    maker = await _make_session(tmp_path / "app.db")
-    settings = Settings(
-        database_url=f"sqlite+aiosqlite:///{tmp_path / 'app.db'}",
-        apply_lock_path=tmp_path / "apply.lock",
-    )
-    reconciled: list[list[tuple[str, str | None]]] = []
-
-    def fake_ensure_keypair(backend: Backend) -> bool:
-        backend.ssh_public_key = "ssh-ed25519 AAAAOUTPUT cnc-web"
-        backend.ssh_private_key = "PRIVATE KEY\n"
-        return True
-
-    async def fake_reconcile(
-        backends: list[Backend], _settings: Settings
-    ) -> dict[str, object]:
-        reconciled.append(
-            [(backend.name, backend.ssh_public_key) for backend in backends]
-        )
-        return {"ssh_backends": [backend.name for backend in backends]}
-
-    monkeypatch.setattr(ui_hardening, "ensure_backend_ssh_keypair", fake_ensure_keypair)
-    monkeypatch.setattr(ui_hardening, "reconcile_backend_ssh_access", fake_reconcile)
-    monkeypatch.setattr(ui_hardening, "enforce_csrf", lambda *_args, **_kwargs: None)
-
-    async with maker() as session:
-        backend = Backend(
-            name="web",
-            kind="app",
-            port=12000,
-            enabled=True,
-            volumes_json="[]",
-        )
-        session.add(backend)
-        await session.commit()
-
-        response = await ui_hardening.provision_backend_ssh_key(
-            backend.id,
-            _PostedRequest(path=f"/api/backends/{backend.id}/ssh-key"),
-            csrf_token="token",
-            settings=settings,
-            session=session,
-        )
-        stored = (
-            await session.execute(select(Backend).where(Backend.id == backend.id))
-        ).scalar_one()
-
-    assert response.status_code == 200
-    assert response.body == b"PRIVATE KEY\n"
-    assert 'filename="cnc-web-id_ed25519"' in response.headers["content-disposition"]
-    assert response.headers["cache-control"] == "no-store"
-    assert stored.ssh_public_key == "ssh-ed25519 AAAAOUTPUT cnc-web"
-    assert reconciled == [[("web", "ssh-ed25519 AAAAOUTPUT cnc-web")]]
-
-
-async def test_download_backend_ssh_key_is_read_only(
-    monkeypatch, tmp_path: Path
-) -> None:
-    maker = await _make_session(tmp_path / "app.db")
-
-    assert not hasattr(ui_reads, "ensure_backend_ssh_keypair")
-    assert not hasattr(ui_reads, "reconcile_backend_ssh_access")
-
-    async with maker() as session:
-        backend = Backend(
-            name="web",
-            kind="app",
-            port=12000,
-            enabled=True,
-            volumes_json="[]",
-            ssh_public_key="ssh-ed25519 AAAAOUTPUT cnc-web",
-            ssh_private_key="PRIVATE KEY\n",
-        )
-        session.add(backend)
-        await session.commit()
-
-        response = await ui_reads.download_backend_ssh_key(
-            backend.id,
-            settings=Settings(),
-            session=session,
-        )
-
-    assert response.status_code == 200
-    assert response.body == b"PRIVATE KEY\n"
-
-
-async def test_download_backend_ssh_key_does_not_mint_missing_key(
-    monkeypatch, tmp_path: Path
-) -> None:
-    maker = await _make_session(tmp_path / "app.db")
-
-    assert not hasattr(ui_reads, "ensure_backend_ssh_keypair")
-    assert not hasattr(ui_reads, "reconcile_backend_ssh_access")
-
-    async with maker() as session:
-        backend = Backend(
-            name="web",
-            kind="app",
-            port=12000,
-            enabled=True,
-            volumes_json="[]",
-        )
-        session.add(backend)
-        await session.commit()
-
-        response = await ui_reads.download_backend_ssh_key(
-            backend.id,
-            settings=Settings(),
-            session=session,
-        )
-        await session.refresh(backend)
-
-        assert response.status_code == 409
-        assert backend.ssh_private_key is None
-
-
 async def test_access_page_uses_access_template(monkeypatch) -> None:
     captured: dict[str, object] = {}
     monkeypatch.delenv("ACCESS_KEY_HASH", raising=False)
@@ -245,7 +130,7 @@ async def test_access_page_uses_access_template(monkeypatch) -> None:
         captured["context"] = context
         return HTMLResponse("ok", status_code=status_code)
 
-    monkeypatch.setattr(ui_shared.templates, "TemplateResponse", fake_template_response)
+    monkeypatch.setattr(ui_http.templates, "TemplateResponse", fake_template_response)
 
     request = _request(path="/access?next=%2Foutputs%2F7")
     response = await ui_pages.access_page(request, settings=settings)
@@ -311,7 +196,7 @@ async def test_update_access_key_settings_form_sets_cookie(
             "flash_error": None,
             "flash_success": None,
             "active_tab": "home",
-            "access_key_settings": ui_shared._access_key_settings_summary(
+            "access_key_settings": ui_settings_view._access_key_settings_summary(
                 next_settings
             ),
         }
@@ -324,8 +209,11 @@ async def test_update_access_key_settings_form_sets_cookie(
         return HTMLResponse("ok", status_code=status_code)
 
     monkeypatch.setattr(ui_settings, "enforce_csrf", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(ui_shared, "_dashboard_context", fake_dashboard_context)
-    monkeypatch.setattr(ui_shared.templates, "TemplateResponse", fake_template_response)
+    monkeypatch.setattr(
+        ui_dashboard_context, "dashboard_context", fake_dashboard_context
+    )
+    monkeypatch.setattr(ui_http, "dashboard_context", fake_dashboard_context)
+    monkeypatch.setattr(ui_http.templates, "TemplateResponse", fake_template_response)
 
     request = _PostedRequest(path="/ui/settings/access-key")
     response = await ui_settings.update_access_key_settings_form(
@@ -365,8 +253,11 @@ async def test_update_access_key_settings_form_reopens_modal_on_validation_error
         return HTMLResponse("ok", status_code=status_code)
 
     monkeypatch.setattr(ui_settings, "enforce_csrf", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(ui_shared, "_dashboard_context", fake_dashboard_context)
-    monkeypatch.setattr(ui_shared.templates, "TemplateResponse", fake_template_response)
+    monkeypatch.setattr(
+        ui_dashboard_context, "dashboard_context", fake_dashboard_context
+    )
+    monkeypatch.setattr(ui_http, "dashboard_context", fake_dashboard_context)
+    monkeypatch.setattr(ui_http.templates, "TemplateResponse", fake_template_response)
 
     response = await ui_settings.update_access_key_settings_form(
         _PostedRequest(path="/ui/settings/access-key"),
@@ -404,7 +295,7 @@ async def test_update_access_key_settings_form_disables_existing_key(
             "flash_error": None,
             "flash_success": None,
             "active_tab": "home",
-            "access_key_settings": ui_shared._access_key_settings_summary(
+            "access_key_settings": ui_settings_view._access_key_settings_summary(
                 next_settings
             ),
         }
@@ -417,8 +308,11 @@ async def test_update_access_key_settings_form_disables_existing_key(
         return HTMLResponse("ok", status_code=status_code)
 
     monkeypatch.setattr(ui_settings, "enforce_csrf", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(ui_shared, "_dashboard_context", fake_dashboard_context)
-    monkeypatch.setattr(ui_shared.templates, "TemplateResponse", fake_template_response)
+    monkeypatch.setattr(
+        ui_dashboard_context, "dashboard_context", fake_dashboard_context
+    )
+    monkeypatch.setattr(ui_http, "dashboard_context", fake_dashboard_context)
+    monkeypatch.setattr(ui_http.templates, "TemplateResponse", fake_template_response)
 
     response = await ui_settings.update_access_key_settings_form(
         _PostedRequest(path="/ui/settings/access-key"),
@@ -438,7 +332,7 @@ async def test_update_access_key_settings_form_disables_existing_key(
 
 
 def test_dashboard_redirect_sanitizes_flash_cookie_control_chars() -> None:
-    response = ui_shared._dashboard_redirect(
+    response = ui_http.dashboard_redirect(
         _request(path="/"),
         active_tab="outputs",
         flash_error="line 1\nstdout:\n\nstderr:\nuseradd: cannot lock /etc/passwd;\ttry again later.",

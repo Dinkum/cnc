@@ -1,10 +1,28 @@
 from __future__ import annotations
 
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    Form,
+    Request,
+)
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    Response,
+)
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+
 from app.config import Settings
 from app.dependencies import (
     db_session_dependency,
     settings_dependency,
 )
+from app.logger import get_logger
 from app.models.entities import Backend
 from app.security import enforce_csrf
 from app.services import backend_commands
@@ -36,16 +54,31 @@ from app.services.operations import (
 from app.services.shield_service import make_code_hash
 from app.services.ssh_access import remove_backend_ssh_access
 from app.services.validators import ValidationError
-from app.ui.errors import (
-    operator_action_error as _operator_action_error,
-    operator_error_json as _operator_error_json,
-)
+from app.ui.dashboard.context import cached_dashboard_context
+from app.ui.errors import operator_action_error as _operator_action_error
+from app.ui.errors import operator_error_json as _operator_error_json
 from app.ui.forms import (
     _backend_create_payload_from_form,
     _backend_inputs_payload_from_form,
     _backend_update_payload_from_form,
     _form_string_or_default,
     _nonblank_form_values,
+    operator_validation_error,
+)
+from app.ui.http import (
+    dashboard_redirect,
+    dashboard_refresh_response,
+    dashboard_tab_url,
+    output_redirect,
+    render_dashboard_template,
+    render_output_template,
+    request_prefers_json,
+    ui_request_mode,
+)
+from app.ui.mutation_feedback import (
+    backend_update_changed_keys,
+    host_mutation_blocked_message,
+    host_mutation_preflight_message,
 )
 from app.ui.operations.common import operation_response as _operation_response
 from app.ui.operations.output_lifecycle import (
@@ -53,49 +86,19 @@ from app.ui.operations.output_lifecycle import (
     _run_delete_operation,
 )
 from app.ui.operations.output_save import (
-    _run_update_backend_interface_operation,
     _run_update_backend_inputs_operation,
+    _run_update_backend_interface_operation,
     _run_update_backend_operation,
     _run_update_backend_state_operation,
 )
+from app.ui.outputs.context import output_page_context
 from app.ui.progress import (
     _output_save_progress_details,
     _planned_operation_progress_details,
 )
-from app.ui.routes.shared import (
-    _backend_update_changed_keys,
-    _cached_dashboard_context,
-    _dashboard_redirect,
-    _dashboard_refresh_response,
-    _dashboard_tab_url,
-    _host_mutation_blocked_message,
-    _host_mutation_preflight_message,
-    _operator_validation_error,
-    _output_page_context,
-    _output_redirect,
-    _render_dashboard_template,
-    _render_output_template,
-    _request_prefers_json,
-    _ui_request_mode,
-    logger,
-)
 from app.ui.view_models import _save_apply_feedback
-from fastapi import (
-    APIRouter,
-    BackgroundTasks,
-    Depends,
-    Form,
-    Request,
-)
-from fastapi.responses import (
-    HTMLResponse,
-    JSONResponse,
-    Response,
-)
-from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+
+logger = get_logger("ui")
 
 
 router = APIRouter(tags=["ui"])
@@ -109,20 +112,20 @@ async def _output_host_mutation_preflight(
     backend_id: int,
     action: str,
 ) -> Response | None:
-    message = await _host_mutation_preflight_message(settings, action)
+    message = await host_mutation_preflight_message(settings, action)
     if message is None:
         return None
-    if _request_prefers_json(request):
+    if request_prefers_json(request):
         return _operator_error_json(
             message,
             ErrorCode.UI_ACTION_UNAVAILABLE,
             key="flash_error",
             status_code=409,
         )
-    context = await _output_page_context(session, settings, backend_id)
+    context = await output_page_context(session, settings, backend_id)
     context["request"] = request
     context["flash_error"] = message
-    return _render_output_template(request, settings, context, status_code=409)
+    return render_output_template(request, settings, context, status_code=409)
 
 
 @router.post("/ui/backends")
@@ -167,9 +170,9 @@ async def create_backend_form(
     try:
         blocker = await active_host_mutation_blocker(settings)
         if blocker is not None:
-            flash_error = _host_mutation_blocked_message("Output create", blocker)
+            flash_error = host_mutation_blocked_message("Output create", blocker)
             if return_dashboard:
-                return await _dashboard_refresh_response(
+                return await dashboard_refresh_response(
                     request,
                     session,
                     settings,
@@ -177,13 +180,13 @@ async def create_backend_form(
                     flash_error=flash_error,
                     status_code=409,
                 )
-            context = await _cached_dashboard_context(
+            context = await cached_dashboard_context(
                 session, settings, active_tab="outputs"
             )
             context["request"] = request
             context["active_tab"] = "outputs"
             context["flash_error"] = flash_error
-            return _render_dashboard_template(request, context, status_code=409)
+            return render_dashboard_template(request, context, status_code=409)
         payload = _backend_create_payload_from_form(
             name=name,
             kind=kind,
@@ -248,7 +251,7 @@ async def create_backend_form(
                 backend_name=backend.name,
                 mutation_state=mutation.state,
             )
-            context = await _cached_dashboard_context(
+            context = await cached_dashboard_context(
                 session, settings, active_tab="outputs"
             )
             context["request"] = request
@@ -260,7 +263,7 @@ async def create_backend_form(
             )
             context["flash_success"] = success_flash
             context["flash_error"] = error_flash
-            return _render_dashboard_template(request, context, status_code=200)
+            return render_dashboard_template(request, context, status_code=200)
         await session.refresh(backend)
         logger.info(
             "ui.backend.create.succeeded",
@@ -277,11 +280,11 @@ async def create_backend_form(
             success_message="Output created.",
             failure_prefix="Output saved",
         )
-        context = await _output_page_context(session, settings, backend.id)
+        context = await output_page_context(session, settings, backend.id)
         context["request"] = request
         context["flash_success"] = success_flash
         context["flash_error"] = error_flash
-        return _render_output_template(
+        return render_output_template(
             request,
             settings,
             context,
@@ -290,18 +293,18 @@ async def create_backend_form(
     except ValidationError as exc:
         await session.rollback()
         logger.warning("ui.backend.create.validation_failed", error=str(exc))
-        context = await _cached_dashboard_context(
+        context = await cached_dashboard_context(
             session, settings, active_tab="outputs"
         )
         context["request"] = request
         context["active_tab"] = "outputs"
-        context["flash_error"] = _operator_validation_error(exc)
-        return _render_dashboard_template(request, context, status_code=400)
+        context["flash_error"] = operator_validation_error(exc)
+        return render_dashboard_template(request, context, status_code=400)
     except IntegrityError as exc:
         await session.rollback()
         error_fields = error_context(ErrorCode.UI_BACKEND_CREATE_CONFLICT)
         logger.warning("ui.backend.create.conflict", **error_fields, error=str(exc))
-        context = await _cached_dashboard_context(
+        context = await cached_dashboard_context(
             session, settings, active_tab="outputs"
         )
         context["request"] = request
@@ -311,12 +314,12 @@ async def create_backend_form(
             "name already exists. Use a unique output name.",
             error_fields,
         )
-        return _render_dashboard_template(request, context, status_code=400)
+        return render_dashboard_template(request, context, status_code=400)
     except Exception as exc:
         await session.rollback()
         error_fields = error_context(ErrorCode.UI_BACKEND_CREATE_FAILED)
         logger.exception("ui.backend.create.failed", **error_fields, error=str(exc))
-        context = await _cached_dashboard_context(
+        context = await cached_dashboard_context(
             session, settings, active_tab="outputs"
         )
         context["request"] = request
@@ -326,7 +329,7 @@ async def create_backend_form(
             "Unexpected error while creating the output. Check server logs with this instance.",
             error_fields,
         )
-        return _render_dashboard_template(request, context, status_code=400)
+        return render_dashboard_template(request, context, status_code=400)
 
 
 @router.post("/ui/backends/{backend_id}")
@@ -367,19 +370,19 @@ async def update_backend_form(
         )
     ).scalar_one_or_none()
     if backend is None:
-        if _request_prefers_json(request):
+        if request_prefers_json(request):
             return _operator_error_json(
                 "output not found",
                 ErrorCode.UI_RESOURCE_NOT_FOUND,
                 key="flash_error",
                 status_code=404,
             )
-        context = await _cached_dashboard_context(
+        context = await cached_dashboard_context(
             session, settings, active_tab="outputs"
         )
         context["request"] = request
         context["flash_error"] = "backend not found"
-        return _render_dashboard_template(request, context, status_code=404)
+        return render_dashboard_template(request, context, status_code=404)
     blocked_response = await _output_host_mutation_preflight(
         request,
         session,
@@ -389,7 +392,7 @@ async def update_backend_form(
     )
     if blocked_response is not None:
         return blocked_response
-    if _request_prefers_json(request):
+    if request_prefers_json(request):
         operation = await create_operation(
             settings,
             kind="ui.backend.update",
@@ -477,7 +480,7 @@ async def update_backend_form(
             shield_code_hash=shield_code_hash,
             shield_access_code=shield_access_code_display,
         )
-        changed_keys = _backend_update_changed_keys(backend, payload)
+        changed_keys = backend_update_changed_keys(backend, payload)
         backend = await backend_commands.update_backend(
             session, backend_id, payload, commit=False
         )
@@ -496,7 +499,7 @@ async def update_backend_form(
             mutation_state=mutation_state,
             changed_keys=sorted(changed_keys),
         )
-        context = await _output_page_context(session, settings, backend_id)
+        context = await output_page_context(session, settings, backend_id)
         context["request"] = request
         success_flash, error_flash = _save_apply_feedback(
             apply_response,
@@ -505,25 +508,25 @@ async def update_backend_form(
         )
         context["flash_success"] = success_flash
         context["flash_error"] = error_flash
-        return _render_output_template(request, settings, context, status_code=200)
+        return render_output_template(request, settings, context, status_code=200)
     except ValidationError as exc:
         await session.rollback()
         logger.warning(
             "ui.backend.update.validation_failed", backend_id=backend_id, error=str(exc)
         )
-        context = await _output_page_context(session, settings, backend_id)
+        context = await output_page_context(session, settings, backend_id)
         context["request"] = request
-        context["flash_error"] = _operator_validation_error(exc)
-        return _render_output_template(request, settings, context, status_code=400)
+        context["flash_error"] = operator_validation_error(exc)
+        return render_output_template(request, settings, context, status_code=400)
     except Exception as exc:
         await session.rollback()
         logger.exception(
             "ui.backend.update.failed", backend_id=backend_id, error=str(exc)
         )
-        context = await _output_page_context(session, settings, backend_id)
+        context = await output_page_context(session, settings, backend_id)
         context["request"] = request
         context["flash_error"] = f"failed to update output: {exc}"
-        return _render_output_template(request, settings, context, status_code=400)
+        return render_output_template(request, settings, context, status_code=400)
 
 
 @router.post("/ui/backends/{backend_id}/inputs")
@@ -544,19 +547,19 @@ async def update_backend_inputs_form(
         )
     ).scalar_one_or_none()
     if backend is None:
-        if _request_prefers_json(request):
+        if request_prefers_json(request):
             return _operator_error_json(
                 "output not found",
                 ErrorCode.UI_RESOURCE_NOT_FOUND,
                 key="flash_error",
                 status_code=404,
             )
-        context = await _cached_dashboard_context(
+        context = await cached_dashboard_context(
             session, settings, active_tab="outputs"
         )
         context["request"] = request
         context["flash_error"] = "output not found"
-        return _render_dashboard_template(request, context, status_code=404)
+        return render_dashboard_template(request, context, status_code=404)
     blocked_response = await _output_host_mutation_preflight(
         request,
         session,
@@ -566,7 +569,7 @@ async def update_backend_inputs_form(
     )
     if blocked_response is not None:
         return blocked_response
-    if _request_prefers_json(request):
+    if request_prefers_json(request):
         operation = await create_operation(
             settings,
             kind="ui.backend.inputs",
@@ -617,7 +620,7 @@ async def update_backend_inputs_form(
             mutation_state=mutation.state,
         )
         apply_response = mutation.apply_response
-        context = await _output_page_context(session, settings, backend_id)
+        context = await output_page_context(session, settings, backend_id)
         context["request"] = request
         success_flash, error_flash = _save_apply_feedback(
             apply_response,
@@ -626,25 +629,25 @@ async def update_backend_inputs_form(
         )
         context["flash_success"] = success_flash
         context["flash_error"] = error_flash
-        return _render_output_template(request, settings, context, status_code=200)
+        return render_output_template(request, settings, context, status_code=200)
     except ValidationError as exc:
         await session.rollback()
         logger.warning(
             "ui.backend.inputs.validation_failed", backend_id=backend_id, error=str(exc)
         )
-        context = await _output_page_context(session, settings, backend_id)
+        context = await output_page_context(session, settings, backend_id)
         context["request"] = request
-        context["flash_error"] = _operator_validation_error(exc)
-        return _render_output_template(request, settings, context, status_code=400)
+        context["flash_error"] = operator_validation_error(exc)
+        return render_output_template(request, settings, context, status_code=400)
     except Exception as exc:
         await session.rollback()
         logger.exception(
             "ui.backend.inputs.failed", backend_id=backend_id, error=str(exc)
         )
-        context = await _output_page_context(session, settings, backend_id)
+        context = await output_page_context(session, settings, backend_id)
         context["request"] = request
         context["flash_error"] = f"failed to save attached inputs: {exc}"
-        return _render_output_template(request, settings, context, status_code=400)
+        return render_output_template(request, settings, context, status_code=400)
 
 
 @router.post("/ui/backends/{backend_id}/interfaces/inbound")
@@ -672,7 +675,7 @@ async def update_backend_inbound_interface_form(
     blocker = await active_host_mutation_blocker(settings)
     if blocker is not None:
         return _operator_error_json(
-            _host_mutation_blocked_message("Interface action", blocker),
+            host_mutation_blocked_message("Interface action", blocker),
             ErrorCode.UI_ACTION_UNAVAILABLE,
             key="flash_error",
             status_code=409,
@@ -774,19 +777,19 @@ async def update_backend_state_form(
         )
     ).scalar_one_or_none()
     if backend is None:
-        if _request_prefers_json(request):
+        if request_prefers_json(request):
             return _operator_error_json(
                 "output not found",
                 ErrorCode.UI_RESOURCE_NOT_FOUND,
                 key="flash_error",
                 status_code=404,
             )
-        context = await _cached_dashboard_context(
+        context = await cached_dashboard_context(
             session, settings, active_tab="outputs"
         )
         context["request"] = request
         context["flash_error"] = "output not found"
-        return _render_dashboard_template(request, context, status_code=404)
+        return render_dashboard_template(request, context, status_code=404)
     blocked_response = await _output_host_mutation_preflight(
         request,
         session,
@@ -802,19 +805,19 @@ async def update_backend_state_form(
             "ui.backend.state.invalid_action",
             backend_id=backend_id,
             action=normalized_action or "-",
-            request_mode=_ui_request_mode(request),
+            request_mode=ui_request_mode(request),
         )
-        if _request_prefers_json(request):
+        if request_prefers_json(request):
             return _operator_error_json(
                 "invalid output action",
                 ErrorCode.UI_ACTION_UNAVAILABLE,
                 key="flash_error",
                 status_code=400,
             )
-        context = await _output_page_context(session, settings, backend_id)
+        context = await output_page_context(session, settings, backend_id)
         context["request"] = request
         context["flash_error"] = "invalid output action"
-        return _render_output_template(request, settings, context, status_code=400)
+        return render_output_template(request, settings, context, status_code=400)
     target_enabled = normalized_action == "enable"
     logger.info(
         "ui.backend.state.requested",
@@ -823,9 +826,9 @@ async def update_backend_state_form(
         action=normalized_action,
         target_enabled=target_enabled,
         current_enabled=backend.enabled,
-        request_mode=_ui_request_mode(request),
+        request_mode=ui_request_mode(request),
     )
-    if _request_prefers_json(request):
+    if request_prefers_json(request):
         operation = await create_operation(
             settings,
             kind="ui.backend.state",
@@ -873,10 +876,10 @@ async def update_backend_state_form(
             mutation_state=mutation.state,
             apply_status=mutation.apply_response.status,
             run_id=mutation.apply_response.run_id,
-            request_mode=_ui_request_mode(request),
+            request_mode=ui_request_mode(request),
         )
         apply_response = mutation.apply_response
-        context = await _output_page_context(session, settings, backend_id)
+        context = await output_page_context(session, settings, backend_id)
         context["request"] = request
         success_flash, error_flash = _save_apply_feedback(
             apply_response,
@@ -885,7 +888,7 @@ async def update_backend_state_form(
         )
         context["flash_success"] = success_flash
         context["flash_error"] = error_flash
-        return _render_output_template(request, settings, context, status_code=200)
+        return render_output_template(request, settings, context, status_code=200)
     except ValidationError as exc:
         await session.rollback()
         logger.warning(
@@ -893,13 +896,13 @@ async def update_backend_state_form(
             backend_id=backend_id,
             action=normalized_action,
             target_enabled=target_enabled,
-            request_mode=_ui_request_mode(request),
+            request_mode=ui_request_mode(request),
             error=str(exc),
         )
-        context = await _output_page_context(session, settings, backend_id)
+        context = await output_page_context(session, settings, backend_id)
         context["request"] = request
-        context["flash_error"] = _operator_validation_error(exc)
-        return _render_output_template(request, settings, context, status_code=400)
+        context["flash_error"] = operator_validation_error(exc)
+        return render_output_template(request, settings, context, status_code=400)
     except Exception as exc:
         await session.rollback()
         logger.exception(
@@ -907,13 +910,13 @@ async def update_backend_state_form(
             backend_id=backend_id,
             action=normalized_action,
             target_enabled=target_enabled,
-            request_mode=_ui_request_mode(request),
+            request_mode=ui_request_mode(request),
             error=str(exc),
         )
-        context = await _output_page_context(session, settings, backend_id)
+        context = await output_page_context(session, settings, backend_id)
         context["request"] = request
         context["flash_error"] = f"failed to update output state: {exc}"
-        return _render_output_template(request, settings, context, status_code=400)
+        return render_output_template(request, settings, context, status_code=400)
 
 
 @router.post("/ui/backends/{backend_id}/delete")
@@ -936,16 +939,16 @@ async def delete_backend_form(
         logger.warning(
             "ui.backend.delete.missing",
             backend_id=backend_id,
-            request_mode=_ui_request_mode(request),
+            request_mode=ui_request_mode(request),
         )
-        if _request_prefers_json(request):
+        if request_prefers_json(request):
             return _operator_error_json(
                 "output not found",
                 ErrorCode.UI_RESOURCE_NOT_FOUND,
                 key="flash_error",
                 status_code=404,
             )
-        return _dashboard_redirect(
+        return dashboard_redirect(
             request, active_tab="outputs", flash_error="output not found"
         )
 
@@ -965,9 +968,9 @@ async def delete_backend_form(
         backend_name=backend.name,
         enabled=backend.enabled,
         input_count=len(backend.inputs),
-        request_mode=_ui_request_mode(request),
+        request_mode=ui_request_mode(request),
     )
-    if _request_prefers_json(request):
+    if request_prefers_json(request):
         progress_plan = delete_output_progress_plan(backend_kind=backend.kind)
         operation = await create_operation(
             settings,
@@ -981,7 +984,7 @@ async def delete_backend_form(
                 "Delete queued.",
                 phase="Delete output",
                 substate="Opening delete operation",
-                redirect_url=_dashboard_tab_url(request, "outputs", defer_status=True),
+                redirect_url=dashboard_tab_url(request, "outputs", defer_status=True),
             ),
         )
         logger.info(
@@ -1026,11 +1029,11 @@ async def delete_backend_form(
         logger.info(
             "ui.backend.delete.deleted",
             backend_id=backend_id,
-            name=deleted_backend_name,
+            backend_name=deleted_backend_name,
             mutation_state=mutation.state,
             apply_status=mutation.apply_response.status,
             run_id=mutation.apply_response.run_id,
-            request_mode=_ui_request_mode(request),
+            request_mode=ui_request_mode(request),
         )
         apply_response = mutation.apply_response
         filesystem_cleanup_error: str | None = None
@@ -1068,7 +1071,7 @@ async def delete_backend_form(
                 "the output was deleted, but its persistent filesystem cleanup did not finish. The retained files are recoverable; check server logs and retry cleanup.",
                 error_context(ErrorCode.OUTPUT_DELETE_FAILED),
             )
-        return _dashboard_redirect(
+        return dashboard_redirect(
             request,
             active_tab="outputs",
             flash_success=success_flash,
@@ -1079,10 +1082,10 @@ async def delete_backend_form(
         logger.exception(
             "ui.backend.delete.failed",
             backend_id=backend_id,
-            request_mode=_ui_request_mode(request),
+            request_mode=ui_request_mode(request),
             error=str(exc),
         )
-        return _output_redirect(
+        return output_redirect(
             request,
             backend_id=backend_id,
             flash_error=f"failed to delete output: {exc}",

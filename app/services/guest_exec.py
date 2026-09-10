@@ -119,6 +119,8 @@ def backend_guest_exec_guard(
     settings: Settings,
     backend_name: str,
     wait_sec: float = 0,
+    *,
+    job_id: int | None = None,
 ) -> Iterator[BackendGuestExecGuardState]:
     wait_sec = max(0.0, wait_sec)
     lock = FileLock(
@@ -140,6 +142,16 @@ def backend_guest_exec_guard(
         yield BackendGuestExecGuardState.UNAVAILABLE
         return
     try:
+        from app.services.command_job_files import reserved_job
+
+        try:
+            reservation = reserved_job(settings, backend_name)
+        except (OSError, ValueError):
+            yield BackendGuestExecGuardState.UNAVAILABLE
+            return
+        if reservation is not None and reservation != job_id:
+            yield BackendGuestExecGuardState.BUSY
+            return
         yield BackendGuestExecGuardState.ACQUIRED
     finally:
         lock.__exit__(None, None, None)
@@ -154,8 +166,10 @@ def run_backend_guest_command(
     command_runner: Callable[[list[str], float], CommandResult] = run_command,
     wait_sec: float = 0,
     source: str = "guest_probe",
+    job_id: int | None = None,
+    container_id: str | None = None,
 ) -> CommandResult:
-    container = container_name(backend_name)
+    container = container_id or container_name(backend_name)
     plain_command = ["podman", "exec", container, *guest_command]
     circuit = read_guest_exec_circuit(settings, backend_name)
     if circuit is not None:
@@ -171,6 +185,7 @@ def run_backend_guest_command(
         settings,
         backend_name,
         wait_sec=min(max(0.0, timeout_sec), max(0.0, wait_sec)),
+        **({"job_id": job_id} if job_id is not None else {}),
     ) as guard_state:
         if guard_state == BackendGuestExecGuardState.BUSY:
             return CommandResult(

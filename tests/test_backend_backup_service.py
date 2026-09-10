@@ -1,6 +1,5 @@
 import io
 import json
-import logging
 from pathlib import Path
 import tarfile
 
@@ -11,7 +10,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.config import Settings
 from app.database import Base
-from app.logger import configure_logging
+from app.logger import configure_logging, flush_logging_pipeline_async
 from app.models.entities import Backend, BackendBackup, Input, Operation
 from app.schemas.apply import ApplyResponse
 from app.services.app_containers import write_app_control_assets
@@ -35,6 +34,13 @@ async def _make_session(db_path: Path):
 def _set_container_exists(monkeypatch: pytest.MonkeyPatch, exists: bool) -> None:
     monkeypatch.setattr(
         backups, "container_exists", lambda _container, _timeout_sec: exists
+    )
+    # These fixtures expose an ordinary, unmounted host-root guest tree.
+    # Active idmapped ownership is exercised by the guest metadata tests.
+    monkeypatch.setattr(
+        backups.GuestArchiveView,
+        "capture",
+        classmethod(lambda cls, container, runner=None: cls(container, "fixture")),
     )
 
 
@@ -1912,8 +1918,7 @@ async def test_restore_backend_bundle_as_new_backend_logs_import_and_restore(
         )
 
     assert any(item.get("event") == "backend_restored" for item in sent)
-    for handler in logging.getLogger().handlers:
-        handler.flush()
+    await flush_logging_pipeline_async()
     lines = log_path.read_text(encoding="utf-8").splitlines()
     assert any(
         "backup.import.succeeded" in line and "backend: web" in line for line in lines
@@ -2049,3 +2054,30 @@ async def test_describe_backend_backup_flags_partial_mount_coverage(
     assert payload["verification_status"] == "verified"
     assert payload["restore_readiness"] == "review"
     assert "partial_mount_coverage" in payload["risk_flags"]
+
+
+def test_volume_ownership_restore_requires_a_private_target_parent(tmp_path):
+    import os
+
+    bundle = tmp_path / "volume.tar"
+    with tarfile.open(bundle, "w") as archive:
+        entry = tarfile.TarInfo("mounts/0/file")
+        entry.uid, entry.gid, entry.size = os.getuid(), os.getgid(), 1
+        archive.addfile(entry, io.BytesIO(b"x"))
+    target = tmp_path / "shared-target"
+    metadata = {
+        "mount_entries": [
+            {
+                "archive_prefix": "mounts/0",
+                "host_path": str(target),
+                "target_path": "/data",
+                "exists": True,
+                "link_policy": "strict",
+                "ownership_policy": "canonical_guest",
+            }
+        ]
+    }
+    transaction = backups._RestoreBundleTransaction(metadata, bundle)
+    with pytest.raises(ValueError, match="private directory"):
+        transaction.apply()
+    assert not target.exists()

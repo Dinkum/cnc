@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from contextlib import redirect_stderr
+import io
 import inspect
 import json
 import os
@@ -80,11 +82,21 @@ def _finish_command(
     formatter,
 ) -> int:
     if error is not None:
-        print(error, file=sys.stderr)
+        if json_output:
+            _emit_error("command_failed", error)
+        else:
+            print(error, file=sys.stderr)
         return exit_code
     assert payload is not None
     _emit_payload(payload, json_output=json_output, formatter=formatter)
     return exit_code
+
+
+def _emit_error(code: str, message: str, operation_id: int | None = None) -> None:
+    error: dict[str, object] = {"code": code, "message": message}
+    if operation_id is not None:
+        error["operation_id"] = operation_id
+    print(json.dumps({"ok": False, "error": error}, sort_keys=True))
 
 
 def _command_name_from_argv(argv: list[str]) -> str | None:
@@ -138,13 +150,49 @@ def main(argv: list[str] | None = None) -> int:
         from app.cli import is_known_command
 
         parser = _build_parser(command_name if is_known_command(command_name) else None)
-    args = parser.parse_args(resolved_argv)
+    option_argv = (
+        resolved_argv[: resolved_argv.index("--")]
+        if "--" in resolved_argv
+        else resolved_argv
+    )
+    json_output = "--json" in option_argv
+    if json_output:
+        captured = io.StringIO()
+        try:
+            with redirect_stderr(captured):
+                args = parser.parse_args(resolved_argv)
+        except SystemExit as exc:
+            if exc.code == 0:
+                return 0
+            _emit_error(
+                "invalid_arguments",
+                captured.getvalue().strip().split("error:")[-1].strip(),
+            )
+            return 2
+    else:
+        args = parser.parse_args(resolved_argv)
 
     try:
         return _run_handler(args)
-    except ValueError as exc:
+    except (ValueError, argparse.ArgumentError) as exc:
+        if json_output:
+            _emit_error(
+                getattr(exc, "code", "invalid_arguments"),
+                str(exc),
+                getattr(exc, "operation_id", None),
+            )
+            return 2
         parser.error(str(exc))
         return 2
+    except Exception:
+        if json_output:
+            # SQL/OS exceptions may embed credentials or command arguments.
+            _emit_error(
+                "command_unavailable",
+                "command could not complete; inspect CNC logs before retrying a mutation",
+            )
+            return 1
+        raise
 
 
 if __name__ == "__main__":

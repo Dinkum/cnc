@@ -9,6 +9,7 @@
     readJsonResponse,
     readJsonScript,
     renderLocalTimes,
+    withRequestDeadline,
   } = window.CNCUI;
   const dashboardConfig = readJsonScript("dashboard-config", {});
   const currentTabs = () => Array.from(document.querySelectorAll("[data-tab]"));
@@ -835,6 +836,27 @@
     return serviceName.startsWith("cnc-app-") ? serviceName.slice("cnc-app-".length) : "";
   };
 
+  const outputRuntimeBadge = (enabled, kind, service) => {
+    if (!enabled) return { value: "not enabled", tone: "inactive" };
+    if (kind === "static") return { value: "healthy", tone: "success" };
+    const activeState = String(service?.data?.ActiveState || "").trim().toLowerCase();
+    if (kind === "app") {
+      const diagnosis = String(service?.diagnostics?.diagnosis || "").trim().toLowerCase();
+      if (diagnosis === "healthy") return { value: "healthy", tone: "success" };
+      if (diagnosis === "app_unmonitored") return { value: "unmonitored", tone: "warn" };
+      if (["backend_observation_deferred", "backend_observation_unavailable"].includes(diagnosis)) {
+        return { value: "unknown", tone: "queued" };
+      }
+      if (diagnosis) return { value: "unhealthy", tone: "error" };
+    }
+    // Missing observations after cache invalidation must not count as failures.
+    if (!activeState || activeState === "unknown") return { value: "unknown", tone: "queued" };
+    if (activeState === "active" && (kind !== "shield" || service?.ok)) {
+      return { value: "healthy", tone: "success" };
+    }
+    return { value: "unhealthy", tone: "error" };
+  };
+
   const renderOutputsFromStatus = (payload) => {
     const rows = Array.from(document.querySelectorAll("[data-output-row]"));
     if (!rows.length) return;
@@ -856,22 +878,7 @@
       const activeState = enabled && (kind === "app" || kind === "shield")
         ? String(service?.data?.ActiveState || "unknown").toLowerCase()
         : "";
-      const runtimeValue = !enabled
-        ? "not enabled"
-        : (kind === "static"
-          ? "healthy"
-          : (kind === "shield"
-            ? (activeState && activeState !== "active" ? "unhealthy" : "healthy")
-            : (activeState === "active"
-              ? "healthy"
-              : "unhealthy")));
-      const runtimeTone = !enabled
-        ? "inactive"
-        : (kind === "static"
-          ? "success"
-          : (runtimeValue === "unhealthy"
-            ? "error"
-            : "success"));
+      const { value: runtimeValue, tone: runtimeTone } = outputRuntimeBadge(enabled, kind, service);
       if (runtimeValue === "unhealthy") {
         unhealthyCount += 1;
       }
@@ -974,11 +981,14 @@
     serverLoadPollInFlight = true;
     try {
       const statusPath = forceRefresh ? "/api/status?force_refresh=true" : "/api/status";
-      const response = await fetch(statusPath, {
-        credentials: "same-origin",
-        headers: { Accept: "application/json" },
+      const { response, payload } = await withRequestDeadline(async (signal) => {
+        const response = await fetch(statusPath, {
+          signal,
+          credentials: "same-origin",
+          headers: { Accept: "application/json" },
+        });
+        return { response, payload: await readJsonResponse(response, "Status refresh failed") };
       });
-      const payload = await readJsonResponse(response, "Status refresh failed");
       if (!response.ok) {
         throw new Error(payload.detail || `${response.status} ${response.statusText}`.trim());
       }
@@ -1530,7 +1540,7 @@
     const activeStep = steps[Math.min(activeIndex, Math.max(steps.length - 1, 0))] || {};
     const actionLabel = title || headline || activeStep.headline || "Saving";
     const mainStage = headline || activeStep.headline || actionLabel;
-    const subStage = tone === "success"
+    const subStage = tone === "success" || tone === "error"
       ? (note || substep || "")
       : (substep || activeStep.substep || note || "");
     if (floatingSaveAction) {
@@ -2185,6 +2195,11 @@
     const requestId = latestTabRequestId + 1;
     latestTabRequestId = requestId;
     const requestIsCurrent = () => requestId === latestTabRequestId;
+    const reportTabLoadFailure = () => {
+      if (requestIsCurrent()) {
+        setBanner("error", `Could not load ${targetName}. Try the tab again, or refresh this page.`);
+      }
+    };
     const selectLoadedPanel = (nextDocument) => {
       replaceFromDocument(".site-header", nextDocument);
       syncBannersFromDocument(nextDocument);
@@ -2200,6 +2215,7 @@
       try {
         nextDocument = await tabLoadRequests.get(targetName);
       } catch {
+        reportTabLoadFailure();
         return;
       }
       if (nextDocument && requestIsCurrent()) {
@@ -2207,8 +2223,9 @@
       }
       return;
     }
-    const request = (async () => {
+    const request = withRequestDeadline(async (signal) => {
       const response = await fetch(`/?tab=${encodeURIComponent(targetName)}`, {
+        signal,
         credentials: "same-origin",
         headers: { Accept: "text/html" },
       });
@@ -2220,14 +2237,16 @@
         nextPanel.dataset.loaded = "1";
         bindDashboardPanel(nextPanel);
       }
-      return nextPanel ? nextDocument : null;
-    })();
+      if (!nextPanel) throw new Error("requested panel missing");
+      return nextDocument;
+    });
     tabLoadRequests.set(targetName, request);
     let nextDocument = null;
     try {
       nextDocument = await request;
     } catch (error) {
       console.error("dashboard tab load failed", error);
+      reportTabLoadFailure();
     } finally {
       tabLoadRequests.delete(targetName);
     }

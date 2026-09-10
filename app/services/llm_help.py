@@ -134,10 +134,31 @@ def build_backend_llm_help_payload(
     }
     if llm_help_url:
         commands["llm_help_url"] = llm_help_url
+    if backend.kind == "app":
+        commands["agent_background_frame"] = json_compact(
+            {
+                "id": "submit",
+                "type": "exec",
+                "output": backend.name,
+                "argv": ["bash", "-lc", "cd /app && npm run build"],
+                "background": True,
+                "request_key": "<unique-request-key>",
+            }
+        )
+        commands["agent_operation_frame"] = json_compact(
+            {
+                "id": "status",
+                "type": "operation.list",
+                "output": backend.name,
+            }
+        )
 
     warnings = [
         "Beta agent channel is tenant-wide at the WebSocket connection and output-scoped per frame; every exec or PTY frame must name an output.",
         "Use the beta agent channel for fast structured app commands when you have an admin access key; use backend SSH as the universal fallback.",
+        "Foreground WebSocket exec defaults to a 60-second deadline even while producing output. Use background=true for long work; it survives disconnects and has no execution deadline unless timeout_sec is supplied.",
+        "Generate a unique request_key for each background command and reuse it only for retries of the identical submission. Retained operation IDs support operation.show, operation.logs (byte offset), and operation.cancel; operation.list rediscovers jobs after reconnecting.",
+        "A background job reserves this output's managed execution slot. Busy means wait or inspect its operation, not restart the runtime. A wait ending never cancels the job; cancellation is confirmed only by a terminal result.",
         f"Use the literal backend SSH path `ssh {destination}` for app access; it supports ssh command mode, not scp or sftp.",
         BACKEND_SSH_ACCESS_NOTE,
         (
@@ -229,6 +250,10 @@ def build_host_llm_help_payload(
         "reconcile_host": "cnc-admin host reconcile",
         "cnc_admin_shell": "cnc-admin app shell <backend>",
         "cnc_admin_exec": "cnc-admin app exec <backend> -- <command>",
+        "resources": "cnc-admin input list --json\ncnc-admin route list --json\ncnc-admin output list --json",
+        "resource_help": "cnc-admin input --help\ncnc-admin route --help\ncnc-admin output --help",
+        "background_exec": "cnc-admin output exec <output> --bg --request-key <unique-request-key> --json -- bash -lc 'cd /app && npm run build'",
+        "background_status": "cnc-admin operation show <id> --wait 30 --json\ncnc-admin operation logs <id> --follow --json\ncnc-admin operation cancel <id> --json",
         "doctor_app": "cnc-admin app doctor <backend>",
         "logs_app": "cnc-admin app logs <backend>",
         "fix_backend": "cnc-admin fix <backend>",
@@ -265,6 +290,8 @@ def build_host_llm_help_payload(
                 "Use cnc-admin fix <backend> when CNC already classifies CNC-owned backend drift or publication problems.",
             ],
             "do": [
+                "Manage configuration with input, route, and output commands; route connect/disconnect changes existing input-output links through normal CNC apply.",
+                "For long commands use output exec --bg or WebSocket background=true. Connection/wait deadlines do not stop background jobs; inspect the returned operation ID before retrying.",
                 "Treat app outputs as Podman containers named cnc-app-<backend>.",
                 "Use the beta agent channel for fast structured output commands when an admin access key is available.",
                 "Treat `ssh <backend>@<host>` as the container entry path, not as a host shell account.",
@@ -755,6 +782,14 @@ def _render_backend_command_block(commands: dict[str, Any]) -> str:
         ),
         ("agent_exec_frame", "send this frame on the agent channel to run one command"),
         (
+            "agent_background_frame",
+            "long work: replace request_key with a unique value; reuse it only when retrying this submission",
+        ),
+        (
+            "agent_operation_frame",
+            "rediscover retained command operations after reconnecting",
+        ),
+        (
             "agent_pty_frame",
             "send this frame on the agent channel to open an interactive PTY",
         ),
@@ -783,6 +818,13 @@ def _render_host_command_block(commands: dict[str, Any]) -> str:
         ("agent_pty_frame", "send one output PTY frame on the agent channel"),
         ("cnc_admin_shell", "open a backend shell using CNC"),
         ("cnc_admin_exec", "run one backend command using CNC"),
+        ("resources", "inspect inputs, connections, and outputs on the CNC host"),
+        ("resource_help", "discover supported configuration flags"),
+        ("background_exec", "submit a guest-supervised command from the CNC host"),
+        (
+            "background_status",
+            "inspect, follow, or cancel the returned command operation",
+        ),
         ("doctor_app", "run CNC diagnostics for one backend"),
         ("logs_app", "inspect app logs for one backend"),
         ("fix_backend", "run CNC fix for one backend"),

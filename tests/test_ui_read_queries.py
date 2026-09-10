@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.database import Base, create_configured_async_engine
 from app.models.entities import ApplyRun
-from app.ui.routes.shared import _latest_successful_apply_at
+from app.ui.read_models import latest_successful_apply_at
 
 
 @pytest.mark.asyncio
@@ -20,7 +20,7 @@ async def test_apply_timestamp_query_skips_snapshots_and_selects_latest_success(
         await conn.run_sync(Base.metadata.create_all)
     maker = async_sessionmaker(engine, expire_on_commit=False)
     async with maker() as session:
-        assert await _latest_successful_apply_at(session) is None
+        assert await latest_successful_apply_at(session) is None
         session.add_all(
             [
                 ApplyRun(
@@ -46,6 +46,6 @@ async def test_apply_timestamp_query_skips_snapshots_and_selects_latest_success(
             returned_columns.append([item[0] for item in cursor.description])
 
     async with maker() as session:
-        assert await _latest_successful_apply_at(session) == datetime(2026, 1, 2)
+        assert await latest_successful_apply_at(session) == datetime(2026, 1, 2)
     assert returned_columns == [["created_at"]]
     await engine.dispose()

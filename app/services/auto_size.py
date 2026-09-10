@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from inspect import signature
@@ -10,12 +11,12 @@ import shutil
 import stat
 from typing import Any
 
-from sqlalchemy import delete, extract, func, select
+from sqlalchemy import delete, extract, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
-from app.logger import get_logger
+from app.logger import Operation as LogOperation, get_logger
 from app.models.entities import Backend, BackendResourceSample, HostResourceSample
 from app.schemas.apply import ApplyResponse
 from app.services.app_containers import app_sandbox_dir
@@ -120,7 +121,7 @@ async def run_auto_size_tick(
     sample_now = now.astimezone(UTC) if now is not None else datetime.now(UTC)
     async with logger.operation(
         "auto_size.tick", bucket_start=_bucket_start(sample_now).isoformat()
-    ):
+    ) as log_operation:
         backends = (
             (await session.execute(select(Backend).order_by(Backend.id.asc())))
             .scalars()
@@ -157,7 +158,7 @@ async def run_auto_size_tick(
             "apply": None,
             "notification": None,
         }
-        logger.info(
+        log_operation.step(
             "auto_size.tick.samples_recorded",
             backend_count=len(enabled_app_backends),
             samples_written=samples_written,
@@ -186,7 +187,9 @@ async def run_auto_size_tick(
             if not await _commit_metric_sample_writes(
                 session, result, bucket_start=_bucket_start(sample_now)
             ):
+                _finish_tick_log(log_operation, result)
                 return result
+            _finish_tick_log(log_operation, result)
             return result
 
         samples_committed = await _commit_metric_sample_writes(
@@ -254,6 +257,7 @@ async def run_auto_size_tick(
                 "auto_size.tick.no_size_changes", evaluated_backends=len(decisions)
             )
             await session.commit()
+            _finish_tick_log(log_operation, result)
             return result
 
         changed_names = [item.backend for item in changed]
@@ -318,6 +322,10 @@ async def run_auto_size_tick(
                         apply_status="database_commit_failed",
                         retry_prepared=retry_prepared,
                     )
+                log_operation.failed(
+                    "Auto-size commit failed", status="error", phase="database_commit"
+                )
+                _finish_tick_log(log_operation, result)
                 return result
             await _complete_deferred_apply_operation(settings, apply_response)
             await _emit_deferred_apply_completed_event(settings, apply_response)
@@ -336,6 +344,11 @@ async def run_auto_size_tick(
                 run_id=apply_response.run_id,
             )
         else:
+            log_operation.failed(
+                "Auto-size apply failed",
+                status=apply_response.status,
+                run_id=apply_response.run_id,
+            )
             await session.rollback()
             retry_prepared = await _prepare_emergency_retry(
                 session,
@@ -366,7 +379,19 @@ async def run_auto_size_tick(
             run_id=apply_response.run_id,
             changed_backends=changed_names,
         )
+        _finish_tick_log(log_operation, result)
         return result
+
+
+def _finish_tick_log(operation: LogOperation, result: dict[str, Any]) -> None:
+    if operation.result_emitted:
+        return
+    if result.get("sample_write_status") == "collision":
+        operation.result(
+            "Completed with sample collision", level=logging.WARNING, status="partial"
+        )
+    else:
+        operation.result("Completed", status="success")
 
 
 async def _prepare_emergency_retry(
@@ -850,44 +875,31 @@ async def _load_previous_samples(
 ) -> dict[int, BackendResourceSample]:
     if not backend_ids:
         return {}
-    latest_bucket_rows = (
-        await session.execute(
-            select(
-                BackendResourceSample.backend_id,
-                func.max(BackendResourceSample.bucket_start).label("bucket_start"),
-            )
-            .where(
-                BackendResourceSample.backend_id.in_(backend_ids),
-                BackendResourceSample.bucket_start < bucket_start,
-            )
-            .group_by(BackendResourceSample.backend_id)
+    # Seek once per backend through its unique (backend_id, bucket_start) index,
+    # rather than grouping the full retained history or loading bucket products.
+    latest_id = (
+        select(BackendResourceSample.id)
+        .where(
+            BackendResourceSample.backend_id == Backend.id,
+            BackendResourceSample.bucket_start < bucket_start,
         )
-    ).all()
-    latest_bucket_by_backend_id = {
-        int(backend_id): bucket
-        for backend_id, bucket in latest_bucket_rows
-        if backend_id is not None and bucket is not None
-    }
-    if not latest_bucket_by_backend_id:
-        return {}
-    candidate_buckets = sorted(set(latest_bucket_by_backend_id.values()))
+        .order_by(BackendResourceSample.bucket_start.desc())
+        .limit(1)
+        .correlate(Backend)
+        .scalar_subquery()
+    )
     samples = (
         (
             await session.execute(
-                select(BackendResourceSample).where(
-                    BackendResourceSample.backend_id.in_(latest_bucket_by_backend_id),
-                    BackendResourceSample.bucket_start.in_(candidate_buckets),
-                )
+                select(BackendResourceSample)
+                .join(Backend, BackendResourceSample.id == latest_id)
+                .where(Backend.id.in_(backend_ids))
             )
         )
         .scalars()
         .all()
     )
-    return {
-        sample.backend_id: sample
-        for sample in samples
-        if latest_bucket_by_backend_id.get(sample.backend_id) == sample.bucket_start
-    }
+    return {sample.backend_id: sample for sample in samples}
 
 
 def _allocated_size(stat_result: os.stat_result) -> int:

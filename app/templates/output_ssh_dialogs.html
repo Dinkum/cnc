@@ -1,0 +1,31 @@
+<dialog class="ssh-dialog" id="key-dialog" aria-labelledby="dialog-title">
+<form id="key-form"><div class="section-head"><h2 id="dialog-title">Create SSH key</h2><button type="button" class="ghost close-dialog" aria-label="Close">×</button></div>
+<label for="key-name">Key name</label><input id="key-name" name="name" placeholder="e.g. Deploy runner" maxlength="80" required autocomplete="off">
+<div id="public-field" hidden><label for="public-key">Public key</label><textarea id="public-key" rows="4" placeholder="ssh-ed25519 AAAA… device-name" spellcheck="false"></textarea><p class="subtle">Paste the public key. Keep the private key on your device.</p></div>
+<p id="create-note" class="ssh-callout">Your private key downloads once. Store it somewhere safe; you won’t be able to download it again.</p><p id="form-error" role="alert" hidden></p>
+<div class="ssh-dialog-actions"><button type="button" class="ghost close-dialog">Cancel</button><button id="submit-key" type="submit">Create & download</button></div></form></dialog>
+<dialog class="ssh-dialog" id="revoke-dialog" aria-labelledby="revoke-title"><form id="revoke-form"><h2 id="revoke-title">Revoke SSH key?</h2><p>Remove access for <strong id="revoke-name"></strong>?</p><p class="subtle">New connections using this key will be blocked. Existing SSH sessions will stay open.</p><p id="revoke-error" role="alert" hidden></p><div class="ssh-dialog-actions"><button type="button" class="ghost" id="revoke-cancel">Cancel</button><button type="submit" class="danger" id="revoke-confirm">Revoke key</button></div></form></dialog>
+<dialog class="ssh-dialog" id="connect-dialog" aria-labelledby="connect-title">
+<div class="section-head"><h2 id="connect-title">Connect to {{ selected_backend.name }}</h2><button type="button" class="ghost" id="connect-close" aria-label="Close connection instructions">×</button></div>
+<label for="key-location">Downloaded key file path</label>
+<input id="key-location" value="" spellcheck="false" autocomplete="off">
+
+<div class="ssh-handoff-grid"><section class="ssh-setup-group">
+<div class="ssh-instruction-head"><h3>Import the key and connect</h3></div>
+<div class="ssh-import-commands"><div>
+<div class="ssh-instruction-head"><h4>1. Copy the key</h4><button class="ghost" id="copy-key">Copy</button></div>
+<pre class="ssh-setup" id="key-command"></pre>
+</div><div>
+<div class="ssh-instruction-head"><h4>2. Add to SSH config</h4><button class="ghost" id="copy-shortcut">Copy</button></div>
+<p class="subtle">Run once. Skip if this alias already exists. Earlier matching SSH settings take precedence.</p>
+<pre class="ssh-setup" id="shortcut-command"></pre>
+</div><div>
+<div class="ssh-instruction-head"><h4>3. Connect</h4><button class="ghost" id="copy-setup">Copy</button></div>
+<pre class="ssh-setup" id="setup-command"></pre>
+</div></div>
+</section><section>
+<div class="ssh-instruction-head"><h3>AGENTS.md Connection Instructions</h3></div>
+<pre class="ssh-setup ssh-agent-instructions" id="agent-instructions"></pre><button class="ghost" id="copy-agent">Copy agent instructions</button>
+</section></div>
+<p id="connect-feedback" role="status" class="subtle"></p>
+</dialog>

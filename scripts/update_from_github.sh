@@ -152,6 +152,11 @@ sync_backend_ssh_wrapper() {
     'from app.config import get_settings; from app.services.ssh_access import reconcile_backend_ssh_root_wrapper; reconcile_backend_ssh_root_wrapper(get_settings())'
 }
 
+sync_guest_runtime_helper() {
+  "${CNC_CURRENT_LINK}/.venv/bin/python" -c \
+    'from app.config import get_settings; from app.services.runtime_assets import reconcile_guest_runtime_helper; reconcile_guest_runtime_helper(get_settings())'
+}
+
 sync_systemd_units_from_dir() {
   local source_dir="$1"
   sync_systemd_asset_from_dir "${source_dir}" "packaging/cnc-admin.service" "cnc-admin.service" || return
@@ -349,6 +354,11 @@ switch_release() {
     log "CLI wrapper sync failed, rolling back"
     rollback_release_switch "${previous_target}" "${tmp_link}"
     fail "update failed while syncing CLI wrappers"
+  fi
+
+  if ! sync_guest_runtime_helper; then
+    rollback_release_switch "${previous_target}" "${tmp_link}"
+    fail "update failed while syncing guest runtime helper"
   fi
 
   MIGRATION_BOUNDARY_CROSSED=1

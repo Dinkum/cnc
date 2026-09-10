@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal
 
-from sqlalchemy import select
+from sqlalchemy import event, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -32,6 +32,12 @@ OperationStatus = Literal[
 ACTIVE_OPERATION_STATUSES = ("queued", "running")
 ACTIVE_UPDATE_RUN_STATUSES = ("queued", "running")
 HOST_MUTATION_OPERATION_KINDS = (
+    "cli.output.create",
+    "cli.output.update",
+    "cli.input.create",
+    "cli.input.update",
+    "cli.route.connect",
+    "cli.route.disconnect",
     "apply_host",
     "auto_size",
     "backup_backend",
@@ -112,6 +118,15 @@ async def operation_session_scope(database_url: str) -> AsyncIterator[None]:
         yield
         return
     engine = create_configured_async_engine(database_url, future=True, echo=False)
+
+    @event.listens_for(engine.sync_engine, "checkout")
+    def restore_busy_timeout(connection, _record, _proxy) -> None:
+        # Progress may leave a pooled connection in nonblocking mode. Reset on
+        # checkout without forcing normally lazy sessions to open the database.
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA busy_timeout=5000")
+        cursor.close()
+
     owner = _OperationSessionOwner(
         database_url, loop, engine, async_sessionmaker(engine, expire_on_commit=False)
     )
@@ -209,6 +224,11 @@ class OperationHandle:
         for attempt in range(1, attempts + 1):
             try:
                 async with _operation_session(self.settings.database_url) as session:
+                    # Progress already has a file snapshot. Never wait on the
+                    # caller's write transaction; terminal records still wait.
+                    await session.execute(
+                        text(f"PRAGMA busy_timeout={5000 if finished else 0}")
+                    )
                     operation = await session.get(Operation, self.id)
                     if operation is None:
                         return
@@ -530,6 +550,9 @@ async def fail_interrupted_operations(settings: Settings) -> int:
                 await session.execute(
                     select(Operation)
                     .where(Operation.status.in_(("queued", "running")))
+                    # Guest-supervised commands outlive the control-plane process.
+                    # Their result/guest incarnation is reconciled by command_jobs.
+                    .where(Operation.kind != "output_exec")
                     .order_by(Operation.id.asc())
                 )
             )

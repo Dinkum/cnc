@@ -81,6 +81,7 @@ class Settings(BaseSettings):
     app_control_dir: Path = Path("/var/lib/cnc/app-control")
     app_sandbox_dir: Path = Path("/var/lib/cnc/sandboxes")
     app_quadlet_dir: Path = Path("/etc/containers/systemd")
+    guest_runtime_helper_path: Path = Path("/usr/local/bin/cnc-prepare-guest")
     tailscale_serve_state_path: Path = Path("/var/lib/cnc/tailscale-serve-state.json")
     tailscale_tailnet_dns_name: str = ""
     app_container_dns_servers: str = ""

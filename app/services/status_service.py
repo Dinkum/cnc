@@ -11,7 +11,7 @@ from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import load_only, selectinload
 
 from app.config import Settings
 from app.logger import get_logger
@@ -1408,7 +1408,25 @@ async def _collect_status_uncached(
             }
         )
     last_apply = (
-        await session.execute(select(ApplyRun).order_by(ApplyRun.id.desc()).limit(1))
+        await session.execute(
+            select(ApplyRun)
+            .options(
+                load_only(
+                    ApplyRun.id,
+                    ApplyRun.operation_id,
+                    ApplyRun.status,
+                    ApplyRun.message,
+                    ApplyRun.config_revision,
+                    ApplyRun.desired_state_hash,
+                    ApplyRun.details_json,
+                    ApplyRun.created_at,
+                    ApplyRun.resource_profile_json,
+                    raiseload=True,
+                )
+            )
+            .order_by(ApplyRun.id.desc())
+            .limit(1)
+        )
     ).scalar_one_or_none()
     host_apply_state = await session.get(HostApplyState, 1)
     last_update = (

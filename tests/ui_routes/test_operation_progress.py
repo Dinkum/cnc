@@ -1,3 +1,7 @@
+import pytest
+
+import app.ui.view_models as ui_view_models
+
 from .support import (
     ApplyResponse,
     create_backend_progress_value,
@@ -9,12 +13,11 @@ from .support import (
     operation_progress_value,
     output_save_progress_steps,
     progress_plan_value,
-    ui_shared,
 )
 
 
 def test_save_apply_feedback_success_includes_save_job_id() -> None:
-    success, error = ui_shared._save_apply_feedback(
+    success, error = ui_view_models._save_apply_feedback(
         ApplyResponse(
             status="success",
             message="apply completed",
@@ -30,7 +33,7 @@ def test_save_apply_feedback_success_includes_save_job_id() -> None:
 
 
 def test_save_apply_feedback_failure_surfaces_phase() -> None:
-    success, error = ui_shared._save_apply_feedback(
+    success, error = ui_view_models._save_apply_feedback(
         ApplyResponse(
             status="error",
             message="apply failed",
@@ -55,7 +58,7 @@ def test_save_apply_feedback_failure_surfaces_phase() -> None:
 
 
 def test_save_apply_feedback_uses_error_instance_when_apply_run_is_missing() -> None:
-    success, error = ui_shared._save_apply_feedback(
+    success, error = ui_view_models._save_apply_feedback(
         ApplyResponse(
             status="error",
             message="apply failed",
@@ -79,7 +82,7 @@ def test_save_apply_feedback_uses_error_instance_when_apply_run_is_missing() -> 
 
 
 def test_save_apply_feedback_partial_failure_reports_possible_host_changes() -> None:
-    success, error = ui_shared._save_apply_feedback(
+    success, error = ui_view_models._save_apply_feedback(
         ApplyResponse(
             status="error",
             message="apply partially failed",
@@ -107,7 +110,7 @@ def test_save_apply_feedback_partial_failure_reports_possible_host_changes() -> 
 
 
 def test_save_apply_feedback_self_audit_surfaces_blocking_finding() -> None:
-    success, error = ui_shared._save_apply_feedback(
+    success, error = ui_view_models._save_apply_feedback(
         ApplyResponse(
             status="error",
             message="apply partially failed",
@@ -339,3 +342,43 @@ def test_operation_progress_pipelines_are_ordered_state_substate_catalogs() -> N
         == 96
     )
     assert operation_progress_value("backup", message="unmatched", current=77) == 77
+
+
+@pytest.mark.asyncio
+async def test_input_delete_failure_preserves_cause_phase_and_reference():
+    from app.ui.progress import _complete_input_operation
+
+    class Recorder:
+        async def complete(self, status, **kwargs):
+            self.status = status
+            self.result = kwargs
+
+    operation = Recorder()
+    await _complete_input_operation(
+        operation,
+        ApplyResponse(
+            status="error",
+            message="apply failed",
+            run_id=42,
+            details={
+                "phase": "storage_preflight",
+                "failed_backend": "web",
+                "operator_message": "Writable storage lacks a private parent directory.",
+                "error_code": "CNC-02099",
+                "error_inst": "ABCD1234",
+                "failure_mode": "clean",
+            },
+        ),
+        success_message="Input deleted.",
+        failure_prefix="Input deleted",
+        input_value="example",
+    )
+    assert operation.status == "failed"
+    assert operation.result["phase"] == "storage_preflight"
+    message = operation.result["error"]
+    assert "Couldn't delete input example" in message
+    assert "web" in message
+    assert "private parent" in message
+    assert "CNC-02099-ABCD1234" in message
+    assert "input was retained" in message
+    assert "Refreshing dashboard" not in str(operation.result)

@@ -47,6 +47,7 @@ from app.services.app_quadlet import (
 from app.services.app_runtime import (
     apply_app_backends,
     legacy_direct_podman_migration_backend_reasons,
+    preflight_app_storage,
 )
 from app.services.cluster_ingress import reconcile_cluster_followers
 from app.services.commands import (
@@ -122,6 +123,9 @@ APPLY_PHASE_ORDER = (
 
 @dataclass
 class ApplyServices:
+    preflight_app_storage: Callable[..., dict[str, Any]] = field(
+        default_factory=lambda: preflight_app_storage
+    )
     runtime_services: AppRuntimeServices = field(
         default_factory=lambda: AppRuntimeServices(
             inspect_container=inspect_container,
@@ -623,13 +627,13 @@ async def run_apply(
         ) as operation:
             desired_record: DesiredStateRecord | None = None
             live_apply_completed = False
-            async with logger.operation("apply.run"):
+            async with logger.operation("apply.run") as log_operation:
                 try:
                     await _emit_apply_progress(
                         services, "Save desired state", "Building host plan"
                     )
                     desired = await build_desired_state(session, settings)
-                    logger.info(
+                    log_operation.step(
                         "apply.desired_state.ready",
                         nginx_files=len(desired.nginx_files),
                         app_backends=len(desired.enabled_app_backends),
@@ -861,6 +865,9 @@ async def run_apply(
                                 or [],
                             },
                         )
+                    log_operation.result(
+                        success_message, status="success", run_id=run.id
+                    )
                     return ApplyResponse(
                         status="success",
                         message=success_message,
@@ -1030,6 +1037,7 @@ async def run_apply(
                         url=admin_dashboard_url(settings, tab="home"),
                         url_title="Open CNC",
                     )
+                    log_operation.failed(message, status="error", run_id=run.id)
                     return ApplyResponse(
                         status="error",
                         message=message,
@@ -1372,6 +1380,13 @@ async def _apply_desired_state(
                             phase="app_runtime",
                             details=exc.details,
                         ) from exc
+                details.update(
+                    await asyncio.to_thread(
+                        services.preflight_app_storage,
+                        desired,
+                        runtime_reconcile_backends,
+                    )
+                )
                 progress.live_mutation("app_runtime")
                 runtime_kwargs = {
                     "services": services.runtime_services,

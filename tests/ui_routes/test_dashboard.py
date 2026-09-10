@@ -1,3 +1,10 @@
+import app.services.operation_runtime as app_services_operation_runtime
+import app.ui.dashboard.context as ui_dashboard_context
+import app.ui.dashboard.data as ui_dashboard_data
+import app.ui.http as ui_http
+import app.ui.read_models as ui_read_models
+import app.ui.view_models as ui_view_models
+
 from .support import (
     Backend,
     HTMLResponse,
@@ -10,7 +17,6 @@ from .support import (
     _make_session,
     _request,
     ui_pages,
-    ui_shared,
 )
 
 
@@ -30,8 +36,8 @@ async def test_dashboard_uses_request_first_template_response(monkeypatch) -> No
         captured["status_code"] = status_code
         return SimpleNamespace(status_code=status_code)
 
-    monkeypatch.setattr(ui_pages, "_dashboard_context", fake_dashboard_context)
-    monkeypatch.setattr(ui_shared.templates, "TemplateResponse", fake_template_response)
+    monkeypatch.setattr(ui_pages, "dashboard_context", fake_dashboard_context)
+    monkeypatch.setattr(ui_http.templates, "TemplateResponse", fake_template_response)
 
     request = _request()
     response = await ui_pages.dashboard(request, settings=settings, session=object())
@@ -45,15 +51,18 @@ async def test_dashboard_uses_request_first_template_response(monkeypatch) -> No
     assert context["flash_error"] is None
     assert context["flash_success"] is None
     assert context["request"] is request
-    assert context["asset_version"] == ui_shared._app_version()
+    assert context["asset_version"] == ui_view_models.app_version()
     assert (
         context["create_output_progress_steps"]
-        == ui_shared.create_backend_progress_steps()
+        == app_services_operation_runtime.create_backend_progress_steps()
     )
-    assert context["input_progress_pipelines"] == ui_shared.input_progress_pipelines()
+    assert (
+        context["input_progress_pipelines"]
+        == app_services_operation_runtime.input_progress_pipelines()
+    )
     assert (
         context["operation_progress_pipelines"]
-        == ui_shared.operation_progress_pipelines()
+        == app_services_operation_runtime.operation_progress_pipelines()
     )
 
 
@@ -70,8 +79,8 @@ async def test_dashboard_prefers_cached_status_for_routing_tab(monkeypatch) -> N
     def fake_template_response(request, name, context, status_code=200):
         return HTMLResponse("ok", status_code=status_code)
 
-    monkeypatch.setattr(ui_pages, "_dashboard_context", fake_dashboard_context)
-    monkeypatch.setattr(ui_shared.templates, "TemplateResponse", fake_template_response)
+    monkeypatch.setattr(ui_pages, "dashboard_context", fake_dashboard_context)
+    monkeypatch.setattr(ui_http.templates, "TemplateResponse", fake_template_response)
 
     request = _request(path="/?tab=routing")
     response = await ui_pages.dashboard(request, settings=settings, session=object())
@@ -95,8 +104,8 @@ async def test_dashboard_can_defer_status_for_fast_output_return(monkeypatch) ->
     def fake_template_response(request, name, context, status_code=200):
         return HTMLResponse("ok", status_code=status_code)
 
-    monkeypatch.setattr(ui_pages, "_dashboard_context", fake_dashboard_context)
-    monkeypatch.setattr(ui_shared.templates, "TemplateResponse", fake_template_response)
+    monkeypatch.setattr(ui_pages, "dashboard_context", fake_dashboard_context)
+    monkeypatch.setattr(ui_http.templates, "TemplateResponse", fake_template_response)
 
     request = _request(path="/?tab=outputs&defer_status=1")
     response = await ui_pages.dashboard(request, settings=settings, session=object())
@@ -111,13 +120,13 @@ async def test_deferred_dashboard_status_skips_collection(monkeypatch) -> None:
     async def fail_collect_status(*_args, **_kwargs):
         raise AssertionError("deferred dashboard render must not collect status")
 
-    monkeypatch.setattr(ui_shared, "collect_status", fail_collect_status)
-    monkeypatch.setattr(ui_shared, "peek_cached_status", lambda: None)
+    monkeypatch.setattr(ui_dashboard_data, "collect_status", fail_collect_status)
+    monkeypatch.setattr(ui_dashboard_data, "peek_cached_status", lambda: None)
 
-    payload = await ui_shared._dashboard_status(
+    payload = await ui_dashboard_data.dashboard_status(
         object(),
         Settings(),
-        scope=ui_shared._DashboardScope("outputs"),
+        scope=ui_read_models.DashboardScope("outputs"),
         prefer_cached_status=True,
         defer_status=True,
     )
@@ -132,13 +141,13 @@ async def test_home_dashboard_cold_status_never_blocks_on_collection(
     async def fail_collect_status(*_args, **_kwargs):
         raise AssertionError("Home first paint must not run a cold host status sweep")
 
-    monkeypatch.setattr(ui_shared, "collect_status", fail_collect_status)
-    monkeypatch.setattr(ui_shared, "peek_cached_status", lambda: None)
+    monkeypatch.setattr(ui_dashboard_data, "collect_status", fail_collect_status)
+    monkeypatch.setattr(ui_dashboard_data, "peek_cached_status", lambda: None)
 
-    payload = await ui_shared._dashboard_status(
+    payload = await ui_dashboard_data.dashboard_status(
         object(),
         Settings(),
-        scope=ui_shared._DashboardScope("home"),
+        scope=ui_read_models.DashboardScope("home"),
         prefer_cached_status=True,
     )
 
@@ -174,8 +183,8 @@ async def test_dashboard_renders_remote_update_version_and_disables_button_when_
             "settings tab should render from cached status without live collection"
         )
 
-    monkeypatch.setattr(ui_shared, "collect_status", fail_collect_status)
-    monkeypatch.setattr(ui_shared, "peek_cached_status", lambda: cached_status)
+    monkeypatch.setattr(ui_dashboard_data, "collect_status", fail_collect_status)
+    monkeypatch.setattr(ui_dashboard_data, "peek_cached_status", lambda: cached_status)
 
     async with maker() as session:
         session.add(Input(kind="domain", hostname="web.example.com", enabled=True))
@@ -210,7 +219,7 @@ async def test_dashboard_renders_remote_update_version_and_disables_button_when_
     )
     assert "const renderHomeFromStatus = (payload) =>" in client_source
     assert "const submitUrl" not in body
-    assert f"/static/js/dashboard.js?v={ui_shared._app_version()}" in body
+    assert f"/static/js/dashboard.js?v={ui_view_models.app_version()}" in body
     assert "<h2>Nodes</h2>" in body
     assert 'action="/ui/settings/nodes"' in body
     assert 'name="multi_node_enabled" type="checkbox"' in body
@@ -265,7 +274,7 @@ async def test_dashboard_non_routing_tabs_do_not_embed_route_graph_rows(
     async def fake_collect_status(_session, _settings, **_kwargs):
         return _healthy_status(backend_count=0)
 
-    monkeypatch.setattr(ui_shared, "collect_status", fake_collect_status)
+    monkeypatch.setattr(ui_dashboard_data, "collect_status", fake_collect_status)
 
     async with maker() as session:
         backend = Backend(
@@ -307,7 +316,7 @@ async def test_dashboard_server_renders_active_outputs_tab_without_panel_flash(
     async def fake_collect_status(_session, _settings, **_kwargs):
         return _healthy_status(backend_count=0)
 
-    monkeypatch.setattr(ui_shared, "collect_status", fake_collect_status)
+    monkeypatch.setattr(ui_dashboard_data, "collect_status", fake_collect_status)
 
     async with maker() as session:
         response = await ui_pages.dashboard(
@@ -383,7 +392,7 @@ async def test_dashboard_context_builds_runtime_cards_for_app(
             "last_update": {},
         }
 
-    monkeypatch.setattr(ui_shared, "collect_status", fake_collect_status)
+    monkeypatch.setattr(ui_dashboard_data, "collect_status", fake_collect_status)
 
     async with maker() as session:
         session.add_all(
@@ -408,7 +417,7 @@ async def test_dashboard_context_builds_runtime_cards_for_app(
         )
         await session.commit()
 
-        context = await ui_shared._dashboard_context(session, settings)
+        context = await ui_dashboard_context.dashboard_context(session, settings)
 
     runtime_cards = context["runtime_cards"]
     assert [card["name"] for card in runtime_cards] == ["web"]
@@ -452,7 +461,7 @@ async def test_dashboard_context_tolerates_missing_service_row_for_app(
             "last_update": {},
         }
 
-    monkeypatch.setattr(ui_shared, "collect_status", fake_collect_status)
+    monkeypatch.setattr(ui_dashboard_data, "collect_status", fake_collect_status)
 
     async with maker() as session:
         session.add(
@@ -472,12 +481,13 @@ async def test_dashboard_context_tolerates_missing_service_row_for_app(
         )
         await session.commit()
 
-        context = await ui_shared._dashboard_context(session, settings)
+        context = await ui_dashboard_context.dashboard_context(session, settings)
 
     assert context["runtime_cards"] == []
-    assert context["output_details"][1]["status_value"] == "unhealthy"
-    assert context["output_details"][1]["status_tone"] == "error"
+    assert context["output_details"][1]["status_value"] == "unknown"
+    assert context["output_details"][1]["status_tone"] == "queued"
     assert context["output_details"][1]["service_state"] == "- / -"
+    assert context["overview"]["outputs_unhealthy"] == 0
 
 
 async def test_dashboard_context_marks_explicit_failed_app_backend_unhealthy(
@@ -519,7 +529,7 @@ async def test_dashboard_context_marks_explicit_failed_app_backend_unhealthy(
             "last_update": {},
         }
 
-    monkeypatch.setattr(ui_shared, "collect_status", fake_collect_status)
+    monkeypatch.setattr(ui_dashboard_data, "collect_status", fake_collect_status)
 
     async with maker() as session:
         session.add(
@@ -539,7 +549,7 @@ async def test_dashboard_context_marks_explicit_failed_app_backend_unhealthy(
         )
         await session.commit()
 
-        context = await ui_shared._dashboard_context(session, settings)
+        context = await ui_dashboard_context.dashboard_context(session, settings)
 
     assert context["output_details"][1]["status_value"] == "unhealthy"
     assert context["output_details"][1]["status_tone"] == "error"
@@ -576,7 +586,7 @@ async def test_dashboard_context_marks_disabled_app_backend_inactive(
             "last_update": {},
         }
 
-    monkeypatch.setattr(ui_shared, "collect_status", fake_collect_status)
+    monkeypatch.setattr(ui_dashboard_data, "collect_status", fake_collect_status)
 
     async with maker() as session:
         session.add(
@@ -596,7 +606,7 @@ async def test_dashboard_context_marks_disabled_app_backend_inactive(
         )
         await session.commit()
 
-        context = await ui_shared._dashboard_context(session, settings)
+        context = await ui_dashboard_context.dashboard_context(session, settings)
 
     assert context["output_details"][1]["status_value"] == "not enabled"
     assert context["output_details"][1]["status_tone"] == "inactive"

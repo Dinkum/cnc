@@ -33,7 +33,7 @@ async def test_output_metric_history_skips_resource_profile_for_non_memory_metri
     monkeypatch.setattr(ui_reads, "peek_cached_status", lambda: {"services": []})
     monkeypatch.setattr(
         ui_reads,
-        "_enabled_runtime_backends_for_resource_profile",
+        "enabled_runtime_backends_for_resource_profile",
         fail_enabled_runtime_backends,
     )
 

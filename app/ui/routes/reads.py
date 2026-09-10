@@ -3,12 +3,26 @@ from __future__ import annotations
 import asyncio
 import json
 
+from fastapi import (
+    APIRouter,
+    Depends,
+    Request,
+)
+from fastapi.responses import (
+    JSONResponse,
+    Response,
+    StreamingResponse,
+)
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+
 from app.config import Settings
 from app.dependencies import (
     db_session_dependency,
     settings_dependency,
 )
-from app.logger import flush_logging_pipeline
+from app.logger import flush_logging_pipeline_async
 from app.models.entities import (
     Backend,
     Input,
@@ -32,46 +46,35 @@ from app.services.debug_bundle import (
 from app.services.error_reporting import ErrorCode
 from app.services.resource_profile import build_resource_profile
 from app.services.status_service import peek_cached_status
-from app.ui.errors import (
-    operator_error_json as _operator_error_json,
-    operator_error_payload as _operator_error_payload,
+from app.ui.cluster import cluster_nodes
+from app.ui.diagnostics import (
+    RuntimeDiagnosticsPending,
+    collect_output_runtime_diagnostics_for_ui,
+)
+from app.ui.errors import operator_error_json as _operator_error_json
+from app.ui.errors import operator_error_payload as _operator_error_payload
+from app.ui.outputs.data import enabled_runtime_backends_for_resource_profile
+from app.ui.outputs.health import service_metrics_from_status_payload
+from app.ui.outputs.presentation import (
+    build_output_detail,
+    output_signal_cards,
+    planned_backup_coverage_summary,
+)
+from app.ui.resources import (
+    format_metric_data_size,
+    memory_limit_bytes_for_profile,
+    memory_soft_limit_percent_for_profile,
+)
+from app.ui.routing import (
+    build_input_attach_options,
+    get_input_kind,
+    get_input_value,
+    input_kind_label,
 )
 from app.ui.view_models import (
     _backup_summary,
     _pending_backup_history_rows,
 )
-from fastapi import (
-    APIRouter,
-    Depends,
-    Request,
-)
-from fastapi.responses import (
-    JSONResponse,
-    Response,
-    StreamingResponse,
-)
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
-
-from app.ui.routes.shared import (
-    _build_input_attach_options,
-    _build_output_detail,
-    _cluster_nodes,
-    _collect_output_runtime_diagnostics_for_ui,
-    _enabled_runtime_backends_for_resource_profile,
-    _format_metric_data_size,
-    _input_kind,
-    _input_kind_label,
-    _input_value,
-    _memory_limit_bytes_for_profile,
-    _memory_soft_limit_percent_for_profile,
-    _output_signal_cards,
-    _planned_backup_coverage_summary,
-    _service_metrics_from_status_payload,
-    RuntimeDiagnosticsPending,
-)
-
 
 router = APIRouter(tags=["ui"])
 
@@ -104,7 +107,7 @@ async def output_input_attach_options(
         .scalars()
         .all()
     )
-    options = _build_input_attach_options(inputs, current_backend_id=backend.id)
+    options = build_input_attach_options(inputs, current_backend_id=backend.id)
     return {
         "options": options,
         "visible_count": sum(1 for item in options if not item["attached"]),
@@ -144,7 +147,7 @@ async def output_backup_signals(
         "backup_summary_rows": _backup_summary(
             latest_backup,
             coverage_by_id.get(latest_backup.id) if latest_backup else None,
-            planned_coverage=_planned_backup_coverage_summary(backend, settings),
+            planned_coverage=planned_backup_coverage_summary(backend, settings),
         )["rows"],
         "backup_history": history_rows,
     }
@@ -175,11 +178,11 @@ async def output_runtime_signals(
     )
     base_profile = build_resource_profile(settings, enabled_runtime_backends)
     attached_input_labels = [
-        f"{_input_kind_label(_input_kind(item))}: {_input_value(item)}"
+        f"{input_kind_label(get_input_kind(item))}: {get_input_value(item)}"
         for item in sorted(backend.inputs, key=lambda item: item.id)
     ]
     try:
-        runtime_diagnostics = await _collect_output_runtime_diagnostics_for_ui(
+        runtime_diagnostics = await collect_output_runtime_diagnostics_for_ui(
             backend, settings
         )
     except RuntimeDiagnosticsPending:
@@ -196,7 +199,7 @@ async def output_runtime_signals(
             status_code=202,
             headers={"Retry-After": "1"},
         )
-    detail = _build_output_detail(
+    detail = build_output_detail(
         backend=backend,
         service_map={},
         attached_input_ids=backend.input_ids,
@@ -211,7 +214,7 @@ async def output_runtime_signals(
         "runtime_health_summary": detail.get("runtime_health_summary"),
         "runtime_health_detail": detail.get("runtime_health_detail"),
         "runtime_state_detail": detail.get("runtime_state_detail"),
-        "output_signal_cards": _output_signal_cards(detail),
+        "output_signal_cards": output_signal_cards(detail),
         "runtime_alert": detail.get("runtime_health_alert"),
     }
 
@@ -236,7 +239,7 @@ async def output_metric_history(
         )
 
     status_payload = peek_cached_status() or {}
-    live_metrics = _service_metrics_from_status_payload(status_payload, backend)
+    live_metrics = service_metrics_from_status_payload(status_payload, backend)
     payload = await build_backend_metric_history(
         session,
         backend,
@@ -254,13 +257,13 @@ async def output_metric_history(
         soft_limit_value = None
         if backend.kind == "app":
             enabled_runtime_backends = (
-                await _enabled_runtime_backends_for_resource_profile(session)
+                await enabled_runtime_backends_for_resource_profile(session)
             )
             resource_profile = build_resource_profile(
                 settings, enabled_runtime_backends
             )
-            memory_limits = _memory_limit_bytes_for_profile(backend, resource_profile)
-            soft_limit_value = _memory_soft_limit_percent_for_profile(
+            memory_limits = memory_limit_bytes_for_profile(backend, resource_profile)
+            soft_limit_value = memory_soft_limit_percent_for_profile(
                 backend, resource_profile
             )
         elif backend.kind == "shield" and isinstance(live_metrics, dict):
@@ -275,7 +278,7 @@ async def output_metric_history(
         payload["soft_limit_bytes"] = memory_limits["soft"]
         payload["soft_limit_value"] = soft_limit_value
         payload["soft_limit_label"] = (
-            f"SOFT LIMIT ({_format_metric_data_size(memory_limits['soft'])})"
+            f"SOFT LIMIT ({format_metric_data_size(memory_limits['soft'])})"
         )
     return payload
 
@@ -326,7 +329,7 @@ async def download_error_debug_bundle(
     settings: Settings = Depends(settings_dependency),
     session: AsyncSession = Depends(db_session_dependency),
 ) -> Response:
-    flush_logging_pipeline()
+    await flush_logging_pipeline_async()
     try:
         bundle = await build_error_debug_bundle(
             session,
@@ -354,50 +357,13 @@ async def download_support_debug_bundle(
     settings: Settings = Depends(settings_dependency),
     session: AsyncSession = Depends(db_session_dependency),
 ) -> Response:
-    flush_logging_pipeline()
+    await flush_logging_pipeline_async()
     bundle = await build_support_debug_bundle(session, settings)
     return Response(
         bundle.content,
         media_type="application/zip",
         headers={
             "Content-Disposition": f'attachment; filename="{bundle.filename}"',
-            "Cache-Control": "no-store",
-        },
-    )
-
-
-@router.get("/api/backends/{backend_id}/ssh-key")
-async def download_backend_ssh_key(
-    backend_id: int,
-    settings: Settings = Depends(settings_dependency),
-    session: AsyncSession = Depends(db_session_dependency),
-) -> Response:
-    backend = (
-        await session.execute(select(Backend).where(Backend.id == backend_id))
-    ).scalar_one_or_none()
-    if backend is None or backend.kind != "app":
-        return _operator_error_json(
-            "app output not found",
-            ErrorCode.UI_RESOURCE_NOT_FOUND,
-            status_code=404,
-        )
-    private_key = str(backend.ssh_private_key or "")
-    if not private_key:
-        return _operator_error_json(
-            "ssh key has not been provisioned",
-            ErrorCode.UI_ACTION_UNAVAILABLE,
-            status_code=409,
-        )
-    return _backend_ssh_key_download_response(str(backend.name), private_key)
-
-
-def _backend_ssh_key_download_response(backend_name: str, private_key: str) -> Response:
-    filename = f"cnc-{backend_name}-id_ed25519"
-    return Response(
-        private_key,
-        media_type="application/octet-stream",
-        headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
             "Cache-Control": "no-store",
         },
     )
@@ -460,4 +426,4 @@ async def cluster_node_data(
         return JSONResponse(
             status_code=400, content={"detail": "multi node mode is disabled"}
         )
-    return JSONResponse({"nodes": await _cluster_nodes(session, settings)})
+    return JSONResponse({"nodes": await cluster_nodes(session, settings)})

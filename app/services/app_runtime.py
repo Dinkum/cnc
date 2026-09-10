@@ -8,6 +8,7 @@ import shutil
 import tarfile
 import tempfile
 import time
+import uuid
 from typing import Any
 
 from app.services.hardening_policy import (
@@ -83,6 +84,14 @@ from app.services.runtime_services import (
     default_app_runtime_services,
 )
 from app.services.safe_tar import safe_extract_tar
+from app.services.guest_isolation import (
+    guest_podman_args,
+    guest_rootfs_argument,
+    guest_volume_arguments,
+    protect_sandbox_directory,
+    preflight_guest_storage,
+    validate_guest_hardening,
+)
 from app.services.sandbox_profiles import get_app_sandbox_profile
 from app.services.systemd_memory import (
     SystemdMemoryPolicyError,
@@ -100,6 +109,53 @@ _TERMINAL_GUEST_EXEC_OUTCOMES = {
     "guard_unavailable",
     "timeout",
 }
+
+
+def preflight_app_storage(
+    desired: DesiredState,
+    selected_backend_names: set[str],
+) -> dict[str, Any]:
+    volumes_by_backend = {
+        backend.name: hardening_volumes(
+            read_hardening_policy(backend), parse_volumes_json(backend.volumes_json)
+        )
+        for backend in desired.known_app_backends
+    }
+    mounted_sources = [
+        Path(volume.split(":", 1)[0])
+        for volumes in volumes_by_backend.values()
+        for volume in volumes
+    ]
+    blockers: list[dict[str, str]] = []
+    repaired: list[str] = []
+    for name in sorted(
+        selected_backend_names & desired.runtime_graph.enabled_app_backend_names
+    ):
+        try:
+            guest_volume_arguments(volumes_by_backend[name])
+            for volume in volumes_by_backend[name]:
+                repaired.extend(
+                    preflight_guest_storage([volume], mounted_sources=mounted_sources)
+                )
+        except (ValueError, OSError) as exc:
+            blockers.append({"backend": name, "reason": str(exc)})
+    details = {"storage_repairs": sorted(set(repaired)), "storage_blockers": blockers}
+    if repaired:
+        logger.info("app.storage.repaired", **details)
+    if blockers:
+        summary = "; ".join(f"{item['backend']}: {item['reason']}" for item in blockers)
+        raise ApplyFailed(
+            summary,
+            phase="storage_preflight",
+            details={
+                **details,
+                "failed_backend": blockers[0]["backend"],
+                "operator_message": blockers[0]["reason"]
+                if len(blockers) == 1
+                else summary,
+            },
+        )
+    return details
 
 
 async def apply_app_backends(
@@ -967,12 +1023,15 @@ def build_app_container_create_command(
     sandbox_profile = get_app_sandbox_profile(backend.sandbox_profile)
     dns_servers = configured_app_dns_servers(settings)
     policy = read_hardening_policy(backend)
-    volume_entries = hardening_volumes(policy, parse_volumes_json(backend.volumes_json))
+    volume_entries = guest_volume_arguments(
+        hardening_volumes(policy, parse_volumes_json(backend.volumes_json))
+    )
     resource_profile = backend_resource_profile(backend, base_profile)
     command = [
         "podman",
         "create",
         *hardening_podman_args(policy),
+        *guest_podman_args(),
         "--name",
         container_name(backend.name),
         "--hostname",
@@ -1003,7 +1062,7 @@ def build_app_container_create_command(
     command.extend(
         [
             "--rootfs",
-            str(app_sandbox_rootfs_path(settings, backend.name)),
+            guest_rootfs_argument(app_sandbox_rootfs_path(settings, backend.name)),
             *sandbox_profile.init_command,
         ]
     )
@@ -1265,6 +1324,7 @@ async def _seed_persistent_guest_rootfs(
 ) -> dict[str, Any]:
     expected_profile = _expected_profile_state(backend)
     sandbox_dir = app_sandbox_rootfs_path(settings, backend.name).parent
+    protect_sandbox_directory(sandbox_dir)
     rootfs_dir = app_sandbox_rootfs_path(settings, backend.name)
     profile_state_path = app_sandbox_profile_state_path(settings, backend.name)
     current_profile = _read_profile_state(profile_state_path)
@@ -1316,7 +1376,7 @@ async def _seed_persistent_guest_rootfs(
         )
         rootfs_reseed_required = True
 
-    sandbox_dir.mkdir(parents=True, exist_ok=True)
+    protect_sandbox_directory(sandbox_dir)
     settings.app_sandbox_dir.mkdir(parents=True, exist_ok=True)
     profile = get_app_sandbox_profile(backend.sandbox_profile)
     with tempfile.TemporaryDirectory(
@@ -1385,6 +1445,7 @@ async def _seed_persistent_guest_rootfs(
                 extracted_rootfs,
                 allow_relative_symlinks=True,
                 guest_symlink_roots={PurePosixPath()},
+                guest_metadata_roots={PurePosixPath()},
             )
         _record_guest_seed_step(settings, backend, "seed_archive_extract", "succeeded")
         (extracted_rootfs / "etc").mkdir(parents=True, exist_ok=True)
@@ -1815,6 +1876,9 @@ class AppRuntimeReconciler:
         self.container_started = False
         self.guest_rootfs_seeded = False
         self.remove_runtime_on_apply_failure = False
+        self._isolation_rollback_files: dict[Path, bytes] = {}
+        self._isolation_rollback_dir: Path | None = None
+        self._isolation_migration_started = False
         self.result = AppRuntimeReconcileResult(
             backend=backend.name,
             container=self.container,
@@ -1837,6 +1901,8 @@ class AppRuntimeReconciler:
 
         actions: list[str] = []
         if container_exists:
+            if self._isolation_rollback_files:
+                self._isolation_migration_started = True
             await _stop_app_quadlet_backend(
                 self.backend.name, self.settings, services=self.services
             )
@@ -1984,11 +2050,75 @@ class AppRuntimeReconciler:
         return details
 
     async def reconcile_for_publish(self) -> AppRuntimeReconcileResult:
-        await self._run_phase("prepare", self._prepare_phase)
-        await self._run_phase("create", self._create_phase)
-        await self._run_phase("bootstrap", self._bootstrap_phase)
-        await self._run_phase("publish", self._publish_phase)
+        try:
+            await self._run_phase("prepare", self._prepare_phase)
+            await self._run_phase("create", self._create_phase)
+            await self._run_phase("bootstrap", self._bootstrap_phase)
+            await self._run_phase("publish", self._publish_phase)
+        except Exception as exc:
+            if self._isolation_migration_started:
+                try:
+                    await self._restore_previous_isolation_runtime()
+                except Exception as rollback_exc:
+                    raise ApplyFailed(
+                        "Guest runtime migration failed and the previous runtime could not restart",
+                        phase="app_create",
+                        details={
+                            "error": str(exc),
+                            "rollback_error": str(rollback_exc),
+                            "runtime_backup": str(self._isolation_rollback_dir),
+                        },
+                    ) from exc
+            raise
         return self.result
+
+    def _save_previous_isolation_runtime(self) -> None:
+        unit = quadlet_container_path(self.settings, self.backend.name)
+        if not unit.is_file():
+            raise ApplyFailed(
+                "Guest isolation migration requires an existing Quadlet for automatic rollback",
+                phase="app_create",
+            )
+        backup = (
+            self.settings.apply_backup_dir
+            / "guest-runtime"
+            / self.backend.name
+            / uuid.uuid4().hex
+        )
+        backup.mkdir(parents=True, mode=0o700)
+        paths = [unit, quadlet_network_path(self.settings, self.backend.name)]
+        paths.extend(
+            control_dir(self.settings, self.backend.name) / name
+            for name in ("spec.json", "bootstrap.json")
+        )
+        for path in paths:
+            if path.is_file():
+                content = path.read_bytes()
+                self._isolation_rollback_files[path] = content
+                (backup / path.name).write_bytes(content)
+        self._isolation_rollback_dir = backup
+
+    async def _restore_previous_isolation_runtime(self) -> None:
+        # Only runtime artifacts changed: idmapped storage needs no recursive
+        # ownership conversion, so the previous Quadlet can reuse the same data.
+        self.remove_runtime_on_apply_failure = False
+        await _stop_app_quadlet_backend(
+            self.backend.name, self.settings, services=self.services
+        )
+        _remove_podman_container(self.container, self.settings, services=self.services)
+        for path, content in self._isolation_rollback_files.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+        await _systemctl_daemon_reload(self.settings, services=self.services)
+        await _start_app_quadlet_backend(
+            self.backend, self.settings, services=self.services
+        )
+        self._isolation_migration_started = False
+        logger.warning(
+            "app.isolation.migration_rolled_back",
+            backend=self.backend.name,
+            runtime_backup=str(self._isolation_rollback_dir),
+        )
 
     async def verify_steady_state(self) -> AppRuntimeReconcileResult:
         await self._run_phase("verify", self._verify_phase)
@@ -1996,6 +2126,19 @@ class AppRuntimeReconciler:
         return self.result
 
     async def _prepare_phase(self) -> dict[str, Any]:
+        policy = read_hardening_policy(self.backend)
+        validate_guest_hardening(policy.model_dump())
+        volumes = hardening_volumes(
+            policy, parse_volumes_json(self.backend.volumes_json)
+        )
+        guest_volume_arguments(volumes)
+        # Fail before stopping an existing guest if the host cannot prepare the
+        # confined runtime. ExecStartPre repeats this after host reboot.
+        await self.services.run_command_checked_async(
+            [str(self.settings.guest_runtime_helper_path)]
+            + [arg for volume in volumes for arg in ("--volume", volume)],
+            timeout_sec=self.settings.command_timeout_apply_sec,
+        )
         self.inspect_result, self.inspect_payload = self.services.inspect_container(
             self.container,
             timeout_sec=self.settings.command_timeout_status_sec,
@@ -2005,6 +2148,13 @@ class AppRuntimeReconciler:
             timeout_sec=self.settings.command_timeout_status_sec,
         )
         container_exists = self.inspect_payload is not None
+        if (
+            container_exists
+            and self.saved_spec is not None
+            and self.saved_spec.get("guest_isolation_revision")
+            != self.current_spec.get("guest_isolation_revision")
+        ):
+            self._save_previous_isolation_runtime()
         network_exists = self.network_payload is not None
         self.create_action = "reuse"
         auto_repair_details: dict[str, Any] | None = None
@@ -2448,6 +2598,13 @@ class AppRuntimeReconciler:
                     "dns_servers": self.current_spec.get("dns_servers", []),
                 },
             )
+        if self.container_started or self.result.created or self.result.recreated:
+            await asyncio.to_thread(
+                _verify_guest_isolation,
+                self.backend,
+                self.settings,
+                services=self.services,
+            )
         return {
             "bootstrapped": self.result.bootstrapped,
             "bootstrap_status": (
@@ -2569,6 +2726,43 @@ def _app_container_running(
     if not isinstance(state, dict):
         return False
     return bool(state.get("Running"))
+
+
+def _verify_guest_isolation(
+    backend: Backend, settings: Settings, *, services: AppRuntimeServices
+) -> None:
+    unit = f"cnc-runtime-check-{uuid.uuid4().hex}"
+    script = (
+        "set -eu; "
+        f"systemd-run --quiet --wait --collect --unit={unit}-user "
+        "-p Type=exec -p User=65534 -p NoNewPrivileges=yes -p RestrictSUIDSGID=yes "
+        '/bin/sh -ec \'test "$(id -u)" = 65534; '
+        'grep -q "^CapEff:[[:space:]]*0000000000000000$" /proc/self/status; '
+        'grep -q "^NoNewPrivs:[[:space:]]*1$" /proc/self/status\'; '
+        f"systemd-run --quiet --wait --collect --unit={unit}-filesystem "
+        "-p Type=exec -p ProtectSystem=strict -p ProtectHome=yes "
+        "-p PrivateTmp=yes -p PrivateDevices=yes "
+        "/bin/sh -ec 'test \"$(id -u)\" = 0; test ! -w /etc'"
+    )
+    result = run_backend_guest_command(
+        backend.name,
+        settings,
+        ["/bin/sh", "-ec", script],
+        timeout_sec=min(30, settings.command_timeout_apply_sec),
+        command_runner=services.run_command,
+        wait_sec=1,
+        source="runtime_isolation_check",
+    )
+    if not result.ok:
+        raise ApplyFailed(
+            "Ubuntu guest failed its service isolation check",
+            phase="app_bootstrap",
+            details={
+                "backend": backend.name,
+                "returncode": result.returncode,
+                "error": clip_output(result.stderr or result.stdout),
+            },
+        )
 
 
 def _guest_systemd_state(
@@ -2699,6 +2893,8 @@ def _normalize_saved_spec(
     normalized = dict(saved_spec)
     # A missing policy means the old runtime had no reviewed hardening overrides.
     normalized.setdefault("hardening", {})
+    if "guest_isolation_revision" in current_spec:
+        normalized.setdefault("guest_isolation_revision", 0)
     for key, value in current_spec.items():
         normalized.setdefault(key, value)
     return normalized
@@ -2708,6 +2904,7 @@ def _rebuild_required_spec_keys(
     saved_spec: dict[str, Any], current_spec: dict[str, Any]
 ) -> set[str]:
     immutable_keys = {
+        "guest_isolation_revision",
         "hardening",
         "runtime_owner",
         "network",

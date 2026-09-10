@@ -6,7 +6,7 @@ import contextlib
 from sqlalchemy.exc import IntegrityError
 
 from app.config import Settings
-from app.logger import flush_logging_pipeline, get_logger
+from app.logger import flush_logging_pipeline_async, get_logger
 from app.services import backend_commands
 from app.services.app_runtime import remove_deleted_app_filesystem_artifacts
 from app.services.apply_service import default_apply_services, run_apply
@@ -372,7 +372,7 @@ async def _run_delete_operation(
             backend_id=backend_id,
             operation_id=operation_id,
         )
-        flush_logging_pipeline()
+        await flush_logging_pipeline_async()
         await operation.update(
             status="running",
             phase="Delete output",
@@ -396,7 +396,7 @@ async def _run_delete_operation(
                 enabled=backend.enabled,
                 input_count=len(backend.inputs),
             )
-            flush_logging_pipeline()
+            await flush_logging_pipeline_async()
             await operation.update(
                 status="running",
                 phase="Delete output",
@@ -464,7 +464,7 @@ async def _run_delete_operation(
                 apply_status=apply_response.status,
                 run_id=apply_response.run_id,
             )
-            flush_logging_pipeline()
+            await flush_logging_pipeline_async()
             if apply_response.status == "success" and deleted_backend_name:
                 try:
                     await remove_deleted_app_filesystem_artifacts(
@@ -478,7 +478,7 @@ async def _run_delete_operation(
                         backend=deleted_backend_name,
                         error=filesystem_cleanup_error,
                     )
-                    flush_logging_pipeline()
+                    await flush_logging_pipeline_async()
                 try:
                     await operation.update(
                         status="running",
@@ -503,7 +503,7 @@ async def _run_delete_operation(
                         backend=deleted_backend_name,
                         error=str(exc),
                     )
-                    flush_logging_pipeline()
+                    await flush_logging_pipeline_async()
             success_flash, error_flash = _save_apply_feedback(
                 apply_response,
                 success_message="Output deleted.",
@@ -549,7 +549,7 @@ async def _run_delete_operation(
                 apply_status=apply_response.status,
                 run_id=apply_response.run_id,
             )
-            flush_logging_pipeline()
+            await flush_logging_pipeline_async()
             await operation.complete(
                 status, phase="delete", error=error_flash, details=details
             )
@@ -567,7 +567,7 @@ async def _run_delete_operation(
             **error_fields,
             error=str(exc),
         )
-        flush_logging_pipeline()
+        await flush_logging_pipeline_async()
         await operation.complete(
             "failed",
             phase="delete",

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from app.services.guest_isolation import GUEST_RUNTIME_REVISION
+
 import ipaddress
 import json
 import os
@@ -140,6 +142,7 @@ def runtime_spec(
     sandbox_profile = get_app_sandbox_profile(backend.sandbox_profile)
     return {
         "runtime_owner": "quadlet",
+        "guest_isolation_revision": GUEST_RUNTIME_REVISION,
         "hardening": read_hardening_policy(backend).model_dump(exclude_defaults=True),
         "quadlet_container_unit": f"{container_name(backend.name)}.container",
         "quadlet_container_service": f"{container_name(backend.name)}.service",

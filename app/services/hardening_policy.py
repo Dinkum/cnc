@@ -290,6 +290,9 @@ POLICY_CONTROLS = (
 )
 
 ADVISOR_MANAGED = {
+    "apparmor_confined": "CNC manages the confined Ubuntu systemd profile.",
+    "userns_auto_or_nomap": "CNC assigns each Ubuntu guest its own user namespace.",
+    "mount_idmap_or_U_only_if_needed": "CNC preserves guest ownership through idmapped storage.",
     "privileged_false": "CNC does not enable privileged mode.",
     "seccomp_not_unconfined": "CNC keeps the runtime seccomp default; it does not request unconfined.",
     "selinux_label_separation": "CNC keeps runtime labeling defaults.",
@@ -308,11 +311,9 @@ ADVISOR_MANAGED = {
 }
 ADVISOR_UNAVAILABLE = {
     "seccomp_custom_profile": "Requires a reviewed, installed syscall profile; no profile is selected automatically.",
-    "mount_idmap_or_U_only_if_needed": "Ownership remapping needs a separate review of the exact mount and UID mapping.",
     "exact_device_permissions_if_needed": "Requires an exact device and permission review; CNC does not pass host devices.",
     "network_none": "Would remove the networking CNC needs for app routing and SSH access.",
     "nonroot_user": "CNC's systemd guest starts as root; set app-service users inside the guest.",
-    "userns_auto_or_nomap": "Requires a reviewed ownership migration of the persistent guest root filesystem.",
 }
 
 
@@ -381,13 +382,6 @@ def recommended_hardening_policy(
                 setting,
                 "Choose exact capability exceptions in the flag editor; the advisor does not supply a proven capability list.",
             )
-        elif setting == "apparmor_confined":
-            if phase2.get("status") == "success":
-                current["apparmor_profile"] = "container-default"
-            else:
-                skip(
-                    setting, "Choose an installed AppArmor profile in the flag editor."
-                )
         elif setting == "explicit_tmpfs_paths":
             current["tmpfs_paths"] = "tmp_run"
         elif setting in ("ipc_none", "ipc_private"):

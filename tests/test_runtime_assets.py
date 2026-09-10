@@ -63,7 +63,10 @@ def test_inspect_managed_systemd_assets_reports_drift_without_mutating(
     systemd_dir = tmp_path / "systemd"
     _write_packaged_systemd_assets(packaging_dir)
     wrapper_path = tmp_path / "bin" / "cnc-ssh-backend-root"
-    settings = Settings(ssh_backend_root_wrapper_path=wrapper_path)
+    settings = Settings(
+        ssh_backend_root_wrapper_path=wrapper_path,
+        guest_runtime_helper_path=tmp_path / "bin" / "cnc-prepare-guest",
+    )
     commands: list[list[str]] = []
 
     def fake_run(command: list[str], timeout_sec: int = 30) -> CommandResult:
@@ -83,7 +86,10 @@ def test_inspect_managed_systemd_assets_reports_drift_without_mutating(
     )
 
     assert payload["changed_units"] == MANAGED_ASSET_NAMES
-    assert payload["changed_files"] == [str(wrapper_path)]
+    assert payload["changed_files"] == [
+        str(wrapper_path),
+        str(settings.guest_runtime_helper_path),
+    ]
     assert payload["daemon_reload_needed"] is True
     assert payload["admin_restart_required"] is True
     assert payload["timer_reconcile_needed"] is True
@@ -100,7 +106,10 @@ def test_reconcile_managed_systemd_assets_installs_missing_units_and_enables_tim
     systemd_dir = tmp_path / "systemd"
     _write_packaged_systemd_assets(packaging_dir)
     wrapper_path = tmp_path / "bin" / "cnc-ssh-backend-root"
-    settings = Settings(ssh_backend_root_wrapper_path=wrapper_path)
+    settings = Settings(
+        ssh_backend_root_wrapper_path=wrapper_path,
+        guest_runtime_helper_path=tmp_path / "bin" / "cnc-prepare-guest",
+    )
     commands: list[list[str]] = []
 
     def fake_run(command: list[str], timeout_sec: int = 30) -> CommandResult:
@@ -120,7 +129,10 @@ def test_reconcile_managed_systemd_assets_installs_missing_units_and_enables_tim
     )
 
     assert payload["changed_units"] == MANAGED_ASSET_NAMES
-    assert payload["changed_files"] == [str(wrapper_path)]
+    assert payload["changed_files"] == [
+        str(wrapper_path),
+        str(settings.guest_runtime_helper_path),
+    ]
     assert payload["daemon_reloaded"] is True
     assert payload["admin_restart_required"] is True
     assert payload["timer_reconciled"] is True
@@ -161,12 +173,16 @@ def test_reconcile_managed_systemd_assets_skips_reload_when_units_match(
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(source.read_bytes())
     wrapper_path = tmp_path / "bin" / "cnc-ssh-backend-root"
-    settings = Settings(ssh_backend_root_wrapper_path=wrapper_path)
+    settings = Settings(
+        ssh_backend_root_wrapper_path=wrapper_path,
+        guest_runtime_helper_path=tmp_path / "bin" / "cnc-prepare-guest",
+    )
     wrapper_path.parent.mkdir(parents=True)
     wrapper_path.write_text(
         runtime_assets.backend_ssh_root_wrapper_script(), encoding="utf-8"
     )
     wrapper_path.chmod(0o755)
+    runtime_assets.reconcile_guest_runtime_helper(settings)
     commands: list[list[str]] = []
 
     def fake_run(command: list[str], timeout_sec: int = 30) -> CommandResult:

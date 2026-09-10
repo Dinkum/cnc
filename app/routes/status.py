@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import Settings
 from app.database import verify_db_connection
 from app.dependencies import db_session_dependency, settings_dependency
+from app.logger import logging_pipeline_status
 from app.models.entities import Operation
 from app.security import get_csrf_token
 from app.services.operation_progress import read_operation_progress
@@ -165,6 +166,13 @@ async def operation_status_payload(
     ).scalar_one_or_none()
     if operation is None:
         raise HTTPException(status_code=404, detail="operation not found")
+    if operation.kind == "output_exec":
+        from app.services.command_jobs import get_job
+
+        # Polling consumes durable completion evidence without entering the guest
+        # or multiplying Podman observations across UI/event-stream subscribers.
+        await get_job(settings, operation_id, observe=False)
+        await session.refresh(operation)
     return operation_payload(operation, settings)
 
 
@@ -307,6 +315,7 @@ async def _readiness_response(request: Request) -> JSONResponse:
         "config": "ok" if startup_config_ok else "error",
         "db": "ok" if live_db_ok and startup_db_ok else "error",
         "startup": startup,
+        "logging": logging_pipeline_status(),
     }
     if db_error:
         payload["db_error"] = db_error

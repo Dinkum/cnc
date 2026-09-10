@@ -247,7 +247,12 @@ def test_safe_extract_tar_allows_opted_in_absolute_rootfs_symlink_targets(
     )
 
     with tarfile.open(archive_path, "r:*") as archive:
-        safe_extract_tar(archive, destination, allow_relative_symlinks=True)
+        safe_extract_tar(
+            archive,
+            destination,
+            allow_relative_symlinks=True,
+            guest_symlink_roots={"mounts/0/rootfs"},
+        )
 
     link_path = destination / "mounts/0/rootfs/etc/alternatives/awk"
     assert link_path.is_symlink()

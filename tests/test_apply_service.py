@@ -2893,6 +2893,7 @@ async def test_apply_auto_recovers_rebuild_required_dns_change(
         """
 {
   "seed_image": "docker.io/library/ubuntu:24.04",
+                "guest_isolation_revision": 1,
   "sandbox_profile": "ubuntu-24.04-systemd",
   "guest_rootfs": "/var/lib/cnc/sandboxes/web/rootfs",
   "dns_servers": ["8.8.8.8"],
@@ -3266,6 +3267,7 @@ async def test_apply_backfills_legacy_saved_spec_before_reuse(
         json.dumps(
             {
                 "seed_image": "docker.io/library/ubuntu:24.04",
+                "guest_isolation_revision": 1,
                 "sandbox_profile": "ubuntu-24.04-systemd",
                 "guest_rootfs": str(tmp_path / "sandboxes" / "web" / "rootfs"),
                 "handoff_port": 8337,
@@ -3416,6 +3418,7 @@ async def test_apply_rejects_bridge_dns_network_until_explicit_rebuild(
         json.dumps(
             {
                 "runtime_owner": "quadlet",
+                "guest_isolation_revision": 1,
                 "network": network,
                 "base_image": "docker.io/library/ubuntu:24.04",
                 "internal_port": 8337,
@@ -3664,7 +3667,7 @@ async def test_apply_stops_container_after_bootstrap_failure(
 
 @pytest.mark.asyncio
 async def test_run_apply_sends_pushover_alert_on_failure(
-    monkeypatch, tmp_path: Path
+    monkeypatch, tmp_path: Path, caplog
 ) -> None:
     maker = await _make_session(tmp_path / "app.db")
     settings = Settings(
@@ -3697,6 +3700,16 @@ async def test_run_apply_sends_pushover_alert_on_failure(
     assert sent
     assert sent[0]["title"] == "CNC apply failed"
     assert "nginx explode" in str(sent[0]["message"])
+
+    terminal = [
+        record
+        for record in caplog.records
+        if getattr(record, "log_kind", None) == "result" and record.name == "apply"
+    ]
+    assert len(terminal) == 1
+    assert terminal[0].levelname == "ERROR"
+    assert terminal[0].context["status"] == "error"
+    assert terminal[0].context["run_id"] == result.run_id
 
 
 @pytest.mark.asyncio
@@ -3781,3 +3794,56 @@ async def test_run_apply_sends_partial_failure_pushover_message(
     assert sent[0]["title"] == "CNC apply failed"
     assert "Apply partially failed." in str(sent[0]["message"])
     assert "manual review: required" in str(sent[0]["message"])
+
+
+@pytest.mark.asyncio
+async def test_storage_preflight_failure_precedes_all_runtime_mutations(
+    monkeypatch, tmp_path
+):
+    maker = await _make_session(tmp_path / "app.db")
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'app.db'}",
+        nginx_generated_dir=tmp_path / "nginx",
+        apply_backup_dir=tmp_path / "backups",
+        apply_lock_path=tmp_path / "apply.lock",
+        app_quadlet_dir=tmp_path / "quadlets",
+    )
+    checked = []
+
+    def preflight(desired, selected):
+        checked.extend(sorted(selected))
+        raise apply_service.ApplyFailed(
+            "web-b storage is unsafe",
+            phase="storage_preflight",
+            details={"failed_backend": "web-b"},
+        )
+
+    async def runtime(*args, **kwargs):
+        pytest.fail("runtime must not change before storage preflight passes")
+
+    monkeypatch.setattr(apply_service, "preflight_app_storage", preflight)
+    monkeypatch.setattr(apply_service, "apply_app_backends", runtime)
+    async with maker() as session:
+        for index, name in enumerate(["web-a", "web-b"]):
+            session.add(
+                Backend(
+                    name=name,
+                    kind="app",
+                    port=12000 + index,
+                    base_image="ubuntu:24.04",
+                    internal_port=8337,
+                    workdir="/srv/web",
+                    install_command="",
+                    start_command="",
+                    env_json="{}",
+                    volumes_json="[]",
+                    enabled=True,
+                )
+            )
+        await session.commit()
+        result = await run_apply(session, settings)
+    assert checked == ["web-a", "web-b"]
+    assert result.status == "error"
+    assert result.details["phase"] == "storage_preflight"
+    assert result.details["failure_mode"] == "clean"
+    assert result.details["live_mutation_phases"] == []

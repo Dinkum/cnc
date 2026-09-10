@@ -765,7 +765,7 @@ async def test_prepare_phase_auto_repairs_missing_container_with_saved_spec(
     assert not bootstrap_state_path(settings, backend.name).exists()
     assert not failure_artifact_path(settings, backend.name).exists()
     assert not bootstrap_lock_path(settings, backend.name).exists()
-    assert hooks.commands == []
+    assert hooks.commands == [[str(settings.guest_runtime_helper_path)]]
 
 
 @pytest.mark.asyncio
@@ -1336,6 +1336,7 @@ async def test_prepare_phase_auto_repairs_missing_saved_spec_by_removing_contain
     assert details["auto_repair"]["reason"] == "missing_saved_spec"
     assert reconciler.result.recreated is True
     assert hooks.commands == [
+        [str(settings.guest_runtime_helper_path)],
         ["systemctl", "stop", "cnc-app-web.service"],
         ["podman", "rm", "-f", "cnc-app-web"],
     ]
@@ -1850,3 +1851,65 @@ async def test_verify_phase_reports_disabled_healthcheck_as_unmonitored(
         "port": 12001,
     }
     assert hooks.commands == []
+
+
+@pytest.mark.asyncio
+async def test_isolation_preparation_failure_does_not_stop_existing_guest(tmp_path):
+    settings = _settings(tmp_path)
+    backend = _backend()
+    hooks = _FakeHooks()
+    hooks.inspect_payload = {"State": {"Running": True}}
+    hooks.command_error = RuntimeError("host preparation failed")
+    reconciler = app_runtime.AppRuntimeReconciler(
+        backend,
+        settings,
+        base_profile=build_resource_profile(settings, [backend]),
+        services=hooks.as_services(),
+    )
+    with pytest.raises(RuntimeError, match="host preparation failed"):
+        await reconciler._prepare_phase()
+    assert hooks.commands == [[str(settings.guest_runtime_helper_path)]]
+
+
+@pytest.mark.asyncio
+async def test_failed_isolation_migration_restores_previous_runtime(
+    monkeypatch, tmp_path
+):
+    settings = _settings(tmp_path).model_copy(
+        update={"apply_backup_dir": tmp_path / "backups"}
+    )
+    backend = _backend()
+    profile = build_resource_profile(settings, [backend])
+    write_app_control_assets(backend, settings, base_profile=profile)
+    path = spec_path(settings, backend.name)
+    saved = json.loads(path.read_text())
+    saved.pop("guest_isolation_revision")
+    path.write_text(json.dumps(saved))
+    unit = quadlet_container_path(settings, backend.name)
+    unit.parent.mkdir(parents=True, exist_ok=True)
+    unit.write_text("[Container]\nRootfs=/example/rootfs\n")
+    old_spec, old_unit = path.read_bytes(), unit.read_bytes()
+    hooks = _FakeHooks()
+    hooks.inspect_payload = {"State": {"Running": True}}
+    monkeypatch.setattr(app_runtime, "bootstrap_lock_is_held", lambda *_: False)
+    reconciler = app_runtime.AppRuntimeReconciler(
+        backend,
+        settings,
+        base_profile=profile,
+        services=hooks.as_services(),
+    )
+
+    async def fail_candidate():
+        assert reconciler._isolation_migration_started
+        unit.write_text("candidate runtime")
+        path.write_text("candidate spec")
+        raise RuntimeError("candidate boot failed")
+
+    monkeypatch.setattr(reconciler, "_create_phase", fail_candidate)
+    with pytest.raises(RuntimeError, match="candidate boot failed"):
+        await reconciler.reconcile_for_publish()
+    assert path.read_bytes() == old_spec
+    assert unit.read_bytes() == old_unit
+    assert reconciler.remove_runtime_on_apply_failure is False
+    assert ["systemctl", "start", "cnc-app-web.service"] in hooks.commands
+    assert (reconciler._isolation_rollback_dir / unit.name).read_bytes() == old_unit

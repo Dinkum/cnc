@@ -2,6 +2,19 @@ from __future__ import annotations
 
 import html
 
+from fastapi import (
+    APIRouter,
+    Depends,
+    Form,
+    Request,
+)
+from fastapi.responses import (
+    HTMLResponse,
+    PlainTextResponse,
+    RedirectResponse,
+)
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.access import (
     ACCESS_ROUTE_PATH,
     access_key_is_configured,
@@ -19,6 +32,7 @@ from app.dependencies import (
     db_session_dependency,
     settings_dependency,
 )
+from app.logger import get_logger
 from app.models.entities import Backend
 from app.services.error_reporting import ErrorCode
 from app.services.llm_help import (
@@ -28,38 +42,27 @@ from app.services.llm_help import (
     render_host_llm_help_text,
 )
 from app.services.managed_env import apply_managed_env_updates
-from app.ui.errors import operator_coded_error as _operator_coded_error
 from app.ui.access import _access_page_context
-from fastapi import (
-    APIRouter,
-    Depends,
-    Form,
-    Request,
-)
-from fastapi.responses import (
-    HTMLResponse,
-    PlainTextResponse,
-    RedirectResponse,
-)
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from app.ui.routes.shared import (
+from app.ui.dashboard.context import dashboard_context, host_llm_help_context
+from app.ui.errors import operator_coded_error as _operator_coded_error
+from app.ui.http import (
     FLASH_ERROR_COOKIE,
     FLASH_SUCCESS_COOKIE,
-    _backend_ssh_destination,
-    _dashboard_context,
-    _dashboard_tab,
-    _host_llm_help_context,
-    _host_llm_help_url,
-    _output_llm_help_url,
-    _output_page_context,
-    _render_access_template,
-    _render_dashboard_template,
-    _render_output_template,
-    _stylesheet_asset_version,
-    _ssh_destination_for_request,
-    logger,
+    render_access_template,
+    render_dashboard_template,
+    render_output_template,
 )
+from app.ui.operator_help import (
+    backend_ssh_destination,
+    host_llm_help_url,
+    output_llm_help_url,
+    ssh_destination_for_request,
+)
+from app.ui.outputs.context import output_page_context
+from app.ui.read_models import dashboard_tab
+from app.ui.view_models import stylesheet_version
+
+logger = get_logger("ui")
 
 
 router = APIRouter(tags=["ui"])
@@ -76,7 +79,7 @@ async def access_page(
         return RedirectResponse(url=next_path, status_code=303)
     context = _access_page_context(settings, next_path=next_path)
     context["request"] = request
-    return _render_access_template(request, context)
+    return render_access_template(request, context)
 
 
 @router.post(ACCESS_ROUTE_PATH)
@@ -101,7 +104,7 @@ async def access_submit(
                 flash_error=f"Try again in {wait_seconds}s.",
             )
             context["request"] = request
-            return _render_access_template(request, context, status_code=429)
+            return render_access_template(request, context, status_code=429)
         if not valid:
             context = _access_page_context(
                 settings,
@@ -109,7 +112,7 @@ async def access_submit(
                 flash_error="Access key did not match.",
             )
             context["request"] = request
-            return _render_access_template(request, context, status_code=401)
+            return render_access_template(request, context, status_code=401)
         response = RedirectResponse(url=next_target, status_code=303)
         set_access_cookie(response, settings, request=request)
         return response
@@ -121,7 +124,7 @@ async def access_submit(
             settings, next_path=next_target, flash_error=str(exc)
         )
         context["request"] = request
-        return _render_access_template(request, context, status_code=400)
+        return render_access_template(request, context, status_code=400)
     if normalized_key != str(access_key_confirm or "").strip():
         context = _access_page_context(
             settings,
@@ -132,7 +135,7 @@ async def access_submit(
             ),
         )
         context["request"] = request
-        return _render_access_template(request, context, status_code=400)
+        return render_access_template(request, context, status_code=400)
     next_settings = apply_managed_env_updates(
         settings, {"ACCESS_KEY_HASH": hash_access_key(normalized_key)}
     )
@@ -147,10 +150,10 @@ async def dashboard(
     settings: Settings = Depends(settings_dependency),
     session: AsyncSession = Depends(db_session_dependency),
 ) -> HTMLResponse:
-    active_tab = _dashboard_tab(request.query_params.get("tab"), "home")
+    active_tab = dashboard_tab(request.query_params.get("tab"), "home")
     if active_tab == "routing" and not settings.beta_routing:
         active_tab = "home"
-    context = await _dashboard_context(
+    context = await dashboard_context(
         session,
         settings,
         prefer_cached_status=True,
@@ -165,7 +168,7 @@ async def dashboard(
         context["flash_success"] = flash_success
     context["request"] = request
     context["active_tab"] = active_tab
-    response = _render_dashboard_template(request, context)
+    response = render_dashboard_template(request, context)
     if hasattr(response, "delete_cookie"):
         response.delete_cookie(FLASH_SUCCESS_COOKIE, path="/")
         response.delete_cookie(FLASH_ERROR_COOKIE, path="/")
@@ -178,11 +181,11 @@ async def host_llm_help(
     settings: Settings = Depends(settings_dependency),
     session: AsyncSession = Depends(db_session_dependency),
 ) -> PlainTextResponse:
-    context = await _host_llm_help_context(session, settings)
+    context = await host_llm_help_context(session, settings)
     backends = context.get("backends", [])
     output_details = context.get("output_details", {})
-    host = _ssh_destination_for_request(request)
-    backend_ssh_host = _backend_ssh_destination(settings, request, resolve_dns=True)
+    host = ssh_destination_for_request(request)
+    backend_ssh_host = backend_ssh_destination(settings, request, resolve_dns=True)
     backend_payloads: list[dict[str, object]] = []
     for backend in backends:
         if not isinstance(backend, Backend):
@@ -193,7 +196,7 @@ async def host_llm_help(
                 backend,
                 host=host,
                 backend_ssh_host=backend_ssh_host,
-                llm_help_url=_output_llm_help_url(request, backend.id),
+                llm_help_url=output_llm_help_url(request, backend.id),
                 status_value=str(detail.get("status_value") or ""),
                 service_state=str(detail.get("service_state") or ""),
                 target=str(detail.get("target") or ""),
@@ -205,7 +208,7 @@ async def host_llm_help(
         settings=settings,
         host=host,
         backend_ssh_host=backend_ssh_host,
-        host_llm_help_url=_host_llm_help_url(request),
+        host_llm_help_url=host_llm_help_url(request),
         backend_payloads=backend_payloads,
     )
     return PlainTextResponse(render_host_llm_help_text(payload))
@@ -219,7 +222,7 @@ async def output_detail(
     session: AsyncSession = Depends(db_session_dependency),
 ) -> HTMLResponse:
     try:
-        context = await _output_page_context(
+        context = await output_page_context(
             session, settings, backend_id, prefer_cached_runtime=True
         )
     except LookupError:
@@ -228,7 +231,7 @@ async def output_detail(
             backend_id=backend_id,
             path=str(request.url.path),
         )
-        asset_version = html.escape(_stylesheet_asset_version(settings), quote=True)
+        asset_version = html.escape(stylesheet_version(settings), quote=True)
         return HTMLResponse(
             f"""<!doctype html>
 <html lang="en">
@@ -259,7 +262,7 @@ async def output_detail(
             status_code=404,
         )
     context["request"] = request
-    return _render_output_template(request, settings, context)
+    return render_output_template(request, settings, context)
 
 
 @router.get(
@@ -274,7 +277,7 @@ async def output_llm_help(
     session: AsyncSession = Depends(db_session_dependency),
 ) -> PlainTextResponse:
     try:
-        context = await _output_page_context(session, settings, backend_id)
+        context = await output_page_context(session, settings, backend_id)
     except LookupError:
         return PlainTextResponse("backend not found", status_code=404)
 
@@ -283,9 +286,9 @@ async def output_llm_help(
     assert isinstance(backend, Backend)
     payload = build_backend_llm_help_payload(
         backend,
-        host=_ssh_destination_for_request(request),
-        backend_ssh_host=_backend_ssh_destination(settings, request, resolve_dns=True),
-        llm_help_url=_output_llm_help_url(request, backend_id),
+        host=ssh_destination_for_request(request),
+        backend_ssh_host=backend_ssh_destination(settings, request, resolve_dns=True),
+        llm_help_url=output_llm_help_url(request, backend_id),
         status_value=str(detail.get("status_value") or ""),
         service_state=str(detail.get("service_state") or ""),
         target=str(detail.get("target") or ""),

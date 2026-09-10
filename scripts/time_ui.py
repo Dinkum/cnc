@@ -18,6 +18,9 @@ from typing import Any
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+import app.ui.dashboard.context as ui_dashboard_context
+import app.ui.dashboard.data as ui_dashboard_data
+import app.ui.outputs.data as ui_outputs_data
 from app import main as app_main
 from app.config import Settings
 from app.database import Base
@@ -44,8 +47,6 @@ from app.ui.routes import backup_mutations as ui_backup_mutations
 from app.ui.routes import input_mutations as ui_input_mutations
 from app.ui.routes import output_mutations as ui_output_mutations
 from app.ui.routes import reads as ui_reads
-from app.ui.routes import shared as ui_shared
-
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_OUTPUT_DIR = ROOT / "ignore" / "perf"
@@ -198,9 +199,11 @@ def _install_runtime_patches(settings: Settings) -> RuntimePatchState:
         originals={
             "app_main_get_settings": app_main.get_settings,
             "app_main_build_access_required_response": app_main.build_access_required_response,
-            "ui_shared_collect_status": ui_shared.collect_status,
+            "ui_dashboard_collect_status": ui_dashboard_data.collect_status,
             "status_collect_status": status_routes.collect_status,
-            "ui_shared_peek_cached_status": ui_shared.peek_cached_status,
+            "ui_dashboard_peek_cached_status": ui_dashboard_data.peek_cached_status,
+            "ui_help_peek_cached_status": ui_dashboard_context.peek_cached_status,
+            "ui_output_peek_cached_status": ui_outputs_data.peek_cached_status,
             "ui_reads_peek_cached_status": ui_reads.peek_cached_status,
             "input_commit_and_apply": input_operations.commit_and_apply,
             "output_lifecycle_commit_and_apply": output_lifecycle_operations.commit_and_apply,
@@ -220,9 +223,11 @@ def _install_runtime_patches(settings: Settings) -> RuntimePatchState:
 
     app_main.get_settings = lambda: settings
     app_main.build_access_required_response = lambda request, settings: None
-    ui_shared.collect_status = _fake_collect_status
+    ui_dashboard_data.collect_status = _fake_collect_status
     status_routes.collect_status = _fake_collect_status
-    ui_shared.peek_cached_status = lambda: {}
+    ui_dashboard_data.peek_cached_status = lambda: {}
+    ui_dashboard_context.peek_cached_status = lambda: {}
+    ui_outputs_data.peek_cached_status = lambda: {}
     ui_reads.peek_cached_status = lambda: {}
     input_operations.commit_and_apply = fake_commit_and_apply
     output_lifecycle_operations.commit_and_apply = fake_commit_and_apply
@@ -240,9 +245,11 @@ def _restore_runtime_patches(state: RuntimePatchState) -> None:
     app_main.build_access_required_response = originals[
         "app_main_build_access_required_response"
     ]
-    ui_shared.collect_status = originals["ui_shared_collect_status"]
+    ui_dashboard_data.collect_status = originals["ui_dashboard_collect_status"]
     status_routes.collect_status = originals["status_collect_status"]
-    ui_shared.peek_cached_status = originals["ui_shared_peek_cached_status"]
+    ui_dashboard_data.peek_cached_status = originals["ui_dashboard_peek_cached_status"]
+    ui_dashboard_context.peek_cached_status = originals["ui_help_peek_cached_status"]
+    ui_outputs_data.peek_cached_status = originals["ui_output_peek_cached_status"]
     ui_reads.peek_cached_status = originals["ui_reads_peek_cached_status"]
     input_operations.commit_and_apply = originals["input_commit_and_apply"]
     output_lifecycle_operations.commit_and_apply = originals[

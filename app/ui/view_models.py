@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-import re
 
+from app.config import Settings
 from app.models.entities import ApplyRun, BackendBackup
 from app.schemas.apply import ApplyResponse
+from app.services.update_service import current_app_version
+from app.static_delivery import stylesheet_asset_version
 
 
 def _format_timestamp(value: datetime | None) -> str | None:
@@ -379,7 +382,7 @@ def _save_job_primary_phase(details: dict[str, object]) -> str:
 
 
 def _save_job_backend_name(details: dict[str, object]) -> str:
-    backend = str(details.get("backend") or "").strip()
+    backend = str(details.get("backend") or details.get("failed_backend") or "").strip()
     if backend:
         return backend
 
@@ -412,6 +415,8 @@ def _save_job_backend_name(details: dict[str, object]) -> str:
 
 
 def _save_job_root_cause(details: dict[str, object]) -> str:
+    if details.get("operator_message"):
+        return str(details["operator_message"])
     phase = (
         str(details.get("phase") or details.get("failed_phase") or "").strip().lower()
     )
@@ -445,6 +450,8 @@ def _save_job_root_cause(details: dict[str, object]) -> str:
 
     stderr = str(details.get("stderr") or "").strip()
     if stderr:
+        if "Traceback (most recent call last):" in stderr:
+            return stderr.splitlines()[-1].strip()
         return stderr.splitlines()[0].strip()
 
     diagnostics = details.get("runtime_diagnostics")
@@ -464,6 +471,8 @@ def _save_job_root_cause(details: dict[str, object]) -> str:
 
     error = str(details.get("error") or "").strip()
     if error and error.lower() != "command failed":
+        if "Traceback (most recent call last):" in error:
+            return error.splitlines()[-1].strip()
         return error
     return error or "save failed"
 
@@ -767,3 +776,11 @@ def _save_apply_feedback(
         None,
         f"Save failed{error_ref}. Existing config is still active. Reason: {reason}",
     )
+
+
+def app_version() -> str:
+    return current_app_version()
+
+
+def stylesheet_version(settings: Settings) -> str:
+    return stylesheet_asset_version(settings.static_files_dir)

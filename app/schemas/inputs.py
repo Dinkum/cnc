@@ -1,6 +1,8 @@
-from typing import Optional
+from typing import Annotated, Optional
 
 from pydantic import BaseModel, Field, field_validator
+
+from app.schemas.updates import UpdateValue
 
 
 INPUT_KIND_PATTERN = "^(domain|shield|tailnet_path|tailnet_service)$"
@@ -27,11 +29,11 @@ class InputIn(BaseModel):
 
 
 class InputUpdate(BaseModel):
-    kind: Optional[str] = Field(default=None, pattern=INPUT_KIND_PATTERN)
-    value: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    kind: UpdateValue[Annotated[str, Field(pattern=INPUT_KIND_PATTERN)]] = None
+    value: UpdateValue[Annotated[str, Field(min_length=1, max_length=255)]] = None
     backend_ids: Optional[list[int]] = None
-    enabled: Optional[bool] = None
-    shield_enabled: Optional[bool] = None
+    enabled: UpdateValue[bool] = None
+    shield_enabled: UpdateValue[bool] = None
     shield_code_hash: Optional[str] = None
     shield_access_code: Optional[str] = None
 

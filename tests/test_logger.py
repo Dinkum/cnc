@@ -11,6 +11,7 @@ from app.logger import (
     bind_log_context,
     configure_logging,
     flush_logging_pipeline,
+    flush_logging_pipeline_async,
     get_logger,
     logging_pipeline_status,
     resolve_log_version,
@@ -404,8 +405,7 @@ async def test_logger_operation_writes_grouped_block_and_events_jsonl(tmp_path) 
     async with logger.operation("apply.run", run_id="run_42") as op:
         op.step("check", "Resolved desired state", backend_count=2)
 
-    for handler in logging.getLogger().handlers:
-        handler.flush()
+    await flush_logging_pipeline_async()
 
     rendered = log_path.read_text(encoding="utf-8")
     events = events_path.read_text(encoding="utf-8").splitlines()

@@ -46,6 +46,8 @@ from app.services.operations import OperationHandle, host_mutation_operation
 from app.services.renderers import container_name, safe_slug
 from app.services.sandbox_profiles import app_sandbox_dir
 from app.services.safe_tar import safe_extract_tar, validate_safe_tar
+from app.services.guest_metadata import GuestArchiveView, guest_tar_filter
+from app.services.guest_isolation import validate_guest_volume_paths
 from app.services.validators import (
     ensure_backend_name,
     ensure_healthcheck_host_header,
@@ -184,6 +186,14 @@ def _resolved_mount_entries(
                 target_path=target_path or None,
                 link_policy="guest",
             )
+            try:
+                # A private ancestor outside the bind survives guest chmods.
+                validate_guest_volume_paths([volume])
+                options = volume.split(":", 2)[2:] or [""]
+                if "ro" not in options[0].split(","):
+                    entries[-1]["ownership_policy"] = "canonical_guest"
+            except (ValueError, OSError):
+                pass
 
     return entries
 
@@ -381,6 +391,7 @@ def _progressing_backup_tar_filter(
     progress_start: int,
     progress_end: int,
     progress_callback: BackupProgressCallback | None,
+    metadata_filter: Callable[[tarfile.TarInfo], tarfile.TarInfo | None] | None = None,
 ) -> Callable[[tarfile.TarInfo], tarfile.TarInfo | None]:
     base_filter = _backup_tar_filter(allow_links=allow_links)
     exported_bytes = 0
@@ -391,6 +402,10 @@ def _progressing_backup_tar_filter(
         filtered = base_filter(tarinfo)
         if filtered is None:
             return None
+        if metadata_filter is not None:
+            filtered = metadata_filter(filtered)
+            if filtered is None:
+                return None
         if filtered.isfile():
             exported_bytes += max(0, int(filtered.size))
             if path_total_bytes > 0 and progress_end > progress_start:
@@ -599,6 +614,11 @@ def _write_backup_bundle(
                 )
         _report_backup_progress(progress_callback, 28, "Collecting mounted paths.")
         metadata = _bundle_metadata(backend, settings)
+        guest_view = (
+            GuestArchiveView.capture(container_name(backend.name), run_command)
+            if backend.kind == "app"
+            else None
+        )
         metadata["container_snapshot"] = snapshot_payload or {
             "included": False,
             "archive_name": CONTAINER_SNAPSHOT_NAME,
@@ -656,6 +676,17 @@ def _write_backup_bundle(
                             progress_start=path_progress_start,
                             progress_end=path_progress_end,
                             progress_callback=progress_callback,
+                            metadata_filter=guest_tar_filter(
+                                source=Path(host_path),
+                                archive_prefix=str(entry["archive_prefix"]),
+                                view=guest_view,
+                                rootfs_prefix="rootfs"
+                                if entry.get("target_path") is None
+                                else "",
+                                include_xattrs=entry.get("target_path") is None,
+                            )
+                            if allow_links and guest_view is not None
+                            else None,
                         ),
                     )
                     _report_backup_progress(
@@ -676,6 +707,8 @@ def _write_backup_bundle(
                     76,
                     f"Compressing backup bundle from {_format_progress_bytes(source_size_bytes)}.",
                 )
+            if guest_view is not None:
+                guest_view.verify(run_command)
             temp_bundle_path.replace(bundle_path)
         except Exception:
             try:
@@ -1013,7 +1046,27 @@ def _validate_bundle_restore_members(
         include=_bundle_restore_member_include(allowed_prefixes),
         allow_relative_symlinks=True,
         guest_symlink_roots=guest_symlink_roots,
+        guest_metadata_roots={
+            str(PurePosixPath(entry["archive_prefix"]) / "rootfs")
+            for entry in metadata.get("mount_entries", [])
+            if isinstance(entry, dict)
+            and entry.get("archive_prefix") in guest_symlink_roots
+            and entry.get("target_path") is None
+        },
+        guest_owner_roots=_bundle_guest_owner_roots(metadata),
     )
+
+
+def _bundle_guest_owner_roots(metadata: dict[str, Any]) -> set[str]:
+    return {
+        str(entry["archive_prefix"])
+        for entry in metadata.get("mount_entries", [])
+        if isinstance(entry, dict)
+        and entry.get("exists")
+        and entry.get("ownership_policy") == "canonical_guest"
+        and isinstance(entry.get("archive_prefix"), str)
+        and entry.get("target_path") is not None
+    }
 
 
 def _backend_payload_fields() -> tuple[str, ...]:
@@ -1533,6 +1586,14 @@ def _extract_bundle_entries(
             include=_bundle_restore_member_include(allowed_prefixes),
             allow_relative_symlinks=True,
             guest_symlink_roots=guest_symlink_roots,
+            guest_metadata_roots={
+                str(PurePosixPath(entry["archive_prefix"]) / "rootfs")
+                for entry in metadata.get("mount_entries", [])
+                if isinstance(entry, dict)
+                and entry.get("archive_prefix") in guest_symlink_roots
+                and entry.get("target_path") is None
+            },
+            guest_owner_roots=_bundle_guest_owner_roots(metadata),
         )
 
 
@@ -1585,6 +1646,12 @@ class _RestoreBundleTransaction:
                     continue
 
                 target_path = Path(host_path)
+                if entry.get("archive_prefix") in _bundle_guest_owner_roots(
+                    self.metadata
+                ):
+                    validate_guest_volume_paths(
+                        [f"{target_path}:/:rw"], allow_missing=True
+                    )
                 target_path.parent.mkdir(parents=True, exist_ok=True)
                 stage_path = (
                     target_path.parent
@@ -1599,6 +1666,11 @@ class _RestoreBundleTransaction:
                 if rollback_path.exists() or rollback_path.is_symlink():
                     _remove_existing_path(rollback_path)
                 shutil.move(str(extracted_path), str(stage_path))
+                if (
+                    entry.get("link_policy") == "guest"
+                    and entry.get("target_path") is None
+                ):
+                    stage_path.chmod(0o700)
                 had_existing = target_path.exists() or target_path.is_symlink()
                 self._staged_entries.append(
                     (stage_path, target_path, rollback_path, had_existing)

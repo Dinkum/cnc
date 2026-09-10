@@ -1,10 +1,16 @@
+import app.ui.cluster as ui_cluster
+import app.ui.dashboard.context as ui_dashboard_context
+import app.ui.dashboard.data as ui_dashboard_data
+import app.ui.http as ui_http
+import app.ui.settings as ui_settings_view
+
 from .support import (
     Path,
     Settings,
     SimpleNamespace,
-    _PostedRequest,
     _dashboard_client_source,
     _make_session,
+    _PostedRequest,
     _request,
     app_main,
     asyncio,
@@ -12,7 +18,6 @@ from .support import (
     os,
     ui_pages,
     ui_settings,
-    ui_shared,
 )
 
 
@@ -35,9 +40,9 @@ async def test_dashboard_settings_tab_uses_minimal_status_when_cache_empty(
     async def fail_cluster_nodes(*_args, **_kwargs):
         raise AssertionError("disabled multi-node mode should not build node summaries")
 
-    monkeypatch.setattr(ui_shared, "collect_status", fail_collect_status)
-    monkeypatch.setattr(ui_shared, "peek_cached_status", lambda: None)
-    monkeypatch.setattr(ui_shared, "_cluster_nodes", fail_cluster_nodes)
+    monkeypatch.setattr(ui_dashboard_data, "collect_status", fail_collect_status)
+    monkeypatch.setattr(ui_dashboard_data, "peek_cached_status", lambda: None)
+    monkeypatch.setattr(ui_cluster, "cluster_nodes", fail_cluster_nodes)
 
     async with maker() as session:
         response = await ui_pages.dashboard(
@@ -83,9 +88,12 @@ async def test_update_form_returns_conflict_when_no_new_version_is_available(
         )
 
     monkeypatch.setattr(ui_settings, "enforce_csrf", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(ui_shared, "_dashboard_context", fake_dashboard_context)
+    monkeypatch.setattr(
+        ui_dashboard_context, "dashboard_context", fake_dashboard_context
+    )
+    monkeypatch.setattr(ui_http, "dashboard_context", fake_dashboard_context)
     monkeypatch.setattr(ui_settings, "run_update", fake_run_update)
-    monkeypatch.setattr(ui_shared.templates, "TemplateResponse", fake_template_response)
+    monkeypatch.setattr(ui_http.templates, "TemplateResponse", fake_template_response)
 
     request = _PostedRequest(path="/ui/update")
     response = await ui_settings.update_form(
@@ -125,7 +133,7 @@ async def test_update_beta_settings_form_persists_routing_toggle(
         assert response.headers["location"] == "/?tab=settings"
         assert next_settings.beta_routing is True
         assert "BETA_ROUTING=true" in env_path.read_text(encoding="utf-8")
-        assert ui_shared.FLASH_SUCCESS_COOKIE in response.headers["set-cookie"]
+        assert ui_http.FLASH_SUCCESS_COOKIE in response.headers["set-cookie"]
     finally:
         monkeypatch.delenv("BETA_ROUTING", raising=False)
 
@@ -146,8 +154,8 @@ async def test_settings_nodes_ui_renders_cluster_modals_when_enabled(
     async def fail_collect_status(*_args, **_kwargs):
         raise AssertionError("settings tab should not block on live status collection")
 
-    monkeypatch.setattr(ui_shared, "collect_status", fail_collect_status)
-    monkeypatch.setattr(ui_shared, "peek_cached_status", lambda: None)
+    monkeypatch.setattr(ui_dashboard_data, "collect_status", fail_collect_status)
+    monkeypatch.setattr(ui_dashboard_data, "peek_cached_status", lambda: None)
 
     async with maker() as session:
         response = await ui_pages.dashboard(
@@ -196,7 +204,7 @@ async def test_update_beta_settings_form_persists_shield_toggle(
         assert response.headers["location"] == "/?tab=settings"
         assert next_settings.shield_enabled is True
         assert "SHIELD_ENABLED=true" in env_path.read_text(encoding="utf-8")
-        assert ui_shared.FLASH_SUCCESS_COOKIE in response.headers["set-cookie"]
+        assert ui_http.FLASH_SUCCESS_COOKIE in response.headers["set-cookie"]
     finally:
         monkeypatch.delenv("SHIELD_ENABLED", raising=False)
 
@@ -262,7 +270,7 @@ async def test_update_beta_settings_form_reports_only_failure_when_apply_fails(
         )
 
     monkeypatch.setattr(ui_settings, "enforce_csrf", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(ui_settings, "_host_mutation_preflight_message", fake_preflight)
+    monkeypatch.setattr(ui_settings, "host_mutation_preflight_message", fake_preflight)
     monkeypatch.setattr(ui_settings, "run_apply", fake_run_apply)
 
     try:
@@ -285,11 +293,11 @@ async def test_update_beta_settings_form_reports_only_failure_when_apply_fails(
     success_headers = [
         value
         for value in cookie_headers
-        if value.startswith(f"{ui_shared.FLASH_SUCCESS_COOKIE}=")
+        if value.startswith(f"{ui_http.FLASH_SUCCESS_COOKIE}=")
     ]
     assert success_headers and all("Max-Age=0" in value for value in success_headers)
     assert any(
-        value.startswith(f"{ui_shared.FLASH_ERROR_COOKIE}=")
+        value.startswith(f"{ui_http.FLASH_ERROR_COOKIE}=")
         and "Netdata setting could not be applied" in value
         and "Max-Age=60" in value
         for value in cookie_headers
@@ -318,11 +326,14 @@ async def test_update_notification_settings_form_tests_without_saving(
         return SimpleNamespace(status_code=status_code)
 
     monkeypatch.setattr(ui_settings, "enforce_csrf", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(ui_shared, "_dashboard_context", fake_dashboard_context)
+    monkeypatch.setattr(
+        ui_dashboard_context, "dashboard_context", fake_dashboard_context
+    )
+    monkeypatch.setattr(ui_http, "dashboard_context", fake_dashboard_context)
     monkeypatch.setattr(
         ui_settings, "send_pushover_notification_async", fake_send_notification
     )
-    monkeypatch.setattr(ui_shared.templates, "TemplateResponse", fake_template_response)
+    monkeypatch.setattr(ui_http.templates, "TemplateResponse", fake_template_response)
 
     request = _PostedRequest(path="/ui/settings/notifications")
     response = await ui_settings.update_notification_settings_form(
@@ -363,7 +374,7 @@ async def test_update_notification_settings_form_preserves_masked_values(
             "flash_error": None,
             "flash_success": None,
             "active_tab": "home",
-            "notification_settings": ui_shared._notification_settings_summary(
+            "notification_settings": ui_settings_view._notification_settings_summary(
                 _settings
             ),
         }
@@ -376,8 +387,11 @@ async def test_update_notification_settings_form_preserves_masked_values(
         return SimpleNamespace(status_code=status_code)
 
     monkeypatch.setattr(ui_settings, "enforce_csrf", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(ui_shared, "_dashboard_context", fake_dashboard_context)
-    monkeypatch.setattr(ui_shared.templates, "TemplateResponse", fake_template_response)
+    monkeypatch.setattr(
+        ui_dashboard_context, "dashboard_context", fake_dashboard_context
+    )
+    monkeypatch.setattr(ui_http, "dashboard_context", fake_dashboard_context)
+    monkeypatch.setattr(ui_http.templates, "TemplateResponse", fake_template_response)
 
     response = await ui_settings.update_notification_settings_form(
         _PostedRequest(path="/ui/settings/notifications"),
@@ -410,7 +424,7 @@ def test_notification_settings_summary_displays_masked_configured_values() -> No
         pushover_user_key="fixture-user-key",
     )
 
-    summary = ui_shared._notification_settings_summary(settings)
+    summary = ui_settings_view._notification_settings_summary(settings)
 
     assert summary["app_token_display"] == mask_secret(settings.pushover_app_token)
     assert summary["user_key_display"] == mask_secret(settings.pushover_user_key)
@@ -423,7 +437,7 @@ def test_notification_settings_summary_leaves_unconfigured_inputs_empty(
 ) -> None:
     monkeypatch.delenv("PUSHOVER_APP_TOKEN", raising=False)
     monkeypatch.delenv("PUSHOVER_USER_KEY", raising=False)
-    summary = ui_shared._notification_settings_summary(Settings())
+    summary = ui_settings_view._notification_settings_summary(Settings())
 
     assert summary["app_token_masked"] == "off"
     assert summary["user_key_masked"] == "off"
@@ -448,7 +462,7 @@ async def test_notification_settings_save_is_visible_to_unhandled_exception_hand
             "flash_error": None,
             "flash_success": None,
             "active_tab": "home",
-            "notification_settings": ui_shared._notification_settings_summary(
+            "notification_settings": ui_settings_view._notification_settings_summary(
                 _settings
             ),
         }
@@ -465,8 +479,11 @@ async def test_notification_settings_save_is_visible_to_unhandled_exception_hand
         return True
 
     monkeypatch.setattr(ui_settings, "enforce_csrf", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(ui_shared, "_dashboard_context", fake_dashboard_context)
-    monkeypatch.setattr(ui_shared.templates, "TemplateResponse", fake_template_response)
+    monkeypatch.setattr(
+        ui_dashboard_context, "dashboard_context", fake_dashboard_context
+    )
+    monkeypatch.setattr(ui_http, "dashboard_context", fake_dashboard_context)
+    monkeypatch.setattr(ui_http.templates, "TemplateResponse", fake_template_response)
     monkeypatch.setattr(app_main, "send_pushover_notification_async", fake_notify)
 
     try:

@@ -259,6 +259,7 @@ install_packages() {
     logrotate \
     nginx \
     podman \
+    apparmor \
     python3 \
     python3-pip \
     python3-venv \
@@ -1265,6 +1266,8 @@ EOF
 }
 
 write_backend_ssh_assets() {
+  run_cmd "${CURRENT_LINK}/.venv/bin/python" -c \
+    'from app.config import get_settings; from app.services.runtime_assets import reconcile_guest_runtime_helper; reconcile_guest_runtime_helper(get_settings())' || return $?
   local wrapper_template="${APP_DIR}/${PACKAGED_SSH_BACKEND_ROOT_WRAPPER_PATH}"
   [[ -f "${wrapper_template}" ]] || fail "missing packaged backend SSH wrapper: ${wrapper_template}"
   sed 's/__CNC_ADMIN_PORT__/9090/g' "${wrapper_template}" \

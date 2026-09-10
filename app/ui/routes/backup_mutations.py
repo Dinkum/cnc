@@ -3,12 +3,32 @@ from __future__ import annotations
 import asyncio
 import shutil
 import tempfile
+from pathlib import Path
+
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    Form,
+    Request,
+    UploadFile,
+)
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    Response,
+)
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.config import Settings
 from app.dependencies import (
     db_session_dependency,
     settings_dependency,
 )
+from app.logger import get_logger
 from app.models.entities import Backend
 from app.security import enforce_csrf
 from app.services import backend_commands
@@ -49,12 +69,25 @@ from app.services.placement_config import (
 from app.services.replica_readiness import validate_replica_readiness_for_nodes
 from app.services.status_service import invalidate_status_cache
 from app.services.validators import ValidationError
+from app.ui.dashboard.context import cached_dashboard_context
+from app.ui.errors import operator_coded_error as _operator_coded_error
 from app.ui.errors import (
-    operator_coded_error as _operator_coded_error,
     operator_coded_message_payload as _operator_coded_message_payload,
-    operator_error_json as _operator_error_json,
 )
-from app.ui.forms import _backend_clone_payload_from_form
+from app.ui.errors import operator_error_json as _operator_error_json
+from app.ui.forms import _backend_clone_payload_from_form, operator_validation_error
+from app.ui.http import (
+    copy_upload_file_with_limit,
+    form_truthy,
+    json_save_feedback,
+    render_dashboard_template,
+    render_output_template,
+    request_prefers_json,
+)
+from app.ui.mutation_feedback import (
+    host_mutation_blocked_message,
+    host_mutation_preflight_message,
+)
 from app.ui.operations.backups import (
     _run_backup_operation,
     _run_clone_operation,
@@ -67,43 +100,14 @@ from app.ui.operations.cluster import (
     _run_transfer_operation,
 )
 from app.ui.operations.common import operation_response as _operation_response
+from app.ui.outputs.context import output_page_context
 from app.ui.progress import _operation_progress_details
-from app.ui.routes.shared import (
-    _cached_dashboard_context,
-    _copy_upload_file_with_limit,
-    _form_truthy,
-    _host_mutation_blocked_message,
-    _host_mutation_preflight_message,
-    _json_save_feedback,
-    _operator_validation_error,
-    _output_page_context,
-    _render_dashboard_template,
-    _render_output_template,
-    _request_prefers_json,
-    logger,
-)
 from app.ui.view_models import (
     _format_bytes,
     _save_apply_feedback,
 )
-from fastapi import (
-    APIRouter,
-    BackgroundTasks,
-    Depends,
-    File,
-    Form,
-    Request,
-    UploadFile,
-)
-from fastapi.responses import (
-    HTMLResponse,
-    JSONResponse,
-    Response,
-)
-from pathlib import Path
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+
+logger = get_logger("ui")
 
 
 router = APIRouter(tags=["ui"])
@@ -112,7 +116,7 @@ router = APIRouter(tags=["ui"])
 async def _backup_mutation_preflight(
     settings: Settings, *, action: str
 ) -> JSONResponse | None:
-    message = await _host_mutation_preflight_message(settings, action=action)
+    message = await host_mutation_preflight_message(settings, action=action)
     if message is None:
         return None
     return _operator_error_json(
@@ -141,23 +145,23 @@ async def backup_backend_form(
         )
     ).scalar_one_or_none()
     if backend is None:
-        if _request_prefers_json(request):
+        if request_prefers_json(request):
             return _operator_error_json(
                 "output not found",
                 ErrorCode.UI_RESOURCE_NOT_FOUND,
                 key="flash_error",
                 status_code=404,
             )
-        context = await _cached_dashboard_context(
+        context = await cached_dashboard_context(
             session, settings, active_tab="outputs"
         )
         context["request"] = request
         context["flash_error"] = "output not found"
-        return _render_dashboard_template(request, context, status_code=404)
+        return render_dashboard_template(request, context, status_code=404)
     blocked = await _backup_mutation_preflight(settings, action="Backup")
     if blocked is not None:
         return blocked
-    if _request_prefers_json(request):
+    if request_prefers_json(request):
         operation = await create_operation(
             settings,
             kind="backup_backend",
@@ -179,15 +183,15 @@ async def backup_backend_form(
         response = _operation_response(operation, message="Backup started.")
         return response
     backup = await create_backend_backup(session, backend, settings)
-    context = await _output_page_context(session, settings, backend_id)
+    context = await output_page_context(session, settings, backend_id)
     context["request"] = request
     if backup.status == "success":
         context["flash_success"] = (
             f"Backup created: {backup.scope} ({_format_bytes(backup.size_bytes)})."
         )
-        return _render_output_template(request, settings, context, status_code=200)
+        return render_output_template(request, settings, context, status_code=200)
     context["flash_error"] = f"Backup failed: {backup.error or 'unknown error'}"
-    return _render_output_template(request, settings, context, status_code=500)
+    return render_output_template(request, settings, context, status_code=500)
 
 
 @router.post("/ui/backends/{backend_id}/restore")
@@ -210,23 +214,23 @@ async def restore_backend_form(
         )
     ).scalar_one_or_none()
     if backend is None:
-        if _request_prefers_json(request):
+        if request_prefers_json(request):
             return _operator_error_json(
                 "output not found",
                 ErrorCode.UI_RESOURCE_NOT_FOUND,
                 key="flash_error",
                 status_code=404,
             )
-        context = await _cached_dashboard_context(
+        context = await cached_dashboard_context(
             session, settings, active_tab="outputs"
         )
         context["request"] = request
         context["flash_error"] = "output not found"
-        return _render_dashboard_template(request, context, status_code=404)
+        return render_dashboard_template(request, context, status_code=404)
     blocked = await _backup_mutation_preflight(settings, action="Restore")
     if blocked is not None:
         return blocked
-    if _request_prefers_json(request):
+    if request_prefers_json(request):
         operation = await create_operation(
             settings,
             kind="restore_backend",
@@ -266,7 +270,7 @@ async def restore_backend_form(
                 session, backend, selected_backup, settings
             )
             restored_backup = selected_backup
-        context = await _output_page_context(session, settings, backend_id)
+        context = await output_page_context(session, settings, backend_id)
         context["request"] = request
         restored_paths = restore_result.get("restored_paths") or []
         backup_label = (
@@ -281,19 +285,19 @@ async def restore_backend_form(
             )
         else:
             context["flash_success"] = f"Restore completed from {backup_label}."
-        return _render_output_template(request, settings, context, status_code=200)
+        return render_output_template(request, settings, context, status_code=200)
     except LookupError as exc:
-        context = await _output_page_context(session, settings, backend_id)
+        context = await output_page_context(session, settings, backend_id)
         context["request"] = request
         context["flash_error"] = _operator_coded_error(
             str(exc), ErrorCode.UI_RESOURCE_NOT_FOUND
         )
-        return _render_output_template(request, settings, context, status_code=404)
+        return render_output_template(request, settings, context, status_code=404)
     except Exception as exc:
-        context = await _output_page_context(session, settings, backend_id)
+        context = await output_page_context(session, settings, backend_id)
         context["request"] = request
         context["flash_error"] = f"Restore failed: {exc}"
-        return _render_output_template(request, settings, context, status_code=400)
+        return render_output_template(request, settings, context, status_code=400)
 
 
 @router.post("/ui/backends/{backend_id}/backups/{backup_id}/delete")
@@ -315,39 +319,39 @@ async def delete_backup_form(
         )
     ).scalar_one_or_none()
     if backend is None:
-        if _request_prefers_json(request):
+        if request_prefers_json(request):
             return _operator_error_json(
                 "output not found",
                 ErrorCode.UI_RESOURCE_NOT_FOUND,
                 key="flash_error",
                 status_code=404,
             )
-        context = await _cached_dashboard_context(
+        context = await cached_dashboard_context(
             session, settings, active_tab="outputs"
         )
         context["request"] = request
         context["flash_error"] = "output not found"
-        return _render_dashboard_template(request, context, status_code=404)
+        return render_dashboard_template(request, context, status_code=404)
 
     backup = await get_backend_backup(session, backend.id, backup_id)
     if backup is None:
-        if _request_prefers_json(request):
+        if request_prefers_json(request):
             return _operator_error_json(
                 "backup not found for this output",
                 ErrorCode.UI_RESOURCE_NOT_FOUND,
                 key="flash_error",
                 status_code=404,
             )
-        context = await _output_page_context(session, settings, backend_id)
+        context = await output_page_context(session, settings, backend_id)
         context["request"] = request
         context["flash_error"] = "backup not found for this output"
-        return _render_output_template(request, settings, context, status_code=404)
+        return render_output_template(request, settings, context, status_code=404)
 
     blocked = await _backup_mutation_preflight(settings, action="Backup delete")
     if blocked is not None:
         return blocked
 
-    if _request_prefers_json(request):
+    if request_prefers_json(request):
         operation = await create_operation(
             settings,
             kind="delete_backend_backup",
@@ -369,15 +373,15 @@ async def delete_backup_form(
 
     try:
         await delete_backend_backup(session, backend.id, backup_id, settings)
-        context = await _output_page_context(session, settings, backend_id)
+        context = await output_page_context(session, settings, backend_id)
         context["request"] = request
         context["flash_success"] = f"Backup #{backup_id} deleted."
-        return _render_output_template(request, settings, context, status_code=200)
+        return render_output_template(request, settings, context, status_code=200)
     except Exception as exc:
-        context = await _output_page_context(session, settings, backend_id)
+        context = await output_page_context(session, settings, backend_id)
         context["request"] = request
         context["flash_error"] = f"Backup delete failed: {exc}"
-        return _render_output_template(request, settings, context, status_code=400)
+        return render_output_template(request, settings, context, status_code=400)
 
 
 @router.post("/ui/backends/{backend_id}/import")
@@ -399,32 +403,32 @@ async def import_restore_backend_form(
         )
     ).scalar_one_or_none()
     if backend is None:
-        if _request_prefers_json(request):
+        if request_prefers_json(request):
             return _operator_error_json(
                 "output not found",
                 ErrorCode.UI_RESOURCE_NOT_FOUND,
                 key="flash_error",
                 status_code=404,
             )
-        context = await _cached_dashboard_context(
+        context = await cached_dashboard_context(
             session, settings, active_tab="outputs"
         )
         context["request"] = request
         context["flash_error"] = "output not found"
-        return _render_dashboard_template(request, context, status_code=404)
+        return render_dashboard_template(request, context, status_code=404)
 
     if not bundle.filename:
-        if _request_prefers_json(request):
+        if request_prefers_json(request):
             return _operator_error_json(
                 "backup file is required",
                 ErrorCode.VALIDATION_FAILED,
                 key="flash_error",
                 status_code=400,
             )
-        context = await _output_page_context(session, settings, backend_id)
+        context = await output_page_context(session, settings, backend_id)
         context["request"] = request
         context["flash_error"] = "backup file is required"
-        return _render_output_template(request, settings, context, status_code=400)
+        return render_output_template(request, settings, context, status_code=400)
 
     blocked = await _backup_mutation_preflight(settings, action="Backup import")
     if blocked is not None:
@@ -434,12 +438,12 @@ async def import_restore_backend_form(
     temp_path = temp_dir / Path(bundle.filename).name
     try:
         await asyncio.to_thread(
-            _copy_upload_file_with_limit,
+            copy_upload_file_with_limit,
             bundle.file,
             temp_path,
             max_bytes=settings.backend_backup_upload_max_bytes,
         )
-        if _request_prefers_json(request):
+        if request_prefers_json(request):
             operation = await create_operation(
                 settings,
                 kind="import_backend_backup",
@@ -475,13 +479,13 @@ async def import_restore_backend_form(
         )
         if imported_backup.status != "success":
             raise RuntimeError(imported_backup.error or "backup import failed")
-        context = await _output_page_context(session, settings, backend_id)
+        context = await output_page_context(session, settings, backend_id)
         context["request"] = request
         context["flash_success"] = f"Backup #{imported_backup.id} imported."
-        return _render_output_template(request, settings, context, status_code=200)
+        return render_output_template(request, settings, context, status_code=200)
     except Exception as exc:
         status_code = 413 if isinstance(exc, ValueError) else 400
-        if _request_prefers_json(request):
+        if request_prefers_json(request):
             shutil.rmtree(temp_dir, ignore_errors=True)
             return _operator_error_json(
                 f"Import failed: {exc}",
@@ -489,10 +493,10 @@ async def import_restore_backend_form(
                 key="flash_error",
                 status_code=status_code,
             )
-        context = await _output_page_context(session, settings, backend_id)
+        context = await output_page_context(session, settings, backend_id)
         context["request"] = request
         context["flash_error"] = f"Import failed: {exc}"
-        return _render_output_template(
+        return render_output_template(
             request, settings, context, status_code=status_code
         )
     finally:
@@ -500,7 +504,7 @@ async def import_restore_backend_form(
             bundle.file.close()
         except Exception:
             pass
-        if not _request_prefers_json(request):
+        if not request_prefers_json(request):
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 
@@ -536,7 +540,7 @@ async def clone_backend_form(
 
     try:
         payload = _backend_clone_payload_from_form(name=name, port=port)
-        if _request_prefers_json(request):
+        if request_prefers_json(request):
             operation = await create_operation(
                 settings,
                 kind="clone_backend",
@@ -583,7 +587,7 @@ async def clone_backend_form(
         await session.rollback()
         return JSONResponse(
             _operator_coded_message_payload(
-                _operator_validation_error(exc),
+                operator_validation_error(exc),
                 key="error",
                 error_code=ErrorCode.VALIDATION_FAILED,
             ),
@@ -633,7 +637,7 @@ async def transfer_backend_form(
     blocker = await active_host_mutation_blocker(settings)
     if blocker is not None:
         return JSONResponse(
-            {"flash_error": _host_mutation_blocked_message("Transfer", blocker)},
+            {"flash_error": host_mutation_blocked_message("Transfer", blocker)},
             status_code=409,
         )
     operation = await create_operation(
@@ -704,7 +708,7 @@ async def setup_backend_replica_form(
     blocker = await active_host_mutation_blocker(settings)
     if blocker is not None:
         return JSONResponse(
-            {"flash_error": _host_mutation_blocked_message("Replica setup", blocker)},
+            {"flash_error": host_mutation_blocked_message("Replica setup", blocker)},
             status_code=409,
         )
     operation = await create_operation(
@@ -743,7 +747,7 @@ async def update_backend_placement_form(
     session: AsyncSession = Depends(db_session_dependency),
 ) -> Response:
     enforce_csrf(request, settings, csrf_token)
-    prefers_json = _request_prefers_json(request)
+    prefers_json = request_prefers_json(request)
     if not settings.multi_node_enabled:
         if prefers_json:
             return _operator_error_json(
@@ -752,10 +756,10 @@ async def update_backend_placement_form(
                 key="flash_error",
                 status_code=400,
             )
-        context = await _output_page_context(session, settings, backend_id)
+        context = await output_page_context(session, settings, backend_id)
         context["request"] = request
         context["flash_error"] = "multi node mode is disabled"
-        return _render_output_template(request, settings, context, status_code=400)
+        return render_output_template(request, settings, context, status_code=400)
 
     backend = (
         await session.execute(select(Backend).where(Backend.id == backend_id))
@@ -768,12 +772,12 @@ async def update_backend_placement_form(
                 key="flash_error",
                 status_code=404,
             )
-        context = await _cached_dashboard_context(
+        context = await cached_dashboard_context(
             session, settings, active_tab="outputs"
         )
         context["request"] = request
         context["flash_error"] = "output not found"
-        return _render_dashboard_template(request, context, status_code=404)
+        return render_dashboard_template(request, context, status_code=404)
     if backend.kind != "app":
         if prefers_json:
             return _operator_error_json(
@@ -782,25 +786,25 @@ async def update_backend_placement_form(
                 key="flash_error",
                 status_code=400,
             )
-        context = await _output_page_context(session, settings, backend_id)
+        context = await output_page_context(session, settings, backend_id)
         context["request"] = request
         context["flash_error"] = (
             "multi-node placement is only available for app outputs"
         )
-        return _render_output_template(request, settings, context, status_code=400)
+        return render_output_template(request, settings, context, status_code=400)
 
     blocker = await active_host_mutation_blocker(settings)
     if blocker is not None:
-        flash_error = _host_mutation_blocked_message("Multi-node placement", blocker)
+        flash_error = host_mutation_blocked_message("Multi-node placement", blocker)
         if prefers_json:
             return JSONResponse({"flash_error": flash_error}, status_code=409)
-        context = await _output_page_context(session, settings, backend_id)
+        context = await output_page_context(session, settings, backend_id)
         context["request"] = request
         context["flash_error"] = flash_error
-        return _render_output_template(request, settings, context, status_code=409)
+        return render_output_template(request, settings, context, status_code=409)
 
     form = await request.form()
-    enabled = _form_truthy(form.get("placement_enabled"))
+    enabled = form_truthy(form.get("placement_enabled"))
     mode = str(form.get("placement_mode") or PLACEMENT_MODE_FAILOVER).strip().lower()
     current_placement = read_backend_placement(backend)
     active_node_uid = clean_node_uid(
@@ -886,7 +890,7 @@ async def update_backend_placement_form(
         await session.refresh(backend)
         placement = read_backend_placement(backend)
         if prefers_json:
-            return _json_save_feedback(
+            return json_save_feedback(
                 apply_response,
                 success_message="Multi-node saved.",
                 failure_prefix="Multi-node saved",
@@ -906,7 +910,7 @@ async def update_backend_placement_form(
                     ],
                 },
             )
-        context = await _output_page_context(session, settings, backend_id)
+        context = await output_page_context(session, settings, backend_id)
         context["request"] = request
         success_flash, error_flash = _save_apply_feedback(
             apply_response,
@@ -915,7 +919,7 @@ async def update_backend_placement_form(
         )
         context["flash_success"] = success_flash
         context["flash_error"] = error_flash
-        return _render_output_template(request, settings, context, status_code=200)
+        return render_output_template(request, settings, context, status_code=200)
     except ConcurrentInterfaceUpdateError as exc:
         await session.rollback()
         message = str(exc)
@@ -926,13 +930,13 @@ async def update_backend_placement_form(
                 key="flash_error",
                 status_code=409,
             )
-        context = await _output_page_context(session, settings, backend_id)
+        context = await output_page_context(session, settings, backend_id)
         context["request"] = request
         context["flash_error"] = message
-        return _render_output_template(request, settings, context, status_code=409)
+        return render_output_template(request, settings, context, status_code=409)
     except ValidationError as exc:
         await session.rollback()
-        message = _operator_validation_error(exc)
+        message = operator_validation_error(exc)
         if prefers_json:
             return JSONResponse(
                 _operator_coded_message_payload(
@@ -942,10 +946,10 @@ async def update_backend_placement_form(
                 ),
                 status_code=400,
             )
-        context = await _output_page_context(session, settings, backend_id)
+        context = await output_page_context(session, settings, backend_id)
         context["request"] = request
         context["flash_error"] = message
-        return _render_output_template(request, settings, context, status_code=400)
+        return render_output_template(request, settings, context, status_code=400)
     except Exception as exc:
         await session.rollback()
         logger.exception(
@@ -961,7 +965,7 @@ async def update_backend_placement_form(
                 key="flash_error",
                 status_code=400,
             )
-        context = await _output_page_context(session, settings, backend_id)
+        context = await output_page_context(session, settings, backend_id)
         context["request"] = request
         context["flash_error"] = message
-        return _render_output_template(request, settings, context, status_code=400)
+        return render_output_template(request, settings, context, status_code=400)

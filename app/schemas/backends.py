@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Annotated, Optional
 
 from pydantic import BaseModel, Field, field_validator
+
+from app.schemas.updates import UpdateValue
 
 BACKEND_KIND_PATTERN = "^(static|app|shield)$"
 
@@ -37,25 +39,27 @@ class BackendIn(BaseModel):
 
 
 class BackendUpdate(BaseModel):
-    name: Optional[str] = Field(default=None, min_length=1, max_length=255)
-    kind: Optional[str] = Field(default=None, pattern=BACKEND_KIND_PATTERN)
+    name: UpdateValue[Annotated[str, Field(min_length=1, max_length=255)]] = None
+    kind: UpdateValue[Annotated[str, Field(pattern=BACKEND_KIND_PATTERN)]] = None
     port: Optional[int] = None
     static_root: Optional[str] = None
     sandbox_profile: Optional[str] = None
-    handoff_port: Optional[int] = Field(default=None, ge=1, le=65535)
+    handoff_port: UpdateValue[Annotated[int, Field(ge=1, le=65535)]] = None
     healthcheck_mode: Optional[str] = None
     healthcheck_path: Optional[str] = None
     healthcheck_host_header: Optional[str] = None
-    resource_mode: Optional[str] = Field(default=None, pattern="^(auto|manual)$")
-    resource_size: Optional[str] = Field(default=None, pattern="^(small|medium|large)$")
+    resource_mode: UpdateValue[Annotated[str, Field(pattern="^(auto|manual)$")]] = None
+    resource_size: UpdateValue[
+        Annotated[str, Field(pattern="^(small|medium|large)$")]
+    ] = None
     memory_high_override: Optional[str] = None
     memory_max_override: Optional[str] = None
     cpu_quota_override: Optional[str] = None
-    shield_enabled: Optional[bool] = None
+    shield_enabled: UpdateValue[bool] = None
     shield_code_hash: Optional[str] = None
     shield_access_code: Optional[str] = None
-    volumes_json: Optional[str] = None
-    enabled: Optional[bool] = None
+    volumes_json: UpdateValue[str] = None
+    enabled: UpdateValue[bool] = None
     notes: Optional[str] = None
     input_ids: Optional[list[int]] = None
 

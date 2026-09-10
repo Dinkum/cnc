@@ -16,4 +16,5 @@ def test_ui_aggregator_contains_only_surface_owned_routes() -> None:
         "app.ui.routes.pages",
         "app.ui.routes.reads",
         "app.ui.routes.settings_mutations",
+        "app.ui.routes.ssh_keys",
     }

@@ -20,6 +20,22 @@
     }
   };
 
+  const withRequestDeadline = async (request, { controller = new AbortController(), timeoutMs = 30000 } = {}) => {
+    const timer = window.setTimeout(() => {
+      controller.abort(new DOMException("Request timed out", "TimeoutError"));
+    }, timeoutMs);
+    try {
+      // Include body consumption: receiving headers does not finish a request.
+      return await request(controller.signal);
+    } catch (error) {
+      // Body readers may report AbortError even for a deadline. Preserve the
+      // reason so pollers distinguish timeouts from deliberate cancellation.
+      throw controller.signal.aborted ? controller.signal.reason || error : error;
+    } finally {
+      window.clearTimeout(timer);
+    }
+  };
+
   const readJsonScript = (id, fallback = {}) => {
     const element = document.getElementById(id);
     if (!element?.textContent?.trim()) return fallback;
@@ -93,10 +109,16 @@
       const payload = getPayload();
       return payload?.available && payload?.series?.length ? payload : null;
     };
-    control.disabled = !available();
-    control.onchange = () => {
-      const format = control.value;
-      control.value = "";
+    const toggle = control.querySelector?.("[data-export-toggle]");
+    const options = control.querySelector?.(".metric-export-options");
+    const close = () => {
+      if (!toggle || !options) return;
+      options.hidden = true;
+      toggle.setAttribute("aria-expanded", "false");
+    };
+    (toggle || control).disabled = !available();
+    if (!available()) close();
+    const download = (format) => {
       const payload = available();
       if (!payload || !["csv", "json"].includes(format)) return;
       const content = format === "csv" ? metricCsv(payload, scope) : JSON.stringify(payload, null, 2) + "\n";
@@ -110,6 +132,39 @@
       anchor.remove();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
     };
+    if (!toggle || !options) {
+      control.onchange = () => {
+        const format = control.value;
+        control.value = "";
+        download(format);
+      };
+      return;
+    }
+    toggle.onclick = () => {
+      options.hidden = !options.hidden;
+      toggle.setAttribute("aria-expanded", String(!options.hidden));
+    };
+    control.querySelectorAll("[data-export-format]").forEach((button) => {
+      button.onclick = () => {
+        download(button.dataset.exportFormat);
+        close();
+        toggle.focus();
+      };
+    });
+    control.onkeydown = (event) => {
+      if (event.key !== "Escape") return;
+      close();
+      toggle.focus();
+    };
+    control.onfocusout = (event) => {
+      if (!control.contains(event.relatedTarget)) close();
+    };
+    if (!control.dataset.exportBound) {
+      document.addEventListener("click", (event) => {
+        if (!control.contains(event.target)) close();
+      });
+      control.dataset.exportBound = "true";
+    }
   };
 
   const normalizeTimestampValue = (value) => {
@@ -160,5 +215,6 @@
     readJsonResponse,
     readJsonScript,
     renderLocalTimes,
+    withRequestDeadline,
   });
 })();

@@ -1,3 +1,7 @@
+import app.services.resource_profile as app_services_resource_profile
+import app.ui.outputs.context as ui_outputs_context
+import app.ui.resources as ui_resources
+
 from .support import (
     ApplyResponse,
     Backend,
@@ -6,15 +10,14 @@ from .support import (
     Path,
     Settings,
     SimpleNamespace,
-    _PostedRequest,
     _make_session,
+    _PostedRequest,
     json,
     make_code_hash,
     select,
     selectinload,
     ui_output,
     ui_reads,
-    ui_shared,
 )
 
 
@@ -57,7 +60,7 @@ async def test_output_resource_limits_use_full_enabled_app_mix(
         session.add_all([web, large_neighbor])
         await session.commit()
 
-        context = await ui_shared._output_page_context(
+        context = await ui_outputs_context.output_page_context(
             session, settings, web.id, prefer_cached_runtime=True
         )
         memory_payload = await ui_reads.output_metric_history(
@@ -68,30 +71,36 @@ async def test_output_resource_limits_use_full_enabled_app_mix(
             session=session,
         )
 
-        full_mix_profile = ui_shared.build_resource_profile(
+        full_mix_profile = app_services_resource_profile.build_resource_profile(
             settings, [web, large_neighbor]
         )
-        selected_only_profile = ui_shared.build_resource_profile(settings, [web])
-        expected = ui_shared.backend_resource_profile(web, full_mix_profile)
-        selected_only = ui_shared.backend_resource_profile(web, selected_only_profile)
+        selected_only_profile = app_services_resource_profile.build_resource_profile(
+            settings, [web]
+        )
+        expected = app_services_resource_profile.backend_resource_profile(
+            web, full_mix_profile
+        )
+        selected_only = app_services_resource_profile.backend_resource_profile(
+            web, selected_only_profile
+        )
 
     output_info_rows = {row[0]: row[1] for row in context["output_info_rows"]}
     detail = context["selected_output_detail"]
     assert detail["resource_memory_high"] == expected.memory_high
     assert detail["resource_memory_max"] == expected.memory_max
     assert detail["resource_memory_max"] != selected_only.memory_max
-    assert output_info_rows["memory target"] == ui_shared._format_memory_limit(
+    assert output_info_rows["memory target"] == ui_resources.format_memory_limit(
         expected.memory_high
     )
-    assert output_info_rows["memory cap"] == ui_shared._format_memory_limit(
+    assert output_info_rows["memory cap"] == ui_resources.format_memory_limit(
         expected.memory_max
     )
-    assert memory_payload["soft_limit_bytes"] == ui_shared._parse_memory_limit_bytes(
+    assert memory_payload["soft_limit_bytes"] == ui_resources._parse_memory_limit_bytes(
         expected.memory_high
     )
-    assert memory_payload["memory_limit_bytes"] == ui_shared._parse_memory_limit_bytes(
-        expected.memory_max
-    )
+    assert memory_payload[
+        "memory_limit_bytes"
+    ] == ui_resources._parse_memory_limit_bytes(expected.memory_max)
 
 
 def test_backend_update_auto_resource_choice_preserves_current_size() -> None:
@@ -151,9 +160,9 @@ async def test_update_backend_form_keeps_inputs_and_enabled_unchanged(
         return SimpleNamespace(status_code=status_code)
 
     monkeypatch.setattr(ui_output, "run_apply", fake_run_apply)
-    monkeypatch.setattr(ui_output, "_output_page_context", fake_output_page_context)
+    monkeypatch.setattr(ui_output, "output_page_context", fake_output_page_context)
     monkeypatch.setattr(
-        ui_output, "_render_output_template", fake_render_output_template
+        ui_output, "render_output_template", fake_render_output_template
     )
 
     async with maker() as session:
@@ -264,9 +273,9 @@ async def test_update_backend_form_runs_apply_for_shield_code_change(
         return SimpleNamespace(status_code=status_code)
 
     monkeypatch.setattr(ui_output, "run_apply", fake_run_apply)
-    monkeypatch.setattr(ui_output, "_output_page_context", fake_output_page_context)
+    monkeypatch.setattr(ui_output, "output_page_context", fake_output_page_context)
     monkeypatch.setattr(
-        ui_output, "_render_output_template", fake_render_output_template
+        ui_output, "render_output_template", fake_render_output_template
     )
 
     async with maker() as session:
@@ -364,7 +373,7 @@ async def test_update_backend_form_returns_json_without_rendering_page(
         raise AssertionError("JSON output save should not render a full page")
 
     monkeypatch.setattr(ui_output, "run_apply", fake_run_apply)
-    monkeypatch.setattr(ui_output, "_render_output_template", fail_render)
+    monkeypatch.setattr(ui_output, "render_output_template", fail_render)
 
     async with maker() as session:
         backend = Backend(
@@ -451,9 +460,9 @@ async def test_update_backend_form_rejects_invalid_port_before_mutating(
         return SimpleNamespace(status_code=status_code)
 
     monkeypatch.setattr(ui_output, "run_apply", fail_run_apply)
-    monkeypatch.setattr(ui_output, "_output_page_context", fake_output_page_context)
+    monkeypatch.setattr(ui_output, "output_page_context", fake_output_page_context)
     monkeypatch.setattr(
-        ui_output, "_render_output_template", fake_render_output_template
+        ui_output, "render_output_template", fake_render_output_template
     )
 
     async with maker() as session:
@@ -536,9 +545,9 @@ async def test_update_backend_inputs_form_updates_attached_inputs(
         return SimpleNamespace(status_code=status_code)
 
     monkeypatch.setattr(ui_output, "run_apply", fake_run_apply)
-    monkeypatch.setattr(ui_output, "_output_page_context", fake_output_page_context)
+    monkeypatch.setattr(ui_output, "output_page_context", fake_output_page_context)
     monkeypatch.setattr(
-        ui_output, "_render_output_template", fake_render_output_template
+        ui_output, "render_output_template", fake_render_output_template
     )
 
     async with maker() as session:
@@ -598,7 +607,7 @@ async def test_update_backend_inputs_form_returns_json_without_rendering_page(
         raise AssertionError("JSON attached-input save should not render a full page")
 
     monkeypatch.setattr(ui_output, "run_apply", fake_run_apply)
-    monkeypatch.setattr(ui_output, "_render_output_template", fail_render)
+    monkeypatch.setattr(ui_output, "render_output_template", fail_render)
 
     async with maker() as session:
         input_a = Input(kind="domain", hostname="a.example.com", enabled=True)
@@ -672,9 +681,9 @@ async def test_update_backend_state_form_disables_output(
         return SimpleNamespace(status_code=status_code)
 
     monkeypatch.setattr(ui_output, "run_apply", fake_run_apply)
-    monkeypatch.setattr(ui_output, "_output_page_context", fake_output_page_context)
+    monkeypatch.setattr(ui_output, "output_page_context", fake_output_page_context)
     monkeypatch.setattr(
-        ui_output, "_render_output_template", fake_render_output_template
+        ui_output, "render_output_template", fake_render_output_template
     )
 
     async with maker() as session:
@@ -725,7 +734,7 @@ async def test_update_backend_state_form_returns_json_without_rendering_page(
         raise AssertionError("JSON output state save should not render a full page")
 
     monkeypatch.setattr(ui_output, "run_apply", fake_run_apply)
-    monkeypatch.setattr(ui_output, "_render_output_template", fail_render)
+    monkeypatch.setattr(ui_output, "render_output_template", fail_render)
 
     async with maker() as session:
         backend = Backend(
@@ -784,7 +793,7 @@ async def test_output_state_preflight_returns_409_without_creating_operation(
         return "Output state save is unavailable while host apply is running."
 
     monkeypatch.setattr(ui_output, "enforce_csrf", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(ui_output, "_host_mutation_preflight_message", blocked)
+    monkeypatch.setattr(ui_output, "host_mutation_preflight_message", blocked)
 
     async with maker() as session:
         session.add(

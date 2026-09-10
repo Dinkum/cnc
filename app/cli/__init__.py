@@ -5,6 +5,10 @@ import importlib
 
 
 COMMAND_MODULES: dict[str, str] = {
+    "input": "app.cli.input",
+    "route": "app.cli.route",
+    "output": "app.cli.output",
+    "operation": "app.cli.operation",
     "host": "app.cli.host",
     "app": "app.cli.app",
     "backup": "app.cli.backup",
@@ -26,6 +30,10 @@ COMMAND_MODULES: dict[str, str] = {
     "exec": "app.cli.shell",
 }
 COMMAND_ORDER = [
+    "input",
+    "route",
+    "output",
+    "operation",
     "host",
     "app",
     "backup",

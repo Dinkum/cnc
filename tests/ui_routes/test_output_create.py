@@ -1,9 +1,13 @@
+import app.ui.dashboard.context as ui_dashboard_context
+import app.ui.dashboard.data as ui_dashboard_data
+import app.ui.http as ui_http
+
 from .support import (
+    CREATE_BACKEND_OPERATION_STEPS,
     ApplyResponse,
     Backend,
     BackendIn,
     BackgroundTasks,
-    CREATE_BACKEND_OPERATION_STEPS,
     Input,
     Operation,
     Path,
@@ -11,18 +15,17 @@ from .support import (
     SimpleNamespace,
     _CreateBackendProgressRecorder,
     _FormRequest,
-    _PostedRequest,
     _healthy_status,
     _make_session,
+    _PostedRequest,
     create_backend_progress_steps,
     create_backend_progress_value,
     create_backend_runtime_progress,
     create_backend_runtime_summary,
     json,
-    select,
     output_lifecycle_operations,
+    select,
     ui_output,
-    ui_shared,
     write_bootstrap_state,
 )
 
@@ -49,8 +52,11 @@ async def test_create_backend_form_surfaces_static_root_hint_on_validation_error
         captured["status_code"] = status_code
         return SimpleNamespace(status_code=status_code)
 
-    monkeypatch.setattr(ui_shared, "_dashboard_context", fake_dashboard_context)
-    monkeypatch.setattr(ui_shared.templates, "TemplateResponse", fake_template_response)
+    monkeypatch.setattr(
+        ui_dashboard_context, "dashboard_context", fake_dashboard_context
+    )
+    monkeypatch.setattr(ui_http, "dashboard_context", fake_dashboard_context)
+    monkeypatch.setattr(ui_http.templates, "TemplateResponse", fake_template_response)
 
     async with maker() as session:
         request = _FormRequest()
@@ -116,8 +122,11 @@ async def test_create_backend_form_surfaces_volume_boundary_hint_on_validation_e
         captured["status_code"] = status_code
         return SimpleNamespace(status_code=status_code)
 
-    monkeypatch.setattr(ui_shared, "_dashboard_context", fake_dashboard_context)
-    monkeypatch.setattr(ui_shared.templates, "TemplateResponse", fake_template_response)
+    monkeypatch.setattr(
+        ui_dashboard_context, "dashboard_context", fake_dashboard_context
+    )
+    monkeypatch.setattr(ui_http, "dashboard_context", fake_dashboard_context)
+    monkeypatch.setattr(ui_http.templates, "TemplateResponse", fake_template_response)
 
     async with maker() as session:
         request = _FormRequest()
@@ -179,9 +188,12 @@ async def test_create_backend_form_rejects_invalid_port_without_apply(
         captured["context"] = context
         return SimpleNamespace(status_code=status_code)
 
-    monkeypatch.setattr(ui_shared, "_dashboard_context", fake_dashboard_context)
+    monkeypatch.setattr(
+        ui_dashboard_context, "dashboard_context", fake_dashboard_context
+    )
+    monkeypatch.setattr(ui_http, "dashboard_context", fake_dashboard_context)
     monkeypatch.setattr(ui_output, "run_apply", fail_run_apply)
-    monkeypatch.setattr(ui_shared.templates, "TemplateResponse", fake_template_response)
+    monkeypatch.setattr(ui_http.templates, "TemplateResponse", fake_template_response)
 
     async with maker() as session:
         response = await ui_output.create_backend_form(
@@ -256,9 +268,9 @@ async def test_create_backend_form_succeeds_with_attached_inputs(
             status="success", message="apply completed", details={}, run_id=7
         )
 
-    monkeypatch.setattr(ui_output, "_output_page_context", fake_output_context)
+    monkeypatch.setattr(ui_output, "output_page_context", fake_output_context)
     monkeypatch.setattr(ui_output, "run_apply", fake_run_apply)
-    monkeypatch.setattr(ui_shared.templates, "TemplateResponse", fake_template_response)
+    monkeypatch.setattr(ui_http.templates, "TemplateResponse", fake_template_response)
 
     async with maker() as session:
         session.add(Input(kind="domain", hostname="api.example.com", enabled=True))
@@ -312,7 +324,7 @@ async def test_create_backend_form_returns_operation_for_dashboard_create(
             status="success", message="apply completed", details={}, run_id=7
         )
 
-    monkeypatch.setattr(ui_output, "_output_page_context", fail_output_context)
+    monkeypatch.setattr(ui_output, "output_page_context", fail_output_context)
     monkeypatch.setattr(ui_output, "run_apply", fake_run_apply)
 
     async with maker() as session:
@@ -556,8 +568,8 @@ async def test_create_backend_form_blocks_dashboard_create_during_active_host_op
         captured["status_code"] = status_code
         return SimpleNamespace(status_code=status_code, raw_headers=[])
 
-    monkeypatch.setattr(ui_shared, "collect_status", fake_collect_status)
-    monkeypatch.setattr(ui_shared.templates, "TemplateResponse", fake_template_response)
+    monkeypatch.setattr(ui_dashboard_data, "collect_status", fake_collect_status)
+    monkeypatch.setattr(ui_http.templates, "TemplateResponse", fake_template_response)
 
     async with maker() as session:
         session.add(
@@ -855,10 +867,10 @@ async def test_update_backend_form_preserves_created_output_kind(
         }
 
     monkeypatch.setattr(ui_output, "run_apply", fake_run_apply)
-    monkeypatch.setattr(ui_output, "_output_page_context", fake_output_page_context)
+    monkeypatch.setattr(ui_output, "output_page_context", fake_output_page_context)
     monkeypatch.setattr(
         ui_output,
-        "_render_output_template",
+        "render_output_template",
         lambda *_args, **_kwargs: SimpleNamespace(status_code=200),
     )
 

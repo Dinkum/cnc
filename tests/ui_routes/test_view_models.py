@@ -1,18 +1,23 @@
+import app.ui.cluster as ui_cluster
+import app.ui.dashboard.presentation as ui_dashboard_presentation
+import app.ui.outputs.health as ui_outputs_health
+import app.ui.outputs.presentation as ui_outputs_presentation
+import app.ui.view_models as ui_view_models
+
 from .support import (
-    Backend,
     DEFAULT_UI_APP_SANDBOX_PROFILE,
+    Backend,
     _normalize_backend_form_sandbox_image,
     datetime,
     timedelta,
     timezone,
     ui_output,
-    ui_shared,
     view_models,
 )
 
 
 def test_output_load_meter_reports_active_percent() -> None:
-    payload = ui_shared._output_load_meter(
+    payload = ui_outputs_presentation._output_load_meter(
         18.4, enabled=True, kind="app", service_state="active"
     )
 
@@ -26,7 +31,7 @@ def test_output_load_meter_reports_active_percent() -> None:
 
 
 def test_output_load_meter_reports_collecting_for_active_app_without_metrics() -> None:
-    payload = ui_shared._output_load_meter(
+    payload = ui_outputs_presentation._output_load_meter(
         None, enabled=True, kind="app", service_state="active"
     )
 
@@ -40,7 +45,7 @@ def test_output_load_meter_reports_collecting_for_active_app_without_metrics() -
 
 
 def test_output_load_meter_reports_shield_metrics_like_managed_runtime() -> None:
-    payload = ui_shared._output_load_meter(
+    payload = ui_outputs_presentation._output_load_meter(
         12.5, enabled=True, kind="shield", service_state="active"
     )
 
@@ -57,7 +62,7 @@ def test_service_metrics_lookup_uses_shield_service_name() -> None:
     backend = Backend(name="shield", kind="shield")
     metrics = {"cpu_percent": 2.5, "memory_percent": 12.5}
 
-    payload = ui_shared._service_metrics_from_status_payload(
+    payload = ui_outputs_health.service_metrics_from_status_payload(
         {"services": [{"service": "cnc-shield.service", "metrics": metrics}]},
         backend,
     )
@@ -67,20 +72,20 @@ def test_service_metrics_lookup_uses_shield_service_name() -> None:
 
 def test_runtime_service_name_uses_kind_not_reserved_name_alone() -> None:
     assert (
-        ui_shared._backend_runtime_service_name("shield", kind="shield")
+        ui_outputs_health._backend_runtime_service_name("shield", kind="shield")
         == "cnc-shield.service"
     )
     assert (
-        ui_shared._backend_runtime_service_name("shield", kind="app")
+        ui_outputs_health._backend_runtime_service_name("shield", kind="app")
         == "cnc-app-shield"
     )
 
 
 def test_network_isolation_home_status_labels_security_state() -> None:
-    assert ui_shared._network_isolation_home_status(
+    assert ui_dashboard_presentation._network_isolation_home_status(
         {"app_network_isolation": {"checked": True, "ok": True}}
     ) == {"label": "OK", "tone": "success"}
-    assert ui_shared._network_isolation_home_status(
+    assert ui_dashboard_presentation._network_isolation_home_status(
         {
             "app_network_isolation": {
                 "checked": True,
@@ -89,23 +94,23 @@ def test_network_isolation_home_status_labels_security_state() -> None:
             }
         }
     ) == {"label": "warning", "tone": "warn"}
-    assert ui_shared._network_isolation_home_status({}) == {
+    assert ui_dashboard_presentation._network_isolation_home_status({}) == {
         "label": "unknown",
         "tone": "warn",
     }
 
 
 def test_cluster_node_state_tones_are_semantic() -> None:
-    assert ui_shared._cluster_node_state_tone("healthy") == "healthy"
-    assert ui_shared._cluster_node_state_tone("joining") == "pending"
-    assert ui_shared._cluster_node_state_tone("degraded") == "degraded"
-    assert ui_shared._cluster_node_state_tone("removed") == "inactive"
+    assert ui_cluster._cluster_node_state_tone("healthy") == "healthy"
+    assert ui_cluster._cluster_node_state_tone("joining") == "pending"
+    assert ui_cluster._cluster_node_state_tone("degraded") == "degraded"
+    assert ui_cluster._cluster_node_state_tone("removed") == "inactive"
 
 
 def test_output_runtime_badge_marks_shield_unknown_without_cached_service_snapshot() -> (
     None
 ):
-    payload = ui_shared._output_runtime_badge(
+    payload = ui_outputs_presentation._output_runtime_badge(
         enabled=True,
         kind="shield",
         runtime_diagnostics=None,
@@ -117,7 +122,7 @@ def test_output_runtime_badge_marks_shield_unknown_without_cached_service_snapsh
 
 
 def test_output_runtime_badge_marks_explicit_failed_shield_service_unhealthy() -> None:
-    payload = ui_shared._output_runtime_badge(
+    payload = ui_outputs_presentation._output_runtime_badge(
         enabled=True,
         kind="shield",
         runtime_diagnostics=None,
@@ -129,7 +134,7 @@ def test_output_runtime_badge_marks_explicit_failed_shield_service_unhealthy() -
 
 
 def test_output_runtime_badge_marks_nonactive_shield_service_unhealthy() -> None:
-    payload = ui_shared._output_runtime_badge(
+    payload = ui_outputs_presentation._output_runtime_badge(
         enabled=True,
         kind="shield",
         runtime_diagnostics=None,
@@ -141,7 +146,7 @@ def test_output_runtime_badge_marks_nonactive_shield_service_unhealthy() -> None
 
 
 def test_output_runtime_badge_marks_deferred_guest_observation_unknown() -> None:
-    payload = ui_shared._output_runtime_badge(
+    payload = ui_outputs_presentation._output_runtime_badge(
         enabled=True,
         kind="app",
         runtime_diagnostics={"diagnosis": "backend_observation_deferred"},
@@ -153,7 +158,7 @@ def test_output_runtime_badge_marks_deferred_guest_observation_unknown() -> None
 
 
 def test_output_load_meter_reports_off_for_disabled_backend() -> None:
-    payload = ui_shared._output_load_meter(
+    payload = ui_outputs_presentation._output_load_meter(
         42.0, enabled=False, kind="app", service_state="active"
     )
 
@@ -167,7 +172,7 @@ def test_output_load_meter_reports_off_for_disabled_backend() -> None:
 
 
 def test_output_load_meter_reports_compact_inactive_app_without_metrics() -> None:
-    payload = ui_shared._output_load_meter(
+    payload = ui_outputs_presentation._output_load_meter(
         None, enabled=True, kind="app", service_state="inactive"
     )
 
@@ -185,7 +190,7 @@ def test_change_state_marks_recent_unapplied_create_as_new() -> None:
     created_at = now - timedelta(hours=6)
 
     assert (
-        ui_shared._change_state(
+        ui_view_models._change_state(
             created_at=created_at, updated_at=None, last_applied_at=None, now=now
         )
         == "new"
@@ -195,7 +200,7 @@ def test_change_state_marks_recent_unapplied_create_as_new() -> None:
 def test_format_timestamp_uses_human_readable_fallback_without_timezone() -> None:
     value = datetime(2026, 4, 29, 5, 6, 34, tzinfo=timezone.utc)
 
-    assert ui_shared._format_timestamp(value) == "Apr 29, 2026, 5:06 AM"
+    assert ui_view_models._format_timestamp(value) == "Apr 29, 2026, 5:06 AM"
 
 
 def test_change_state_downgrades_old_unapplied_create_to_unsynced() -> None:
@@ -203,7 +208,7 @@ def test_change_state_downgrades_old_unapplied_create_to_unsynced() -> None:
     created_at = now - timedelta(hours=25)
 
     assert (
-        ui_shared._change_state(
+        ui_view_models._change_state(
             created_at=created_at, updated_at=None, last_applied_at=None, now=now
         )
         == "unsynced"
@@ -216,7 +221,7 @@ def test_change_state_downgrades_old_post_apply_create_to_unsynced() -> None:
     created_at = now - timedelta(hours=25)
 
     assert (
-        ui_shared._change_state(
+        ui_view_models._change_state(
             created_at=created_at,
             updated_at=None,
             last_applied_at=last_applied_at,
@@ -311,7 +316,7 @@ def test_backend_form_resource_size_choice_maps_to_existing_fields() -> None:
 
 
 def test_debug_kv_dump_renders_multiline_values() -> None:
-    rendered = ui_shared._debug_kv_dump(
+    rendered = ui_outputs_presentation._debug_kv_dump(
         [
             ("name", "web"),
             ("env", {"PORT": "8337"}),
@@ -329,7 +334,7 @@ def test_debug_kv_dump_falls_back_for_non_serializable_values() -> None:
     circular: list[object] = []
     circular.append(circular)
 
-    rendered = ui_shared._debug_kv_dump([("bad", circular)])
+    rendered = ui_outputs_presentation._debug_kv_dump([("bad", circular)])
 
     assert "bad:" in rendered
 
@@ -342,7 +347,7 @@ def test_save_job_error_meta_uses_only_reported_error_reference() -> None:
 
 
 def test_save_job_summary_includes_change_rows() -> None:
-    summary = ui_shared._save_job_summary(
+    summary = ui_view_models._save_job_summary(
         {
             "id": 21,
             "status": "success",
@@ -382,7 +387,7 @@ def test_save_job_summary_includes_change_rows() -> None:
 
 
 def test_save_job_summary_success_counts_outputs_and_paths() -> None:
-    summary = ui_shared._save_job_summary(
+    summary = ui_view_models._save_job_summary(
         {
             "id": 42,
             "status": "success",
@@ -410,7 +415,7 @@ def test_save_job_summary_success_counts_outputs_and_paths() -> None:
 
 
 def test_save_job_summary_failure_includes_phase_rows_and_dump() -> None:
-    summary = ui_shared._save_job_summary(
+    summary = ui_view_models._save_job_summary(
         {
             "id": 43,
             "status": "error",
@@ -443,7 +448,7 @@ def test_save_job_summary_failure_includes_phase_rows_and_dump() -> None:
 
 
 def test_save_job_summary_healthcheck_failure_has_instance_and_specific_probe() -> None:
-    summary = ui_shared._save_job_summary(
+    summary = ui_view_models._save_job_summary(
         {
             "id": 97,
             "status": "error",
@@ -482,7 +487,7 @@ def test_save_job_summary_healthcheck_failure_has_instance_and_specific_probe() 
 
 
 def test_save_job_summary_partial_failure_marks_host_state() -> None:
-    summary = ui_shared._save_job_summary(
+    summary = ui_view_models._save_job_summary(
         {
             "id": 44,
             "status": "error",
@@ -518,7 +523,7 @@ def test_save_job_summary_partial_failure_marks_host_state() -> None:
 def test_save_job_summary_command_failure_prefers_failed_phase_backend_and_stderr() -> (
     None
 ):
-    summary = ui_shared._save_job_summary(
+    summary = ui_view_models._save_job_summary(
         {
             "id": 85,
             "status": "error",
@@ -553,3 +558,22 @@ def test_save_job_summary_command_failure_prefers_failed_phase_backend_and_stder
     assert "command: podman update --memory-reservation 686M cnc-app-web" in (
         summary["detail_dump"] or ""
     )
+
+
+def test_output_runtime_badge_distinguishes_missing_observations_from_failures() -> None:
+    for kind in ("app", "shield"):
+        for state in (None, "", "unknown", "active", "failed", "inactive"):
+            for ok in (True, False):
+                badge = ui_outputs_presentation._output_runtime_badge(
+                    enabled=True,
+                    kind=kind,
+                    runtime_diagnostics=None,
+                    unit_data={"ActiveState": state},
+                    unit_ok=ok,
+                )
+                if state in (None, "", "unknown"):
+                    assert badge == {"value": "unknown", "tone": "queued"}
+                elif state == "active" and (kind == "app" or ok):
+                    assert badge == {"value": "healthy", "tone": "success"}
+                else:
+                    assert badge == {"value": "unhealthy", "tone": "error"}

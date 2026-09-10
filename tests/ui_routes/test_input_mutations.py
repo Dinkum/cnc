@@ -1,3 +1,6 @@
+import app.ui.dashboard.data as ui_dashboard_data
+import app.ui.http as ui_http
+
 from .support import (
     ApplyResponse,
     Backend,
@@ -6,22 +9,21 @@ from .support import (
     Path,
     Settings,
     SimpleNamespace,
-    _FormRequest,
-    _PostedRequest,
     _cookie_values,
+    _FormRequest,
     _healthy_status,
     _make_session,
+    _PostedRequest,
     _request,
     create_operation,
+    input_operations,
     json,
     make_code_hash,
+    output_save_operations,
     select,
     selectinload,
-    input_operations,
-    output_save_operations,
     ui_input,
     ui_pages,
-    ui_shared,
 )
 
 
@@ -40,7 +42,7 @@ async def test_dashboard_output_create_picker_blocks_single_output_inputs(
     async def fake_collect_status(_session, _settings, **_kwargs):
         return _healthy_status(backend_count=1)
 
-    monkeypatch.setattr(ui_shared, "collect_status", fake_collect_status)
+    monkeypatch.setattr(ui_dashboard_data, "collect_status", fake_collect_status)
 
     async with maker() as session:
         attached = Input(kind="tailnet_path", hostname="/sample-used", enabled=True)
@@ -173,7 +175,7 @@ async def test_create_input_form_renders_dashboard_after_success(
             run_id=42,
         )
 
-    monkeypatch.setattr(ui_shared, "collect_status", fake_collect_status)
+    monkeypatch.setattr(ui_dashboard_data, "collect_status", fake_collect_status)
     monkeypatch.setattr(ui_input, "run_apply", fake_run_apply)
 
     async with maker() as session:
@@ -240,9 +242,9 @@ async def test_create_input_form_returns_dashboard_html_for_mounted_refresh(
         captured["status_code"] = status_code
         return SimpleNamespace(status_code=status_code, raw_headers=[])
 
-    monkeypatch.setattr(ui_shared, "collect_status", fake_collect_status)
+    monkeypatch.setattr(ui_dashboard_data, "collect_status", fake_collect_status)
     monkeypatch.setattr(ui_input, "run_apply", fake_run_apply)
-    monkeypatch.setattr(ui_shared.templates, "TemplateResponse", fake_template_response)
+    monkeypatch.setattr(ui_http.templates, "TemplateResponse", fake_template_response)
 
     async with maker() as session:
         response = await ui_input.create_input_form(
@@ -333,9 +335,9 @@ async def test_create_input_form_blocks_mounted_refresh_during_active_host_opera
         captured["status_code"] = status_code
         return SimpleNamespace(status_code=status_code, raw_headers=[])
 
-    monkeypatch.setattr(ui_shared, "collect_status", fake_collect_status)
+    monkeypatch.setattr(ui_dashboard_data, "collect_status", fake_collect_status)
     monkeypatch.setattr(ui_input, "run_apply", fail_run_apply)
-    monkeypatch.setattr(ui_shared.templates, "TemplateResponse", fake_template_response)
+    monkeypatch.setattr(ui_http.templates, "TemplateResponse", fake_template_response)
 
     async with maker() as session:
         session.add(
@@ -399,7 +401,7 @@ async def test_create_input_form_rolls_back_input_when_apply_fails(
             run_id=36,
         )
 
-    monkeypatch.setattr(ui_shared, "collect_status", fake_collect_status)
+    monkeypatch.setattr(ui_dashboard_data, "collect_status", fake_collect_status)
     monkeypatch.setattr(ui_input, "run_apply", fake_run_apply)
 
     async with maker() as session:
@@ -468,7 +470,7 @@ async def test_update_input_form_deletes_input_after_successful_apply(
             status="success", message="apply completed", details={}, run_id=44
         )
 
-    monkeypatch.setattr(ui_shared, "collect_status", fake_collect_status)
+    monkeypatch.setattr(ui_dashboard_data, "collect_status", fake_collect_status)
     monkeypatch.setattr(ui_input, "run_apply", fake_run_apply)
 
     async with maker() as session:
@@ -851,7 +853,7 @@ async def test_update_input_form_rolls_back_deleted_input_when_apply_fails(
             run_id=45,
         )
 
-    monkeypatch.setattr(ui_shared, "collect_status", fake_collect_status)
+    monkeypatch.setattr(ui_dashboard_data, "collect_status", fake_collect_status)
     monkeypatch.setattr(ui_input, "run_apply", fake_run_apply)
 
     async with maker() as session:

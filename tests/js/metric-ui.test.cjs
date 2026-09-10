@@ -62,3 +62,99 @@ test('metric CSV labels rates and preserves nulls, quotes, and numbers', () => {
   assert.match(csv, /"'=1\+1"/);
   assert.equal(csv.trim().split('\r\n').length, 3);
 });
+
+
+test('output polling distinguishes missing observations from runtime failures', () => {
+  const context = vm.createContext({});
+  vm.runInContext(arrow('outputRuntimeBadge', 'dashboard.js') + ';this.badge=outputRuntimeBadge;', context);
+  const badge = (...args) => JSON.parse(JSON.stringify(context.badge(...args)));
+  for (const kind of ['app', 'shield']) {
+    for (const service of [undefined, {}, { data: {} }, { data: { ActiveState: 'unknown' } }]) {
+      assert.deepEqual(badge(true, kind, service), { value: 'unknown', tone: 'queued' });
+    }
+    assert.equal(badge(true, kind, { data: { ActiveState: 'active' }, ok: true }).value, 'healthy');
+    for (const state of ['failed', 'inactive']) {
+      assert.equal(badge(true, kind, { data: { ActiveState: state }, ok: true }).value, 'unhealthy');
+    }
+  }
+  for (const diagnosis of ['backend_observation_deferred', 'backend_observation_unavailable']) {
+    assert.equal(badge(true, 'app', { data: { ActiveState: 'active' }, diagnostics: { diagnosis } }).value, 'unknown');
+  }
+  assert.equal(badge(true, 'app', { data: { ActiveState: 'active' }, diagnostics: { diagnosis: 'app_unmonitored' } }).value, 'unmonitored');
+  assert.equal(badge(true, 'app', { data: { ActiveState: 'active' }, diagnostics: { diagnosis: 'app_failed' } }).value, 'unhealthy');
+  assert.equal(badge(false, 'app', undefined).value, 'not enabled');
+  assert.equal(badge(true, 'static', undefined).value, 'healthy');
+});
+
+test('outputs list recovers from a cold deletion snapshot without a false unhealthy count', () => {
+  const pill = () => ({ textContent: '', className: '', classList: { toggle() {} } });
+  const rows = Array.from({ length: 8 }, (_, i) => {
+    const cells = new Map();
+    return {
+      dataset: { outputName: `app-${i}`, outputKind: 'app', outputEnabled: '1' },
+      querySelector: (selector) => {
+        if (!cells.has(selector)) cells.set(selector, pill());
+        return cells.get(selector);
+      },
+    };
+  });
+  const unhealthy = pill(), enabled = pill();
+  const context = vm.createContext({
+    document: {
+      querySelectorAll: () => rows,
+      querySelector: (selector) => selector.includes('unhealthy') ? unhealthy : enabled,
+    },
+    averageOutputLoad: () => null,
+    outputLoadMeter: () => ({ label: '', tone: 'inactive', percent: 0, compact: true }),
+    setMeterFill() {},
+  });
+  vm.runInContext(['backendNameFromService', 'outputRuntimeBadge', 'renderOutputsFromStatus']
+    .map(name => arrow(name, 'dashboard.js')).join('\n') + ';this.render=renderOutputsFromStatus;', context);
+  context.render({ services: [] });
+  assert.equal(unhealthy.textContent, '0 unhealthy');
+  assert.equal(enabled.textContent, '8/8 enabled');
+  for (const row of rows) assert.equal(row.querySelector('[data-output-runtime-pill]').textContent, 'unknown');
+  const services = rows.map(row => ({ backend: row.dataset.outputName, ok: true, data: { ActiveState: 'active' } }));
+  context.render({ services });
+  assert.equal(unhealthy.textContent, '0 unhealthy');
+  for (const row of rows) assert.equal(row.querySelector('[data-output-runtime-pill]').textContent, 'healthy');
+  services[0].data.ActiveState = 'failed';
+  services[0].ok = false;
+  context.render({ services });
+  assert.equal(unhealthy.textContent, '1 unhealthy');
+  assert.equal(rows[0].querySelector('[data-output-runtime-pill]').textContent, 'unhealthy');
+});
+
+test('late history responses cannot replace the current metric or cached export', async () => {
+  const pending = [], cached = [], rendered = [];
+  const context = vm.createContext({
+    AbortController, URLSearchParams,
+    metricSelect: { value: 'cpu' }, timeframeSelect: { value: 'day' },
+    metricsChart: { parentElement: { clientWidth: 900 } }, metricsEmpty: { hidden: true },
+    lastMetricPayload: null, chartInstance: null, metricsRequestId: 0, metricsAbortController: null,
+    syncOutputMetricExport() {}, setMetricsLoading() {},
+    ensureMetricChartAssets: async () => {}, waitForMetricsLoadingPaint: async () => {},
+    writeCachedMetricPayload: payload => cached.push(payload.metric.key),
+    renderMetricsChart: payload => rendered.push(payload.metric.key),
+    showMetricHistoryError() { throw new Error('unexpected request failure'); },
+    fetch: (_url, options) => new Promise(resolve => pending.push({ resolve, signal: options.signal })),
+    backendId: 1,
+  });
+  context.outputMetricKey = () => context.metricSelect.value;
+  context.outputTimeframeKey = () => context.timeframeSelect.value;
+  vm.runInContext(arrow('loadMetricHistory', 'output-detail.js') + ';this.load=loadMetricHistory;', context);
+  const older = context.load();
+  await new Promise(setImmediate);
+  context.metricSelect.value = 'memory';
+  const newer = context.load();
+  await new Promise(setImmediate);
+  assert.equal(pending.length, 2);
+  assert.equal(pending[0].signal.aborted, true);
+  pending[1].resolve({ ok: true, json: async () => ({ metric: { key: 'memory' } }) });
+  await newer;
+  // Model a transport that completes despite cancellation, after the newer request.
+  pending[0].resolve({ ok: true, json: async () => ({ metric: { key: 'cpu' } }) });
+  await older;
+  assert.deepEqual(cached, ['memory']);
+  assert.deepEqual(rendered, ['memory']);
+});

@@ -3,7 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
-from app.models.entities import Backend, Input
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.entities import ApplyRun, Backend, Input
 
 
 @dataclass(frozen=True)
@@ -66,3 +69,28 @@ def dashboard_status_fallback(current_version: str) -> dict[str, object]:
         "dashboard_overview": {},
         "app_network_isolation": {"checked": False},
     }
+
+
+VALID_DASHBOARD_TABS = {"home", "inputs", "routing", "outputs", "settings"}
+
+
+def dashboard_tab(value: object, default: str = "home") -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in VALID_DASHBOARD_TABS else default
+
+
+def dashboard_scope(active_tab: str | None) -> DashboardScope:
+    tab = dashboard_tab(active_tab, "home") if active_tab is not None else None
+    return DashboardScope(tab)
+
+
+async def latest_successful_apply_at(session: AsyncSession) -> datetime | None:
+    # Page freshness needs only a timestamp, not the potentially large snapshots.
+    return (
+        await session.execute(
+            select(ApplyRun.created_at)
+            .where(ApplyRun.status == "success")
+            .order_by(ApplyRun.id.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()

@@ -1,13 +1,29 @@
 from __future__ import annotations
 
-import asyncio
 from typing import Literal
+
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    Form,
+    HTTPException,
+    Request,
+)
+from fastapi.responses import (
+    JSONResponse,
+)
+from pydantic import ValidationError as PolicyValidationError
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.config import Settings
 from app.dependencies import (
     db_session_dependency,
     settings_dependency,
 )
+from app.logger import get_logger
 from app.models.entities import Backend
 from app.security import enforce_csrf
 from app.services.app_hardening import (
@@ -21,36 +37,17 @@ from app.services.app_hardening import (
     run_phase1_monitor,
     run_phase2_test,
 )
-from app.services.backend_ssh_keys import ensure_backend_ssh_keypair
-from app.services.hardening_policy import hardening_configuration, hardening_preview
 from app.services.error_reporting import ErrorCode
+from app.services.hardening_policy import hardening_configuration, hardening_preview
 from app.services.operations import (
-    HostMutationLockError,
-    host_mutation_operation,
     create_operation,
 )
-from app.services.ssh_access import reconcile_backend_ssh_access
 from app.ui.errors import operator_error_json as _operator_error_json
-from app.ui.routes.reads import _backend_ssh_key_download_response
-from app.ui.routes.shared import logger, _host_mutation_preflight_message
+from app.ui.mutation_feedback import host_mutation_preflight_message
 from app.ui.operations.common import operation_backend, operation_response
 from app.ui.operations.hardening import run_hardening_apply
-from fastapi import (
-    APIRouter,
-    BackgroundTasks,
-    Depends,
-    Form,
-    Request,
-    HTTPException,
-)
-from pydantic import ValidationError as PolicyValidationError
-from fastapi.responses import (
-    JSONResponse,
-    Response,
-)
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+
+logger = get_logger("ui")
 
 
 router = APIRouter(tags=["ui"])
@@ -154,7 +151,7 @@ async def apply_hardening_configuration(
             status_code=409,
             detail="The output or recommendations changed. Review the configuration again.",
         )
-    blocked = await _host_mutation_preflight_message(
+    blocked = await host_mutation_preflight_message(
         settings, action="Security configuration apply"
     )
     if blocked:
@@ -179,75 +176,6 @@ async def apply_hardening_configuration(
         revision=revision,
     )
     return operation_response(operation, message="Security configuration queued.")
-
-
-@router.post("/api/backends/{backend_id}/ssh-key")
-async def provision_backend_ssh_key(
-    backend_id: int,
-    request: Request,
-    csrf_token: str = Form(...),
-    settings: Settings = Depends(settings_dependency),
-    session: AsyncSession = Depends(db_session_dependency),
-) -> Response:
-    enforce_csrf(request, settings, csrf_token)
-    backend = (
-        await session.execute(select(Backend).where(Backend.id == backend_id))
-    ).scalar_one_or_none()
-    if backend is None or backend.kind != "app":
-        return _operator_error_json(
-            "app output not found",
-            ErrorCode.UI_RESOURCE_NOT_FOUND,
-            status_code=404,
-        )
-    try:
-        async with host_mutation_operation(
-            settings,
-            kind="backend_ssh_key",
-            actor="ui",
-            backend_id=backend_id,
-            phase="Provision SSH access",
-        ):
-            changed = await asyncio.to_thread(ensure_backend_ssh_keypair, backend)
-            if changed:
-                await session.commit()
-                await session.refresh(backend)
-            if backend.enabled:
-                enabled_backends = list(
-                    (
-                        await session.execute(
-                            select(Backend)
-                            .where(Backend.kind == "app", Backend.enabled.is_(True))
-                            .order_by(Backend.id.asc())
-                        )
-                    )
-                    .scalars()
-                    .all()
-                )
-                await reconcile_backend_ssh_access(enabled_backends, settings)
-            private_key = str(backend.ssh_private_key or "")
-            backend_name = str(backend.name)
-            if not private_key:
-                raise RuntimeError("ssh key unavailable after provisioning")
-        return _backend_ssh_key_download_response(backend_name, private_key)
-    except HostMutationLockError as exc:
-        await session.rollback()
-        return _operator_error_json(
-            str(exc),
-            ErrorCode.UI_ACTION_UNAVAILABLE,
-            status_code=409,
-        )
-    except Exception as exc:
-        await session.rollback()
-        logger.exception(
-            "ui.backend.ssh_key.provision_failed",
-            backend_id=backend_id,
-            error=str(exc),
-        )
-        return _operator_error_json(
-            "ssh key provisioning failed",
-            ErrorCode.UI_ACTION_UNAVAILABLE,
-            status_code=500,
-        )
 
 
 @router.post("/ui/backends/{backend_id}/hardening/phase1")

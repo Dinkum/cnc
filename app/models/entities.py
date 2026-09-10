@@ -133,6 +133,24 @@ class Backend(Base):
         return sorted(item.id for item in self.inputs)
 
 
+class BackendSshKey(Base):
+    __tablename__ = "backend_ssh_keys"
+
+    id: Mapped[str] = mapped_column(String(6), primary_key=True)
+    backend_id: Mapped[int] = mapped_column(
+        ForeignKey("backends.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(80))
+    public_key: Mapped[str] = mapped_column(Text)
+    fingerprint: Mapped[str] = mapped_column(String(80))
+    filename: Mapped[str] = mapped_column(String(320))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    # Retain revoked IDs so a later key never reuses a downloaded key's identity.
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+
 class Input(Base):
     __tablename__ = "inputs"
 
@@ -232,6 +250,25 @@ class Operation(Base):
     )
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     details_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+
+
+class CommandJob(Base):
+    __tablename__ = "command_jobs"
+
+    operation_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("operations.id", ondelete="CASCADE"), primary_key=True
+    )
+    execution_token: Mapped[str] = mapped_column(
+        String(32), unique=True, nullable=False
+    )
+    request_key: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    output_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    container_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    container_started_at: Mapped[str] = mapped_column(String(64), nullable=False)
+    cancel_requested: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
 
 
 class HostApplyState(Base):

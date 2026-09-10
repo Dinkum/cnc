@@ -10,7 +10,7 @@ from app.shield import ShieldAppConfig, create_app
 EXPECTED_HEADERS = {
     "x-frame-options": "DENY",
     "x-content-type-options": "nosniff",
-    "referrer-policy": "no-referrer",
+    "referrer-policy": "same-origin",
 }
 
 

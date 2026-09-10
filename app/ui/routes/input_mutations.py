@@ -1,57 +1,5 @@
 from __future__ import annotations
 
-from app.config import Settings
-from app.dependencies import (
-    db_session_dependency,
-    settings_dependency,
-)
-from app.models.entities import Input
-from app.security import enforce_csrf
-from app.services import input_commands
-from app.services.apply_service import run_apply
-from app.services.error_reporting import (
-    ErrorCode,
-    error_context,
-)
-from app.services.mutation_apply import commit_and_apply
-from app.services.operation_runtime import delete_input_progress_plan
-from app.services.operations import (
-    active_host_mutation_blocker,
-    create_operation,
-)
-from app.services.shield_service import make_code_hash
-from app.services.validators import ValidationError
-from app.ui.errors import (
-    operator_action_error as _operator_action_error,
-    operator_coded_message_payload as _operator_coded_message_payload,
-    operator_error_json as _operator_error_json,
-)
-from app.ui.forms import (
-    _form_string_or_default,
-    _input_create_payload_from_form,
-    _input_update_payload_from_form,
-    _nonblank_form_values,
-)
-from app.ui.operations.common import operation_response as _operation_response
-from app.ui.operations.inputs import (
-    _run_create_input_operation,
-    _run_delete_input_operation,
-    _run_update_input_operation,
-)
-from app.ui.progress import (
-    _input_progress_details,
-    _planned_operation_progress_details,
-)
-from app.ui.routes.shared import (
-    _dashboard_redirect,
-    _dashboard_refresh_response,
-    _host_mutation_blocked_message,
-    _host_mutation_preflight_message,
-    _operator_validation_error,
-    _request_prefers_json,
-    logger,
-)
-from app.ui.view_models import _save_apply_feedback
 from fastapi import (
     APIRouter,
     BackgroundTasks,
@@ -68,6 +16,63 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.config import Settings
+from app.dependencies import (
+    db_session_dependency,
+    settings_dependency,
+)
+from app.logger import get_logger
+from app.models.entities import Input
+from app.security import enforce_csrf
+from app.services import input_commands
+from app.services.apply_service import run_apply
+from app.services.error_reporting import (
+    ErrorCode,
+    error_context,
+)
+from app.services.mutation_apply import commit_and_apply
+from app.services.operation_runtime import delete_input_progress_plan
+from app.services.operations import (
+    active_host_mutation_blocker,
+    create_operation,
+)
+from app.services.shield_service import make_code_hash
+from app.services.validators import ValidationError
+from app.ui.errors import operator_action_error as _operator_action_error
+from app.ui.errors import (
+    operator_coded_message_payload as _operator_coded_message_payload,
+)
+from app.ui.errors import operator_error_json as _operator_error_json
+from app.ui.forms import (
+    _form_string_or_default,
+    _input_create_payload_from_form,
+    _input_update_payload_from_form,
+    _nonblank_form_values,
+    operator_validation_error,
+)
+from app.ui.http import (
+    dashboard_redirect,
+    dashboard_refresh_response,
+    request_prefers_json,
+)
+from app.ui.mutation_feedback import (
+    host_mutation_blocked_message,
+    host_mutation_preflight_message,
+)
+from app.ui.operations.common import operation_response as _operation_response
+from app.ui.operations.inputs import (
+    _run_create_input_operation,
+    _run_delete_input_operation,
+    _run_update_input_operation,
+)
+from app.ui.progress import (
+    _input_progress_details,
+    _planned_operation_progress_details,
+)
+from app.ui.view_models import _save_apply_feedback
+
+logger = get_logger("ui")
+
 
 router = APIRouter(tags=["ui"])
 
@@ -79,17 +84,17 @@ async def _input_mutation_preflight(
     *,
     action: str,
 ) -> HTMLResponse | JSONResponse | None:
-    message = await _host_mutation_preflight_message(settings, action=action)
+    message = await host_mutation_preflight_message(settings, action=action)
     if message is None:
         return None
-    if _request_prefers_json(request):
+    if request_prefers_json(request):
         return _operator_error_json(
             message,
             ErrorCode.UI_ACTION_UNAVAILABLE,
             key="flash_error",
             status_code=409,
         )
-    return await _dashboard_refresh_response(
+    return await dashboard_refresh_response(
         request,
         session,
         settings,
@@ -119,18 +124,18 @@ async def create_input_form(
         enabled=enabled,
     )
     return_dashboard = request.headers.get("x-cnc-dashboard-refresh") == "1"
-    async_dashboard = return_dashboard and _request_prefers_json(request)
+    async_dashboard = return_dashboard and request_prefers_json(request)
     try:
         blocker = await active_host_mutation_blocker(settings)
         if blocker is not None:
-            flash_error = _host_mutation_blocked_message("Input create", blocker)
+            flash_error = host_mutation_blocked_message("Input create", blocker)
             if async_dashboard:
                 return JSONResponse(
                     _operator_coded_message_payload(flash_error, key="flash_error"),
                     status_code=409,
                 )
             if return_dashboard:
-                return await _dashboard_refresh_response(
+                return await dashboard_refresh_response(
                     request,
                     session,
                     settings,
@@ -138,7 +143,7 @@ async def create_input_form(
                     flash_error=flash_error,
                     status_code=409,
                 )
-            return _dashboard_redirect(
+            return dashboard_redirect(
                 request, active_tab="inputs", flash_error=flash_error
             )
         payload = _input_create_payload_from_form(
@@ -203,7 +208,7 @@ async def create_input_form(
             failure_prefix="Input saved",
         )
         if return_dashboard:
-            return await _dashboard_refresh_response(
+            return await dashboard_refresh_response(
                 request,
                 session,
                 settings,
@@ -212,7 +217,7 @@ async def create_input_form(
                 flash_error=error_flash,
                 status_code=201 if apply_response.status == "success" else 200,
             )
-        return _dashboard_redirect(
+        return dashboard_redirect(
             request,
             active_tab="inputs",
             flash_success=success_flash,
@@ -223,21 +228,21 @@ async def create_input_form(
         logger.warning("ui.input.create.validation_failed", error=str(exc))
         if async_dashboard:
             return JSONResponse(
-                {"flash_error": _operator_validation_error(exc)}, status_code=400
+                {"flash_error": operator_validation_error(exc)}, status_code=400
             )
         if return_dashboard:
-            return await _dashboard_refresh_response(
+            return await dashboard_refresh_response(
                 request,
                 session,
                 settings,
                 active_tab="inputs",
-                flash_error=_operator_validation_error(exc),
+                flash_error=operator_validation_error(exc),
                 status_code=400,
             )
-        return _dashboard_redirect(
+        return dashboard_redirect(
             request,
             active_tab="inputs",
-            flash_error=_operator_validation_error(exc),
+            flash_error=operator_validation_error(exc),
         )
     except IntegrityError as exc:
         await session.rollback()
@@ -260,7 +265,7 @@ async def create_input_form(
                 status_code=400,
             )
         if return_dashboard:
-            return await _dashboard_refresh_response(
+            return await dashboard_refresh_response(
                 request,
                 session,
                 settings,
@@ -268,7 +273,7 @@ async def create_input_form(
                 flash_error=flash_error,
                 status_code=400,
             )
-        return _dashboard_redirect(
+        return dashboard_redirect(
             request,
             active_tab="inputs",
             flash_error=flash_error,
@@ -288,7 +293,7 @@ async def create_input_form(
                 status_code=400,
             )
         if return_dashboard:
-            return await _dashboard_refresh_response(
+            return await dashboard_refresh_response(
                 request,
                 session,
                 settings,
@@ -296,7 +301,7 @@ async def create_input_form(
                 flash_error=flash_error,
                 status_code=400,
             )
-        return _dashboard_redirect(
+        return dashboard_redirect(
             request,
             active_tab="inputs",
             flash_error=flash_error,
@@ -317,7 +322,7 @@ async def _delete_input_and_redirect(
         )
     ).scalar_one_or_none()
     if item is None:
-        return _dashboard_redirect(
+        return dashboard_redirect(
             request,
             active_tab="inputs",
             flash_error="input not found",
@@ -344,7 +349,7 @@ async def _delete_input_and_redirect(
         success_message="Input deleted.",
         failure_prefix="Input deleted",
     )
-    return _dashboard_redirect(
+    return dashboard_redirect(
         request,
         active_tab="inputs",
         flash_success=success_flash,
@@ -409,14 +414,14 @@ async def update_input_form(
         )
     ).scalar_one_or_none()
     if item is None:
-        if _request_prefers_json(request):
+        if request_prefers_json(request):
             return _operator_error_json(
                 "input not found",
                 ErrorCode.UI_RESOURCE_NOT_FOUND,
                 key="flash_error",
                 status_code=404,
             )
-        return _dashboard_redirect(
+        return dashboard_redirect(
             request,
             active_tab="inputs",
             flash_error="input not found",
@@ -431,7 +436,7 @@ async def update_input_form(
         return blocked
     try:
         if normalized_action == "delete":
-            if _request_prefers_json(request):
+            if request_prefers_json(request):
                 return await _input_delete_operation_response(
                     settings, input_id, input_kind=item.kind
                 )
@@ -466,7 +471,7 @@ async def update_input_form(
             shield_code_hash=shield_code_hash,
             shield_access_code=shield_access_code_display,
         )
-        if _request_prefers_json(request):
+        if request_prefers_json(request):
             operation = await create_operation(
                 settings,
                 kind="ui.input.update",
@@ -525,7 +530,7 @@ async def update_input_form(
             success_message="Input saved.",
             failure_prefix="Input saved",
         )
-        return _dashboard_redirect(
+        return dashboard_redirect(
             request,
             active_tab="inputs",
             flash_success=success_flash,
@@ -536,14 +541,14 @@ async def update_input_form(
         logger.warning(
             "ui.input.update.validation_failed", input_id=input_id, error=str(exc)
         )
-        if _request_prefers_json(request):
+        if request_prefers_json(request):
             return JSONResponse(
-                {"flash_error": _operator_validation_error(exc)}, status_code=400
+                {"flash_error": operator_validation_error(exc)}, status_code=400
             )
-        return _dashboard_redirect(
+        return dashboard_redirect(
             request,
             active_tab="inputs",
-            flash_error=_operator_validation_error(exc),
+            flash_error=operator_validation_error(exc),
         )
     except IntegrityError as exc:
         await session.rollback()
@@ -559,12 +564,12 @@ async def update_input_form(
             "input value already exists. Use a unique input value.",
             error_fields,
         )
-        if _request_prefers_json(request):
+        if request_prefers_json(request):
             return JSONResponse(
                 {"flash_error": flash_error, **error_fields},
                 status_code=400,
             )
-        return _dashboard_redirect(
+        return dashboard_redirect(
             request,
             active_tab="inputs",
             flash_error=flash_error,
@@ -583,12 +588,12 @@ async def update_input_form(
             "Unexpected error while saving the input. Check server logs with this instance.",
             error_fields,
         )
-        if _request_prefers_json(request):
+        if request_prefers_json(request):
             return JSONResponse(
                 {"flash_error": flash_error, **error_fields},
                 status_code=400,
             )
-        return _dashboard_redirect(
+        return dashboard_redirect(
             request,
             active_tab="inputs",
             flash_error=flash_error,
@@ -610,7 +615,7 @@ async def delete_input_form(
         )
         if blocked is not None:
             return blocked
-        if _request_prefers_json(request):
+        if request_prefers_json(request):
             item = await input_commands.load_input(session, input_id)
             if item is None:
                 return _operator_error_json(
@@ -637,12 +642,12 @@ async def delete_input_form(
             "Unexpected error while deleting the input. Check server logs with this instance.",
             error_fields,
         )
-        if _request_prefers_json(request):
+        if request_prefers_json(request):
             return JSONResponse(
                 {"flash_error": flash_error, **error_fields},
                 status_code=400,
             )
-        return _dashboard_redirect(
+        return dashboard_redirect(
             request,
             active_tab="inputs",
             flash_error=flash_error,

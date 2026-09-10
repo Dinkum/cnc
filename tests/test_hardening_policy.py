@@ -127,7 +127,9 @@ def test_runtime_renderers_enforce_the_same_reviewed_flags(tmp_path: Path) -> No
     for flag in hardening_podman_args(policy):
         assert flag in command
         assert flag in quadlet
-    mount = "/srv/data:/data:Z,ro,noexec,nosuid,nodev"
+    mount = (
+        "/srv/data:/data:Z,ro,noexec,nosuid,nodev,idmap=uids=@0-0-65536;gids=@0-0-65536"
+    )
     assert mount in command
     assert f"Volume={mount}" in quadlet
     assert "--privileged" not in quadlet

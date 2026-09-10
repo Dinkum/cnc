@@ -4796,66 +4796,6 @@ td {
 }
 
 
-.access-columns {
-  gap: 8px;
-}
-
-.access-key-download {
-  align-content: start;
-}
-
-.access-download-button {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 10px;
-  min-height: 42px;
-  width: 100%;
-  padding: 10px 14px;
-  border: 1px solid rgba(147, 227, 255, 0.24);
-  border-radius: 16px;
-  background: linear-gradient(135deg, rgba(104, 216, 255, 0.15), rgba(155, 240, 199, 0.11));
-  color: #eef7ff;
-  font-size: 0.84rem;
-  font-weight: 750;
-  line-height: 1.25;
-  text-align: center;
-  text-decoration: none;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
-}
-
-.access-download-button:hover {
-  border-color: rgba(147, 227, 255, 0.46);
-  color: #ffffff;
-  background: linear-gradient(135deg, rgba(104, 216, 255, 0.22), rgba(155, 240, 199, 0.16));
-}
-
-.access-download-button:focus-visible {
-  outline: 2px solid rgba(104, 216, 255, 0.7);
-  outline-offset: 3px;
-}
-
-.access-download-icon {
-  display: inline-grid;
-  place-items: center;
-  width: 22px;
-  height: 22px;
-  border-radius: 999px;
-  background: rgba(104, 216, 255, 0.14);
-  color: #9de8ff;
-  flex: 0 0 auto;
-}
-
-.access-download-icon svg {
-  width: 15px;
-  height: 15px;
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 2;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-}
-
 .code-block {
   display: grid;
   gap: 8px;
@@ -5557,8 +5497,44 @@ pre {
     padding: 11px 12px;
   }
 
-  .tabbar {
-    grid-template-columns: 1fr;
+  .output-table,
+  .output-table tbody {
+    display: block;
+    width: 100%;
+    min-width: 0;
+  }
+
+  .output-table thead {
+    display: none;
+  }
+
+  .output-table tr[data-output-row] {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .output-table tr[data-output-row] td {
+    border: 0;
+    padding: 10px 12px;
+    min-width: 0;
+  }
+
+  .output-table tr[data-output-row] td:first-child {
+    overflow-wrap: anywhere;
+  }
+
+  .output-table tr[data-output-row] td:nth-child(3) {
+    grid-column: 1 / -1;
+  }
+
+  .output-table .td-chevron {
+    display: none;
+  }
+
+  .output-table .output-load-cell {
+    min-width: 0;
+    width: 100%;
   }
 }
 
@@ -5655,3 +5631,20 @@ pre {
   .hardening-editor-table th:nth-child(2) { width: 25%; }
   .hardening-confirm .confirm-modal-card { padding: 16px; }
 }
+
+.output-metrics-heading { flex-direction: row; align-items: center; }
+.output-metrics-heading + .metrics-actions { margin-bottom: 14px; }
+.metric-export { position: relative; margin-left: auto; }
+.metric-export-options {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 10;
+  min-width: 160px;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel-elevated);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+}
+.metric-export-options button { width: 100%; text-align: left; white-space: nowrap; }

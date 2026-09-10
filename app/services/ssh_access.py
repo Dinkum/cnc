@@ -51,12 +51,20 @@ def _account_mutation_lock_path(settings: Settings) -> Path:
 @asynccontextmanager
 async def _host_account_mutation_lock(settings: Settings):
     lock_path = _account_mutation_lock_path(settings)
-    lock = FileLock(lock_path, blocking=True, lock_path=lock_path)
-    await asyncio.to_thread(lock.__enter__)
+    lock = FileLock(lock_path, blocking=False, lock_path=lock_path)
+    # Keep ownership on the event-loop thread. Separate to_thread calls can
+    # reuse an owning worker and falsely appear reentrant, or abandon a waiter
+    # on cancellation. Nonblocking attempts preserve the cross-process lock.
+    while True:
+        try:
+            lock.__enter__()
+            break
+        except BlockingIOError:
+            await asyncio.sleep(0.05)
     try:
         yield
     finally:
-        await asyncio.to_thread(lock.__exit__, None, None, None)
+        lock.__exit__(None, None, None)
 
 
 def _write_file_atomic(path: Path, content: str, mode: int) -> bool:
@@ -81,16 +89,19 @@ def _write_file_atomic(path: Path, content: str, mode: int) -> bool:
     return True
 
 
-def _snapshot_file(path: Path) -> tuple[bytes | None, int | None]:
+def _snapshot_file(
+    path: Path,
+) -> tuple[bytes | None, int | None, int | None, int | None]:
     if not path.exists():
-        return None, None
-    return path.read_bytes(), path.stat().st_mode & 0o777
+        return None, None, None, None
+    stat = path.stat()
+    return path.read_bytes(), stat.st_mode & 0o777, stat.st_uid, stat.st_gid
 
 
 def _restore_file_snapshot(
-    path: Path, snapshot: tuple[bytes | None, int | None]
+    path: Path, snapshot: tuple[bytes | None, int | None, int | None, int | None]
 ) -> None:
-    content, mode = snapshot
+    content, mode, uid, gid = snapshot
     if content is None:
         try:
             path.unlink()
@@ -105,6 +116,8 @@ def _restore_file_snapshot(
         with os.fdopen(fd, "wb") as handle:
             handle.write(content)
         os.chmod(tmp_name, mode or 0o644)
+        if uid is not None and gid is not None:
+            os.chown(tmp_name, uid, gid)
         os.replace(tmp_name, path)
     finally:
         try:
@@ -459,6 +472,7 @@ async def reconcile_backend_ssh_access(
             settings.ssh_backend_root_wrapper_path,
             settings.ssh_backend_sshd_config_path,
             settings.ssh_backend_sudoers_path,
+            *(_backend_authorized_keys_path(settings, name) for name in desired),
         )
         previous_files = {path: _snapshot_file(path) for path in managed_paths}
         sudoers_content = _sudoers_config(settings)

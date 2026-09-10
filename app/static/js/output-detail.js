@@ -8,6 +8,7 @@
     loadDeferredScript,
     normalizeTimestampValue,
     renderLocalTimes,
+    withRequestDeadline,
   } = window.CNCUI;
   const outputDetailConfig = window.CNCUI.readJsonScript("output-detail-config", {});
   const operationProgressPipelines = outputDetailConfig.operationProgressPipelines || {};
@@ -1668,7 +1669,7 @@
       if (clonePending) return;
       const name = cloneNameInput?.value.trim() || "";
       const port = clonePortInput?.value.trim() || "";
-      if (!name || !port) return;
+      if (!name || (clonePortInput && !port)) return;
       clonePending = true;
       const firstCloneStep = markFirstOperationStep(
         "clone",
@@ -1684,7 +1685,7 @@
         let formData = new FormData();
         formData.set("csrf_token", csrfToken);
         formData.set("name", name);
-        formData.set("port", port);
+        if (clonePortInput) formData.set("port", port);
         let response = await fetch(`/ui/backends/${backendId}/clone`, {
           method: "POST",
           headers: { Accept: "application/json" },
@@ -1696,7 +1697,7 @@
             formData = new FormData();
             formData.set("csrf_token", token);
             formData.set("name", name);
-            formData.set("port", port);
+            if (clonePortInput) formData.set("port", port);
             response = await fetch(`/ui/backends/${backendId}/clone`, {
               method: "POST",
               headers: { Accept: "application/json" },
@@ -2323,10 +2324,10 @@
     if (force && runtimeRefreshAbortController) runtimeRefreshAbortController.abort();
     const controller = new AbortController();
     runtimeRefreshAbortController = controller;
-    const requestPromise = (async () => {
+    const requestPromise = withRequestDeadline(async (signal) => {
       const response = await fetch(`/api/backends/${backendId}/runtime-signals`, {
         headers: { Accept: "application/json" },
-        signal: controller.signal,
+        signal,
       });
       const payload = await response.json();
       if (!response.ok) throw new Error(`runtime signals request failed: ${response.status}`);
@@ -2338,7 +2339,7 @@
       renderRuntimeSignals(payload);
       runtimeRefreshFailures = 0;
       return payload;
-    })().catch((error) => {
+    }, { controller }).catch((error) => {
       if (error?.name !== "AbortError") runtimeRefreshFailures += 1;
       throw error;
     }).finally(() => {
@@ -2581,7 +2582,10 @@
 
     renderMetricsSummary(payload);
 
-    if (chartInstance) { chartInstance.destroy(); chartInstance = null; }
+    if ((!available || !series.length) && chartInstance) {
+      chartInstance.destroy();
+      chartInstance = null;
+    }
 
     if (!available) {
       metricsEmpty.hidden = false;
@@ -2833,14 +2837,14 @@
       },
     };
 
-    chartInstance = new Chart(ctx, {
+    const config = {
       type: "line",
       data: { datasets },
       plugins: [limitLabelPlugin, window.cncMetricEventMarkers?.plugin].filter(Boolean),
       options: {
         responsive: true,
         maintainAspectRatio: false,
-        animation: { duration: 350, easing: "easeOutQuart" },
+        animation: false,
         interaction: { mode: "index", intersect: false, axis: "x" },
         plugins: {
           cncMetricEventMarkers: {
@@ -2933,7 +2937,16 @@
           },
         },
       },
-    });
+    };
+    if (chartInstance) {
+      // Keep the canvas mounted; fresh callbacks and plugins use this payload's limits.
+      chartInstance.data = config.data;
+      chartInstance.options = config.options;
+      chartInstance.config.plugins.splice(0, chartInstance.config.plugins.length, ...config.plugins);
+      chartInstance.update("none");
+    } else {
+      chartInstance = new Chart(ctx, config);
+    }
   };
 
   const showMetricHistoryError = () => {
@@ -2946,18 +2959,21 @@
 
   const loadMetricHistory = async () => {
     if (!metricSelect || !timeframeSelect || !metricsChart || !metricsEmpty) return;
-    lastMetricPayload = null;
+    const refreshing = Boolean(chartInstance
+      && lastMetricPayload?.metric?.key === outputMetricKey()
+      && lastMetricPayload?.timeframe?.key === outputTimeframeKey());
+    if (!refreshing) lastMetricPayload = null;
     syncOutputMetricExport();
     const requestId = ++metricsRequestId;
     metricsAbortController?.abort();
     const controller = new AbortController();
     metricsAbortController = controller;
     metricsEmpty.hidden = true;
-    setMetricsLoading(true);
+    setMetricsLoading(!refreshing);
     try {
       await ensureMetricChartAssets();
       if (controller.signal.aborted || requestId !== metricsRequestId) return;
-      await waitForMetricsLoadingPaint();
+      if (!refreshing) await waitForMetricsLoadingPaint();
       const chartWidth = Math.round(
         metricsChart.parentElement?.clientWidth || metricsChart.clientWidth || 720
       );

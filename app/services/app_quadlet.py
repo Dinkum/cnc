@@ -11,6 +11,11 @@ from app.services.hardening_policy import (
     hardening_volumes,
     read_hardening_policy,
 )
+from app.services.guest_isolation import (
+    guest_podman_args,
+    guest_rootfs_argument,
+    guest_volume_arguments,
+)
 from app.config import Settings
 from app.logger import get_logger
 from app.models.entities import Backend
@@ -196,6 +201,7 @@ def render_quadlet_container(
     podman_args = [
         "--systemd=always",
         *hardening_podman_args(policy),
+        *guest_podman_args(),
         f"--cpu-shares={resource_profile.cpu_shares or 1024}",
         f"--cpus={_cpu_quota_to_cpus(resource_profile.cpu_quota, resource_profile.host_cpu_count)}",
     ]
@@ -208,7 +214,7 @@ def render_quadlet_container(
         "[Container]",
         f"ContainerName={container}",
         f"HostName={container}",
-        f"Rootfs={rootfs}",
+        f"Rootfs={guest_rootfs_argument(rootfs)}",
         _network_line(network_unit),
         *(
             _network_line(
@@ -231,7 +237,9 @@ def render_quadlet_container(
         lines.append(f"Environment={link.env_key}={link.url}")
     for dns_server in configured_app_dns_servers(settings):
         lines.append(f"DNS={dns_server}")
-    for volume in hardening_volumes(policy, parse_volumes_json(backend.volumes_json)):
+    for volume in guest_volume_arguments(
+        hardening_volumes(policy, parse_volumes_json(backend.volumes_json))
+    ):
         lines.append(f"Volume={volume}")
     health_cmd = _healthcheck_command(backend)
     if health_cmd:
@@ -249,6 +257,17 @@ def render_quadlet_container(
             f"PodmanArgs={' '.join(podman_args)}",
             "",
             "[Service]",
+            "ExecStartPre="
+            + shlex.join(
+                [str(settings.guest_runtime_helper_path), "--rootfs", str(rootfs)]
+                + [
+                    arg
+                    for volume in hardening_volumes(
+                        policy, parse_volumes_json(backend.volumes_json)
+                    )
+                    for arg in ("--volume", volume)
+                ]
+            ),
             "Slice=cnc-apps.slice",
             f"MemoryHigh={resource_profile.memory_high}",
             f"MemoryMax={resource_profile.memory_max}",

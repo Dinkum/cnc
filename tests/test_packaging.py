@@ -1,8 +1,8 @@
-from pathlib import Path
 import re
 import shutil
 import subprocess
 import tomllib
+from pathlib import Path
 
 import pytest
 
@@ -435,7 +435,7 @@ def test_output_create_form_uses_async_save_handler() -> None:
     output_mutations_text = Path("app/ui/routes/output_mutations.py").read_text(
         encoding="utf-8"
     )
-    shared_route_text = Path("app/ui/routes/shared.py").read_text(encoding="utf-8")
+    http_text = Path("app/ui/http.py").read_text(encoding="utf-8")
 
     assert "data-backend-create-form" in template_text
     assert "const bindBackendCreateForms" in template_text
@@ -496,7 +496,7 @@ def test_output_create_form_uses_async_save_handler() -> None:
     assert "_run_update_backend_inputs_operation," in output_mutations_text
     assert "_run_update_backend_state_operation," in output_mutations_text
     assert '{ progress: 6, label: "Reading output form"' not in output_detail_text
-    assert "output_save_progress_steps()" in shared_route_text
+    assert "output_save_progress_steps()" in http_text
     assert "renderDisabledRuntimeState" in output_detail_text
     assert "return Math.max(4, Math.min(96, numericProgress));" in template_text
     assert "const progressStepIndex = (steps, progress) =>" in template_text
@@ -721,23 +721,24 @@ def test_update_check_refreshes_status_without_starting_update_progress() -> Non
 def test_dashboard_removes_redundant_server_tab() -> None:
     template_text = _dashboard_source_text()
     css_text = Path("app/static/css/app.css").read_text(encoding="utf-8")
-    shared_route_text = Path("app/ui/routes/shared.py").read_text(encoding="utf-8")
+    from app.ui.read_models import VALID_DASHBOARD_TABS
+
+    dashboard_view_text = Path("app/ui/dashboard/presentation.py").read_text(
+        encoding="utf-8"
+    )
 
     assert 'data-tab="status"' not in template_text
     assert 'data-panel="status"' not in template_text
     assert "data-server-load-card" not in template_text
-    assert (
-        '"status"'
-        not in shared_route_text.split("VALID_DASHBOARD_TABS", 1)[1].split("\n", 1)[0]
-    )
+    assert "status" not in VALID_DASHBOARD_TABS
     assert "renderServerLoad" not in template_text
     assert "serverLoadElements" not in template_text
     assert "status-load" not in css_text
     assert (
         "Current backend limits match the last successful save."
-        not in shared_route_text
+        not in dashboard_view_text
     )
-    assert "_build_status_load_panel" not in shared_route_text
+    assert "_build_status_load_panel" not in dashboard_view_text
     assert "STATUS_LIVE_REFRESH_TABS" not in template_text
     assert "if (!STATUS_POLL_TABS.has(activeTab))" in template_text
     refresh_block = template_text.split("const refreshVisibleTabStatus = () => {", 1)[

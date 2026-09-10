@@ -1,3 +1,11 @@
+import pytest
+
+import app.ui.http as ui_http
+import app.ui.outputs.context as ui_outputs_context
+import app.ui.outputs.data as ui_outputs_data
+import app.ui.outputs.presentation as ui_outputs_presentation
+import app.ui.view_models as ui_view_models
+
 from .support import (
     Backend,
     BackendBackup,
@@ -9,14 +17,14 @@ from .support import (
     Path,
     Settings,
     SimpleNamespace,
-    _PostedRequest,
     _dashboard_client_source,
     _make_session,
+    _PostedRequest,
     _request,
     app_sandbox_dir,
     backend_commands,
-    delete_backend_backup,
     datetime,
+    delete_backend_backup,
     json,
     select,
     selectinload,
@@ -24,7 +32,6 @@ from .support import (
     ui_backup,
     ui_pages,
     ui_reads,
-    ui_shared,
     view_models,
     write_app_control_assets,
 )
@@ -39,7 +46,7 @@ def test_backup_summary_includes_covered_paths() -> None:
         bundle_path="/tmp/web.tar.gz",
     )
 
-    payload = ui_shared._backup_summary(
+    payload = ui_view_models._backup_summary(
         backup,
         {
             "covered_paths_summary": "/srv/web-data",
@@ -64,7 +71,7 @@ def test_backup_summary_includes_covered_paths() -> None:
 
 
 def test_backup_summary_shows_covered_paths_without_existing_backup() -> None:
-    payload = ui_shared._backup_summary(
+    payload = ui_view_models._backup_summary(
         None, planned_coverage="/var/lib/cnc/sandboxes/web"
     )
 
@@ -87,9 +94,9 @@ def test_planned_backup_coverage_includes_app_sandbox_and_volumes(
         volumes_json=f'["{data_dir}:/srv/data"]',
     )
 
-    assert ui_shared._planned_backup_coverage_summary(backend, settings) == (
-        f"{app_sandbox_dir(settings, 'web')}, {data_dir}"
-    )
+    assert ui_outputs_presentation.planned_backup_coverage_summary(
+        backend, settings
+    ) == (f"{app_sandbox_dir(settings, 'web')}, {data_dir}")
 
 
 def test_backup_history_rows_include_covered_paths() -> None:
@@ -187,8 +194,8 @@ async def test_backup_backend_form_renders_success(monkeypatch, tmp_path: Path) 
         return SimpleNamespace(status_code=status_code)
 
     monkeypatch.setattr(ui_backup, "create_backend_backup", fake_create_backup)
-    monkeypatch.setattr(ui_backup, "_output_page_context", fake_output_context)
-    monkeypatch.setattr(ui_shared.templates, "TemplateResponse", fake_template_response)
+    monkeypatch.setattr(ui_backup, "output_page_context", fake_output_context)
+    monkeypatch.setattr(ui_http.templates, "TemplateResponse", fake_template_response)
 
     async with maker() as session:
         session.add(
@@ -285,7 +292,7 @@ async def test_backup_preflight_returns_409_without_creating_operation(
         return "Backup is unavailable while host apply is running."
 
     monkeypatch.setattr(ui_backup, "enforce_csrf", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(ui_backup, "_host_mutation_preflight_message", blocked)
+    monkeypatch.setattr(ui_backup, "host_mutation_preflight_message", blocked)
 
     async with maker() as session:
         session.add(
@@ -512,8 +519,8 @@ async def test_restore_backend_form_renders_missing_backup_error(
         return SimpleNamespace(status_code=status_code)
 
     monkeypatch.setattr(ui_backup, "restore_latest_backend_backup", fake_restore_backup)
-    monkeypatch.setattr(ui_backup, "_output_page_context", fake_output_context)
-    monkeypatch.setattr(ui_shared.templates, "TemplateResponse", fake_template_response)
+    monkeypatch.setattr(ui_backup, "output_page_context", fake_output_context)
+    monkeypatch.setattr(ui_http.templates, "TemplateResponse", fake_template_response)
 
     async with maker() as session:
         session.add(
@@ -594,8 +601,8 @@ async def test_restore_backend_form_uses_selected_backup_id(
 
     monkeypatch.setattr(ui_backup, "get_backend_backup", fake_get_backup)
     monkeypatch.setattr(ui_backup, "restore_backend_backup", fake_restore_backup)
-    monkeypatch.setattr(ui_backup, "_output_page_context", fake_output_context)
-    monkeypatch.setattr(ui_shared.templates, "TemplateResponse", fake_template_response)
+    monkeypatch.setattr(ui_backup, "output_page_context", fake_output_context)
+    monkeypatch.setattr(ui_http.templates, "TemplateResponse", fake_template_response)
 
     async with maker() as session:
         session.add(
@@ -680,8 +687,8 @@ async def test_import_backend_form_imports_without_restore(
 
     monkeypatch.setattr(ui_backup, "import_backend_backup_bundle", fake_import_backup)
     monkeypatch.setattr(ui_backup, "restore_backend_backup", fail_restore)
-    monkeypatch.setattr(ui_backup, "_output_page_context", fake_output_context)
-    monkeypatch.setattr(ui_shared.templates, "TemplateResponse", fake_template_response)
+    monkeypatch.setattr(ui_backup, "output_page_context", fake_output_context)
+    monkeypatch.setattr(ui_http.templates, "TemplateResponse", fake_template_response)
 
     async with maker() as session:
         session.add(
@@ -864,7 +871,9 @@ async def test_output_page_context_uses_backup_shell_until_hydration(
         )
         await session.commit()
 
-        context = await ui_shared._output_page_context(session, settings, backend.id)
+        context = await ui_outputs_context.output_page_context(
+            session, settings, backend.id
+        )
 
     assert context["backup_signals_pending"] is True
     assert context["backup_history"] == []
@@ -957,7 +966,7 @@ async def test_output_detail_renders_fast_page_shell_with_lazy_backup_hydration(
         multi_node_enabled=True,
     )
     monkeypatch.setattr(
-        ui_shared,
+        ui_outputs_data,
         "peek_cached_status",
         lambda: {
             "services": [
@@ -1108,7 +1117,10 @@ async def test_output_detail_renders_fast_page_shell_with_lazy_backup_hydration(
     assert "published port" not in body
     assert "internal app port" in body
     assert body.index("<h2>Access</h2>") < body.index("<h2>Recent event history</h2>")
-    assert f'<form method="post" action="/api/backends/{backend.id}/ssh-key">' in body
+    assert 'id="create-open"' in body
+    assert 'id="import-open"' in body
+    assert "AGENTS.md Connection Instructions" in body
+    assert "/static/js/output-ssh.js" in body
     assert f'href="/api/backends/{backend.id}/ssh-key"' not in body
     assert "Recent event history" in body
     assert "event-details" in template_text
@@ -1338,3 +1350,15 @@ async def test_output_detail_renders_fast_page_shell_with_lazy_backup_hydration(
     assert "overflow-x: hidden;" in css
     assert ".code-block pre,\n  .compact-block pre" in css
     assert "button:disabled" in css
+
+
+@pytest.fixture(autouse=True)
+def _unmounted_guest_archive_view(monkeypatch):
+    # Route fixtures use local filesystem trees with no running Podman guest.
+    from app.services.guest_metadata import GuestArchiveView
+
+    monkeypatch.setattr(
+        GuestArchiveView,
+        "capture",
+        classmethod(lambda cls, container, runner=None: cls(container, "fixture")),
+    )

@@ -4,7 +4,7 @@ import argparse
 import subprocess
 import sys
 
-from app.cli.common import bind_command, load_backend_async
+from app.cli.common import CommandResult, bind_command, load_backend_async
 
 
 def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -13,9 +13,63 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
     bind_command(shell, handler=_run_shell_command)
 
     exec_parser = subparsers.add_parser("exec")
-    exec_parser.add_argument("backend")
-    exec_parser.add_argument("exec_args", nargs=argparse.REMAINDER)
-    bind_command(exec_parser, handler=_run_exec_command)
+    register_exec(exec_parser)
+
+
+def register_exec(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("backend", metavar="OUTPUT")
+    parser.add_argument(
+        "--bg",
+        action="store_true",
+        help="Submit a supervised background command; return its operation ID",
+    )
+    parser.add_argument(
+        "--request-key",
+        help="Reuse this key when retrying the same background submission",
+    )
+    parser.add_argument(
+        "--timeout", type=int, help="Optional background execution deadline in seconds"
+    )
+    parser.add_argument("--json", action="store_true", dest="json_output")
+    parser.add_argument("exec_args", nargs=argparse.REMAINDER, metavar="-- COMMAND ...")
+    bind_command(
+        parser,
+        handler=_run_exec_command,
+        formatter=_format_exec_text,
+        needs_settings=True,
+    )
+
+
+def _format_exec_text(payload: dict) -> str:
+    return f"operation: {payload['operation_id']}\nstatus: {payload['status']}\nrequest_key: {payload['request_key']}"
+
+
+def _exec_options(args: argparse.Namespace) -> list[str]:
+    values = list(args.exec_args)
+    # REMAINDER preserves arbitrary application flags. CNC options after OUTPUT
+    # are parsed only before an explicit --, never from the guest command itself.
+    if "--" in values:
+        boundary = values.index("--")
+        options, values = values[:boundary], values[boundary + 1 :]
+        parser = argparse.ArgumentParser(add_help=False, exit_on_error=False)
+        parser.add_argument("--bg", action="store_true", default=argparse.SUPPRESS)
+        parser.add_argument("--request-key", default=argparse.SUPPRESS)
+        parser.add_argument("--timeout", type=int, default=argparse.SUPPRESS)
+        parser.add_argument(
+            "--json", action="store_true", dest="json_output", default=argparse.SUPPRESS
+        )
+        parsed, unknown = parser.parse_known_args(options)
+        if unknown:
+            # Existing `exec OUTPUT command -- flags` remains a raw command.
+            if options and not options[0].startswith("--"):
+                return list(args.exec_args)
+            raise ValueError(
+                "unknown exec option; place application arguments after --"
+            )
+        vars(args).update(vars(parsed))
+    elif values and values[0] in {"--bg", "--request-key", "--timeout", "--json"}:
+        raise ValueError("separate CNC execution options from the command with --")
+    return values
 
 
 async def resolve_shell_app_async(
@@ -77,11 +131,32 @@ async def _run_shell_command(args: argparse.Namespace, settings) -> int:
     return run_shell(container)
 
 
-async def _run_exec_command(args: argparse.Namespace, settings) -> int:
-    command_args = normalize_exec_args(list(args.exec_args))
+async def _run_exec_command(args: argparse.Namespace, settings) -> CommandResult | int:
+    command_args = _exec_options(args)
     if not command_args:
-        print("exec requires a command after --", file=sys.stderr)
-        return 1
+        return 1, None, "exec requires a command after --"
+    if getattr(args, "bg", False):
+        from app.services.command_jobs import submit_job
+
+        assert settings is not None
+        frame = {"argv": command_args}
+        if getattr(args, "timeout", None) is not None:
+            frame["timeout_sec"] = args.timeout
+        payload = await submit_job(
+            settings,
+            args.backend,
+            frame,
+            request_key=getattr(args, "request_key", None),
+        )
+        return 0, payload, None
+    if (
+        getattr(args, "json_output", False)
+        or getattr(args, "request_key", None)
+        or getattr(args, "timeout", None) is not None
+    ):
+        raise ValueError(
+            "--json, --request-key and --timeout require --bg; foreground exec preserves command streams"
+        )
     exit_code, container, error = await resolve_shell_app_async(args.backend)
     if error is not None:
         print(error, file=sys.stderr)

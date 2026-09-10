@@ -1012,3 +1012,39 @@ async def test_host_operation_reuses_engine_and_disposes_owner(tmp_path, monkeyp
         assert row.status == "success"
         assert json.loads(row.details_json)["progress"] == 9
     await maker.kw["bind"].dispose()
+
+
+@pytest.mark.asyncio
+async def test_progress_does_not_wait_for_mutation_writer_and_terminal_is_durable(
+    tmp_path,
+):
+    from app.services.operations import OperationHandle
+
+    maker = await _make_session(tmp_path / "app.db")
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'app.db'}",
+        app_control_dir=tmp_path / "control",
+    )
+    operation = await create_operation(
+        settings, kind="ui.input.delete", phase="Validate input"
+    )
+    async with maker() as writer:
+        row = await writer.get(Operation, operation.id)
+        row.phase = "Held by mutation"
+        await writer.flush()
+        handle = OperationHandle(
+            id=operation.id, kind="ui.input.delete", settings=settings
+        )
+        await asyncio.wait_for(
+            handle.update(phase="Preflight", details={"message": "Checking storage"}),
+            timeout=1,
+        )
+        snapshot = read_operation_progress(settings, operation.id)
+        assert snapshot["phase"] == "Preflight"
+        await writer.rollback()
+    await handle.complete("failed", phase="storage_preflight", error="Storage blocked")
+    async with maker() as reader:
+        stored = await reader.get(Operation, operation.id)
+        assert stored.status == "failed"
+        assert stored.error == "Storage blocked"
+    assert read_operation_progress(settings, operation.id) is None

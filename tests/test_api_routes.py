@@ -81,10 +81,16 @@ async def test_ready_returns_ok_after_db_ping(tmp_path: Path) -> None:
             monkeypatch.undo()
 
     assert response.status_code == 200
-    assert (
-        response.body
-        == b'{"status":"ok","config":"ok","db":"ok","startup":{"config":{"status":"ok","error":""},"db":{"status":"ok","error":""},"runtime_assets":{"status":"ok","error":""},"self_audit":{"status":"ok","error":""}}}'
-    )
+    payload = json.loads(response.body)
+    assert payload["status"] == payload["config"] == payload["db"] == "ok"
+    assert payload["startup"] == {
+        "config": {"status": "ok", "error": ""},
+        "db": {"status": "ok", "error": ""},
+        "runtime_assets": {"status": "ok", "error": ""},
+        "self_audit": {"status": "ok", "error": ""},
+    }
+    assert "queue_handler_attached" in payload["logging"]
+    assert "listener_alive" in payload["logging"]
 
 
 @pytest.mark.asyncio
@@ -856,3 +862,14 @@ async def test_input_write_routes_invalidate_status_cache(
         {"prefill": True},
         {"prefill": True},
     ]
+
+
+@pytest.fixture(autouse=True)
+def _unmounted_guest_archive_view(monkeypatch):
+    # Route fixtures use local filesystem trees with no running Podman guest.
+    from app.services.guest_metadata import GuestArchiveView
+
+    monkeypatch.setattr(
+        GuestArchiveView, "capture",
+        classmethod(lambda cls, container, runner=None: cls(container, "fixture")),
+    )

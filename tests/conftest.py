@@ -39,9 +39,8 @@ def _default_test_host_paths(monkeypatch, tmp_path):
         return True
 
     monkeypatch.setattr("app.services.port_preflight.is_loopback_port_free", is_free)
-    monkeypatch.setattr("app.services.backend_commands.is_loopback_port_free", is_free)
+    monkeypatch.setattr("app.services.clone_defaults.is_loopback_port_free", is_free)
     monkeypatch.setattr("app.services.port_allocator.is_loopback_port_free", is_free)
-    monkeypatch.setattr("app.ui.routes.shared.is_loopback_port_free", is_free)
 
 
 @pytest_asyncio.fixture(autouse=True)

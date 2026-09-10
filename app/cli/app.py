@@ -6,7 +6,7 @@ from app.cli.common import bind_command
 from app.cli.doctor import doctor_app_async, format_doctor_text
 from app.cli.fix import fix_app_async, format_fix_text
 from app.cli.logs import format_logs_text, logs_app_async
-from app.cli.shell import _run_exec_command, _run_shell_command
+from app.cli.shell import _run_shell_command, register_exec
 from app.config import Settings
 from app.logger import get_logger
 
@@ -14,10 +14,22 @@ from app.logger import get_logger
 logger = get_logger("cli.app")
 
 
-def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
-    app = subparsers.add_parser("app")
+def register(
+    subparsers: argparse._SubParsersAction[argparse.ArgumentParser],
+    *,
+    name: str = "app",
+) -> argparse._SubParsersAction[argparse.ArgumentParser]:
+    app = subparsers.add_parser(name)
     app_subparsers = app.add_subparsers(dest="app_command", required=True)
+    register_runtime_commands(app_subparsers, legacy_aliases=True)
+    return app_subparsers
 
+
+def register_runtime_commands(
+    app_subparsers: argparse._SubParsersAction[argparse.ArgumentParser],
+    *,
+    legacy_aliases: bool = False,
+) -> None:
     doctor = app_subparsers.add_parser("doctor")
     doctor.add_argument("backend")
     doctor.add_argument("--json", action="store_true", dest="json_output")
@@ -35,12 +47,16 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
         fix, handler=_run_fix_command, formatter=format_fix_text, needs_settings=True
     )
 
-    repair = app_subparsers.add_parser("repair", help=argparse.SUPPRESS)
-    repair.add_argument("backend")
-    repair.add_argument("--json", action="store_true", dest="json_output")
-    bind_command(
-        repair, handler=_run_fix_command, formatter=format_fix_text, needs_settings=True
-    )
+    if legacy_aliases:
+        repair = app_subparsers.add_parser("repair", help="Alias for fix")
+        repair.add_argument("backend")
+        repair.add_argument("--json", action="store_true", dest="json_output")
+        bind_command(
+            repair,
+            handler=_run_fix_command,
+            formatter=format_fix_text,
+            needs_settings=True,
+        )
 
     migrate_runtime = app_subparsers.add_parser("migrate-runtime")
     migrate_runtime.add_argument("backend")
@@ -80,9 +96,7 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
     bind_command(shell, handler=_run_shell_command)
 
     exec_parser = app_subparsers.add_parser("exec")
-    exec_parser.add_argument("backend")
-    exec_parser.add_argument("exec_args", nargs=argparse.REMAINDER)
-    bind_command(exec_parser, handler=_run_exec_command)
+    register_exec(exec_parser)
 
 
 async def _run_doctor_command(args: argparse.Namespace, settings: Settings | None):

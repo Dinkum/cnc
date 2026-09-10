@@ -1,0 +1,9 @@
+<article class="card span-2 ssh-access">
+  <div class="section-head"><h2>Access</h2></div>
+  {% for item in operator_commands if item.label == "ssh shell" %}
+  <div class="ssh-connect code-block compact-block"><div class="code-head code-head-actions"><span>SSH connection</span><button type="button" class="copy-button" data-copy-target="operator-command-{{ loop.index }}">Copy</button></div><pre id="operator-command-{{ loop.index }}">{{ item.command }}</pre></div>
+  {% endfor %}
+  <div class="ssh-key-head"><div><h3>SSH keys <span id="key-count" class="summary-pill">…</span></h3><p class="subtle">Give each device or runner its own access.</p></div><div class="ssh-actions"><button class="ghost" id="import-open">Add public key</button><button id="create-open">Create SSH key</button></div></div>
+  <div id="keys" class="ssh-key-list" aria-live="polite"><p class="ssh-empty">Loading SSH keys…</p></div>
+  <p id="notice" role="status" class="subtle ssh-notice">{{ "Connect using the tailnet hostname or Tailscale IP." if selected_backend.enabled else "Enable this output to connect over SSH." }}</p>
+</article>

@@ -752,3 +752,104 @@ async def test_remove_backend_ssh_access_only_removes_requested_managed_users(
 
     assert details == {"ssh_backends_removed": ["web"], "ssh_aliases_removed": True}
     assert checked == [["userdel", "web"]]
+
+
+@pytest.mark.parametrize("cancel_waiter", [False, True])
+def test_account_lock_serializes_with_one_worker_and_releases_after_cancellation(
+    tmp_path: Path, cancel_waiter: bool
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    from app.services.file_locks import FileLock, _PROCESS_LOCK_OWNERS
+
+    settings = Settings(_env_file=None, apply_lock_path=tmp_path / "apply.lock")
+    lock_path = ssh_access._account_mutation_lock_path(settings)
+
+    async def scenario():
+        asyncio.get_running_loop().set_default_executor(
+            ThreadPoolExecutor(max_workers=1)
+        )
+        waiting = asyncio.Event()
+        entered = False
+
+        async def contender():
+            nonlocal entered
+            waiting.set()
+            async with ssh_access._host_account_mutation_lock(settings):
+                entered = True
+
+        async with ssh_access._host_account_mutation_lock(settings):
+            task = asyncio.create_task(contender())
+            await waiting.wait()
+            await asyncio.sleep(0.02)
+            assert not entered
+            if cancel_waiter:
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            # Cancelling a waiter must not release the current holder's lock.
+            with pytest.raises(BlockingIOError):
+                with FileLock(lock_path, blocking=False, lock_path=lock_path):
+                    pass
+        if not cancel_waiter:
+            await asyncio.wait_for(task, 1)
+            assert entered
+        # Cancellation inside the critical section must also release ownership.
+        with pytest.raises(asyncio.CancelledError):
+            async with ssh_access._host_account_mutation_lock(settings):
+                raise asyncio.CancelledError
+        with FileLock(lock_path, blocking=False, lock_path=lock_path):
+            pass
+        assert lock_path.resolve() not in _PROCESS_LOCK_OWNERS
+
+    asyncio.run(scenario())
+
+
+async def test_reconcile_failure_restores_all_output_key_files(monkeypatch, tmp_path):
+    settings = Settings(
+        ssh_backend_home_root=tmp_path / "homes",
+        ssh_backend_authorized_keys_path=tmp_path / "shared-keys",
+        ssh_backend_authorized_keys_source_path=tmp_path / "operator-keys",
+        ssh_backend_root_wrapper_path=tmp_path / "wrapper",
+        ssh_backend_sshd_config_path=tmp_path / "sshd-config",
+        ssh_backend_sudoers_path=tmp_path / "sudoers",
+        apply_lock_path=tmp_path / "apply.lock",
+    )
+    original = settings.ssh_backend_home_root / "web" / ".ssh" / "authorized_keys"
+    original.parent.mkdir(parents=True)
+    original.write_text("old-key\n")
+    original.chmod(0o600)
+    metadata = original.stat()
+    monkeypatch.setattr(ssh_access, "_validate_sudoers_config", lambda *_args: None)
+    monkeypatch.setattr(
+        ssh_access, "_existing_backend_ssh_users", lambda *_args: {"web", "worker"}
+    )
+    monkeypatch.setattr(ssh_access, "_backend_user_exists", lambda *_args: True)
+
+    async def no_op(*_args, **_kwargs):
+        return False
+
+    async def fail_reload():
+        raise RuntimeError("reload failed")
+
+    monkeypatch.setattr(ssh_access, "_ensure_group_created", no_op)
+    monkeypatch.setattr(ssh_access, "_ensure_backend_user", no_op)
+    monkeypatch.setattr(ssh_access, "run_command_checked_async", no_op)
+    monkeypatch.setattr(ssh_access, "_reload_sshd", fail_reload)
+    with pytest.raises(RuntimeError, match="reload failed"):
+        await ssh_access.reconcile_backend_ssh_access(
+            [
+                ssh_access.BackendSshAccess("web", "new-key\nsecond-key"),
+                ssh_access.BackendSshAccess("worker", "worker-key"),
+            ],
+            settings,
+        )
+    assert original.read_text() == "old-key\n"
+    assert original.stat().st_mode & 0o777 == 0o600
+    assert (original.stat().st_uid, original.stat().st_gid) == (
+        metadata.st_uid,
+        metadata.st_gid,
+    )
+    assert not (
+        settings.ssh_backend_home_root / "worker" / ".ssh" / "authorized_keys"
+    ).exists()

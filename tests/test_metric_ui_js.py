@@ -15,7 +15,11 @@ def test_metric_ui_helpers():
             "--test",
             *[
                 str(Path(__file__).parent / "js" / name)
-                for name in ("metric-ui.test.cjs", "dashboard-tabs.test.cjs")
+                for name in (
+                    "metric-ui.test.cjs",
+                    "dashboard-tabs.test.cjs",
+                    "request-deadline.test.cjs",
+                )
             ],
         ],
         capture_output=True,

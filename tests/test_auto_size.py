@@ -445,7 +445,7 @@ async def test_auto_size_tick_records_one_minute_rollup_sample_without_evaluatio
 
 @pytest.mark.asyncio
 async def test_auto_size_tick_handles_metric_bucket_commit_collision(
-    monkeypatch, tmp_path: Path
+    monkeypatch, tmp_path: Path, caplog
 ) -> None:
     maker = await _make_session(tmp_path / "app.db")
     now = datetime(2026, 4, 1, 12, 30, tzinfo=UTC)
@@ -490,6 +490,15 @@ async def test_auto_size_tick_handles_metric_bucket_commit_collision(
     assert result["evaluated"] is False
     assert result["sample_write_status"] == "collision"
     assert "UNIQUE constraint failed" in result["sample_write_error"]
+
+    terminal = [
+        record
+        for record in caplog.records
+        if getattr(record, "log_kind", None) == "result" and record.name == "auto.size"
+    ]
+    assert len(terminal) == 1
+    assert terminal[0].levelname == "WARNING"
+    assert terminal[0].context["status"] == "partial"
 
 
 @pytest.mark.asyncio
@@ -795,7 +804,7 @@ async def test_auto_size_sample_writer_batches_backend_sample_queries(
                 session.bind.sync_engine, "before_cursor_execute", record_statement
             )
 
-    assert len(statements) == 3
+    assert len(statements) == 2
 
 
 @pytest.mark.asyncio

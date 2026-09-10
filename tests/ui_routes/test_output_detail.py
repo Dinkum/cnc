@@ -1,3 +1,10 @@
+import app.ui.cluster as ui_cluster
+import app.ui.dashboard.data as ui_dashboard_data
+import app.ui.diagnostics as ui_diagnostics
+import app.ui.http as ui_http
+import app.ui.outputs.context as ui_outputs_context
+import app.ui.outputs.data as ui_outputs_data
+
 from .support import (
     Backend,
     ControlEvent,
@@ -14,7 +21,6 @@ from .support import (
     timedelta,
     ui_pages,
     ui_reads,
-    ui_shared,
 )
 
 
@@ -43,8 +49,8 @@ async def test_output_detail_uses_request_first_template_response(monkeypatch) -
         captured["status_code"] = status_code
         return SimpleNamespace(status_code=status_code)
 
-    monkeypatch.setattr(ui_pages, "_output_page_context", fake_output_context)
-    monkeypatch.setattr(ui_shared.templates, "TemplateResponse", fake_template_response)
+    monkeypatch.setattr(ui_pages, "output_page_context", fake_output_context)
+    monkeypatch.setattr(ui_http.templates, "TemplateResponse", fake_template_response)
 
     request = _request()
     response = await ui_pages.output_detail(
@@ -92,8 +98,8 @@ async def test_missing_output_detail_returns_fast_404_without_dashboard_context(
     async def fake_dashboard_context(*_args, **_kwargs) -> dict[str, object]:
         raise AssertionError("missing output detail must not build dashboard context")
 
-    monkeypatch.setattr(ui_pages, "_output_page_context", fake_output_context)
-    monkeypatch.setattr(ui_pages, "_dashboard_context", fake_dashboard_context)
+    monkeypatch.setattr(ui_pages, "output_page_context", fake_output_context)
+    monkeypatch.setattr(ui_pages, "dashboard_context", fake_dashboard_context)
 
     response = await ui_pages.output_detail(
         20, _request(path="/outputs/20"), settings=Settings(), session=object()
@@ -120,7 +126,7 @@ async def test_output_page_context_skips_live_status_collection_and_keeps_inputs
     async def fail_collect_status(*_args, **_kwargs):
         raise AssertionError("output page should not collect live dashboard status")
 
-    monkeypatch.setattr(ui_shared, "collect_status", fail_collect_status)
+    monkeypatch.setattr(ui_dashboard_data, "collect_status", fail_collect_status)
 
     def fake_collect_app_backend_diagnostics(_backend, _settings):
         return {
@@ -134,7 +140,12 @@ async def test_output_page_context_skips_live_status_collection_and_keeps_inputs
         }
 
     monkeypatch.setattr(
-        ui_shared,
+        ui_diagnostics,
+        "collect_app_backend_diagnostics",
+        fake_collect_app_backend_diagnostics,
+    )
+    monkeypatch.setattr(
+        ui_outputs_data,
         "collect_app_backend_diagnostics",
         fake_collect_app_backend_diagnostics,
     )
@@ -159,7 +170,9 @@ async def test_output_page_context_skips_live_status_collection_and_keeps_inputs
         session.add_all([input_item, backend])
         await session.commit()
 
-        context = await ui_shared._output_page_context(session, settings, backend.id)
+        context = await ui_outputs_context.output_page_context(
+            session, settings, backend.id
+        )
 
     assert context["selected_backend"].id == 1
     assert [item.hostname for item in context["inputs"]] == ["web.example.com"]
@@ -227,7 +240,7 @@ async def test_output_page_context_blocks_inputs_attached_to_other_enabled_outpu
         )
         await session.commit()
 
-        context = await ui_shared._output_page_context(
+        context = await ui_outputs_context.output_page_context(
             session,
             settings,
             selected_backend.id,
@@ -276,14 +289,22 @@ async def test_output_page_context_shield_omits_app_only_runtime_fields(
     async def fail_cluster_nodes(*_args, **_kwargs):
         raise AssertionError("shield output detail should not load transfer nodes")
 
-    monkeypatch.setattr(ui_shared, "_cluster_nodes_for_context", fail_cluster_nodes)
+    monkeypatch.setattr(ui_cluster, "cluster_nodes_for_context", fail_cluster_nodes)
+    monkeypatch.setattr(
+        ui_dashboard_data, "cluster_nodes_for_context", fail_cluster_nodes
+    )
+    monkeypatch.setattr(
+        ui_outputs_data, "cluster_nodes_for_context", fail_cluster_nodes
+    )
 
     async with maker() as session:
         backend = Backend(name="shield", kind="shield", enabled=True, volumes_json="[]")
         session.add(backend)
         await session.commit()
 
-        context = await ui_shared._output_page_context(session, settings, backend.id)
+        context = await ui_outputs_context.output_page_context(
+            session, settings, backend.id
+        )
 
     output_info_rows = {row[0]: row[1] for row in context["output_info_rows"]}
     signal_labels = {item["label"] for item in context["output_signal_cards"]}
@@ -317,7 +338,7 @@ async def test_output_page_context_prefers_cached_runtime_snapshot(
     )
 
     monkeypatch.setattr(
-        ui_shared,
+        ui_outputs_data,
         "peek_cached_status",
         lambda: {
             "services": [
@@ -352,7 +373,12 @@ async def test_output_page_context_prefers_cached_runtime_snapshot(
         )
 
     monkeypatch.setattr(
-        ui_shared,
+        ui_diagnostics,
+        "collect_app_backend_diagnostics",
+        fail_collect_app_backend_diagnostics,
+    )
+    monkeypatch.setattr(
+        ui_outputs_data,
         "collect_app_backend_diagnostics",
         fail_collect_app_backend_diagnostics,
     )
@@ -375,7 +401,7 @@ async def test_output_page_context_prefers_cached_runtime_snapshot(
         session.add(backend)
         await session.commit()
 
-        context = await ui_shared._output_page_context(
+        context = await ui_outputs_context.output_page_context(
             session, settings, backend.id, prefer_cached_runtime=True
         )
 
@@ -394,7 +420,7 @@ async def test_output_page_context_defers_unknown_cached_runtime(
     maker = await _make_session(tmp_path / "app.db")
     settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path / 'app.db'}")
 
-    monkeypatch.setattr(ui_shared, "peek_cached_status", lambda: None)
+    monkeypatch.setattr(ui_outputs_data, "peek_cached_status", lambda: None)
 
     def fail_collect_app_backend_diagnostics(_backend, _settings):
         raise AssertionError(
@@ -402,7 +428,12 @@ async def test_output_page_context_defers_unknown_cached_runtime(
         )
 
     monkeypatch.setattr(
-        ui_shared,
+        ui_diagnostics,
+        "collect_app_backend_diagnostics",
+        fail_collect_app_backend_diagnostics,
+    )
+    monkeypatch.setattr(
+        ui_outputs_data,
         "collect_app_backend_diagnostics",
         fail_collect_app_backend_diagnostics,
     )
@@ -420,7 +451,7 @@ async def test_output_page_context_defers_unknown_cached_runtime(
         session.add(backend)
         await session.commit()
 
-        context = await ui_shared._output_page_context(
+        context = await ui_outputs_context.output_page_context(
             session, settings, backend.id, prefer_cached_runtime=True
         )
 
@@ -440,7 +471,7 @@ async def test_output_page_context_includes_relevant_recent_events(
     settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path / 'app.db'}")
 
     monkeypatch.setattr(
-        ui_shared,
+        ui_outputs_data,
         "peek_cached_status",
         lambda: {
             "services": [
@@ -545,7 +576,7 @@ async def test_output_page_context_includes_relevant_recent_events(
         )
         await session.commit()
 
-        context = await ui_shared._output_page_context(
+        context = await ui_outputs_context.output_page_context(
             session, settings, backend.id, prefer_cached_runtime=True
         )
 
@@ -601,7 +632,12 @@ async def test_output_runtime_signals_returns_live_backend_payload(
         }
 
     monkeypatch.setattr(
-        ui_shared,
+        ui_diagnostics,
+        "collect_app_backend_diagnostics",
+        fake_collect_app_backend_diagnostics,
+    )
+    monkeypatch.setattr(
+        ui_outputs_data,
         "collect_app_backend_diagnostics",
         fake_collect_app_backend_diagnostics,
     )
@@ -722,7 +758,12 @@ async def test_output_runtime_signals_skip_live_probe_for_disabled_outputs(
         )
 
     monkeypatch.setattr(
-        ui_shared,
+        ui_diagnostics,
+        "collect_app_backend_diagnostics",
+        fail_collect_app_backend_diagnostics,
+    )
+    monkeypatch.setattr(
+        ui_outputs_data,
         "collect_app_backend_diagnostics",
         fail_collect_app_backend_diagnostics,
     )
@@ -759,16 +800,21 @@ async def test_output_runtime_signals_have_short_live_probe_budget(
 ) -> None:
     maker = await _make_session(tmp_path / "app.db")
     settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path / 'app.db'}")
-    monkeypatch.setattr(ui_shared, "UI_RUNTIME_SIGNAL_TIMEOUT_SEC", 0.01)
-    ui_shared._RUNTIME_DIAGNOSTICS_CACHE.clear()
-    ui_shared._RUNTIME_DIAGNOSTICS_TASKS.clear()
+    monkeypatch.setattr(ui_diagnostics, "UI_RUNTIME_SIGNAL_TIMEOUT_SEC", 0.01)
+    ui_diagnostics._RUNTIME_DIAGNOSTICS_CACHE.clear()
+    ui_diagnostics._RUNTIME_DIAGNOSTICS_TASKS.clear()
 
     def slow_collect_app_backend_diagnostics(_backend, _settings):
         time.sleep(0.2)
         return {"diagnosis": "healthy"}
 
     monkeypatch.setattr(
-        ui_shared,
+        ui_diagnostics,
+        "collect_app_backend_diagnostics",
+        slow_collect_app_backend_diagnostics,
+    )
+    monkeypatch.setattr(
+        ui_outputs_data,
         "collect_app_backend_diagnostics",
         slow_collect_app_backend_diagnostics,
     )
@@ -804,8 +850,8 @@ async def test_output_runtime_signals_have_short_live_probe_budget(
     assert payload["runtime_health_label"] == "Loading"
     assert payload["retry_after_ms"] == 750
     await asyncio.sleep(0.25)
-    ui_shared._RUNTIME_DIAGNOSTICS_CACHE.clear()
-    ui_shared._RUNTIME_DIAGNOSTICS_TASKS.clear()
+    ui_diagnostics._RUNTIME_DIAGNOSTICS_CACHE.clear()
+    ui_diagnostics._RUNTIME_DIAGNOSTICS_TASKS.clear()
 
 
 async def test_output_runtime_signals_coalesce_slow_live_probe(
@@ -813,9 +859,9 @@ async def test_output_runtime_signals_coalesce_slow_live_probe(
 ) -> None:
     maker = await _make_session(tmp_path / "app.db")
     settings = Settings(database_url=f"sqlite+aiosqlite:///{tmp_path / 'app.db'}")
-    monkeypatch.setattr(ui_shared, "UI_RUNTIME_SIGNAL_TIMEOUT_SEC", 0.01)
-    ui_shared._RUNTIME_DIAGNOSTICS_CACHE.clear()
-    ui_shared._RUNTIME_DIAGNOSTICS_TASKS.clear()
+    monkeypatch.setattr(ui_diagnostics, "UI_RUNTIME_SIGNAL_TIMEOUT_SEC", 0.01)
+    ui_diagnostics._RUNTIME_DIAGNOSTICS_CACHE.clear()
+    ui_diagnostics._RUNTIME_DIAGNOSTICS_TASKS.clear()
     call_count = 0
 
     def slow_collect_app_backend_diagnostics(_backend, _settings):
@@ -825,7 +871,12 @@ async def test_output_runtime_signals_coalesce_slow_live_probe(
         return {"diagnosis": "healthy"}
 
     monkeypatch.setattr(
-        ui_shared,
+        ui_diagnostics,
+        "collect_app_backend_diagnostics",
+        slow_collect_app_backend_diagnostics,
+    )
+    monkeypatch.setattr(
+        ui_outputs_data,
         "collect_app_backend_diagnostics",
         slow_collect_app_backend_diagnostics,
     )
@@ -861,32 +912,32 @@ async def test_output_runtime_signals_coalesce_slow_live_probe(
     assert json.loads(second.body)["retry_after_ms"] == 750
     assert call_count == 1
     await asyncio.sleep(0.25)
-    assert ui_shared._RUNTIME_DIAGNOSTICS_TASKS == {}
-    assert (backend.id, backend.name) in ui_shared._RUNTIME_DIAGNOSTICS_CACHE
-    ui_shared._RUNTIME_DIAGNOSTICS_CACHE.clear()
-    ui_shared._RUNTIME_DIAGNOSTICS_TASKS.clear()
+    assert ui_diagnostics._RUNTIME_DIAGNOSTICS_TASKS == {}
+    assert (backend.id, backend.name) in ui_diagnostics._RUNTIME_DIAGNOSTICS_CACHE
+    ui_diagnostics._RUNTIME_DIAGNOSTICS_CACHE.clear()
+    ui_diagnostics._RUNTIME_DIAGNOSTICS_TASKS.clear()
 
 
 def test_runtime_diagnostics_cache_prune_expires_and_caps(monkeypatch) -> None:
-    monkeypatch.setattr(ui_shared, "UI_RUNTIME_SIGNAL_CACHE_TTL_SEC", 10)
-    monkeypatch.setattr(ui_shared, "UI_RUNTIME_SIGNAL_CACHE_MAX_ENTRIES", 3)
-    ui_shared._RUNTIME_DIAGNOSTICS_CACHE.clear()
-    ui_shared._RUNTIME_DIAGNOSTICS_TASKS.clear()
+    monkeypatch.setattr(ui_diagnostics, "UI_RUNTIME_SIGNAL_CACHE_TTL_SEC", 10)
+    monkeypatch.setattr(ui_diagnostics, "UI_RUNTIME_SIGNAL_CACHE_MAX_ENTRIES", 3)
+    ui_diagnostics._RUNTIME_DIAGNOSTICS_CACHE.clear()
+    ui_diagnostics._RUNTIME_DIAGNOSTICS_TASKS.clear()
 
     for index in range(5):
-        ui_shared._RUNTIME_DIAGNOSTICS_CACHE[(index, f"backend-{index}")] = (
+        ui_diagnostics._RUNTIME_DIAGNOSTICS_CACHE[(index, f"backend-{index}")] = (
             100.0 + index,
             {"diagnosis": "healthy"},
         )
 
-    ui_shared._prune_runtime_diagnostics_cache(now=106.0)
+    ui_diagnostics._prune_runtime_diagnostics_cache(now=106.0)
 
-    assert list(ui_shared._RUNTIME_DIAGNOSTICS_CACHE) == [
+    assert list(ui_diagnostics._RUNTIME_DIAGNOSTICS_CACHE) == [
         (2, "backend-2"),
         (3, "backend-3"),
         (4, "backend-4"),
     ]
 
-    ui_shared._prune_runtime_diagnostics_cache(now=115.0)
+    ui_diagnostics._prune_runtime_diagnostics_cache(now=115.0)
 
-    assert list(ui_shared._RUNTIME_DIAGNOSTICS_CACHE) == []
+    assert list(ui_diagnostics._RUNTIME_DIAGNOSTICS_CACHE) == []

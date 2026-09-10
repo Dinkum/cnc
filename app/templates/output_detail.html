@@ -6,6 +6,7 @@
   <title>cnc | {{ selected_backend.name }}</title>
   <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
   <link rel="stylesheet" href="/static/css/app.css?v={{ asset_version }}">
+  <link rel="stylesheet" href="/static/css/output-ssh.css?v={{ asset_version }}">
 </head>
 <body data-output-kind="{{ selected_backend.kind }}" data-output-enabled="{{ 'true' if selected_backend.enabled else 'false' }}">
   <main class="shell">
@@ -127,38 +128,8 @@
         </div>
       </article>
 
-      {% if operator_commands %}
-        <article class="card span-2">
-          <div class="section-head">
-            <h2>Access</h2>
-          </div>
-          <div class="detail-columns access-columns">
-            {% for item in operator_commands %}
-              <div class="code-block compact-block">
-                <div class="code-head code-head-actions">
-                  <span>{{ item.label }}</span>
-                  <button type="button" class="copy-button" data-copy-target="operator-command-{{ loop.index }}">Copy</button>
-                </div>
-                <pre id="operator-command-{{ loop.index }}">{{ item.command }}</pre>
-              </div>
-            {% endfor %}
-            <div class="code-block compact-block access-key-download">
-              <div class="code-head">SSH Access Key</div>
-              <form method="post" action="/api/backends/{{ selected_backend.id }}/ssh-key">
-                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                <button class="access-download-button" type="submit">
-                <span class="access-download-icon" aria-hidden="true">
-                  <svg viewBox="0 0 24 24" role="img" focusable="false">
-                    <path d="M12 3v11m0 0 4-4m-4 4-4-4"></path>
-                    <path d="M5 17v2a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-2"></path>
-                  </svg>
-                </span>
-                <span>Download SSH Access Key</span>
-                </button>
-              </form>
-            </div>
-          </div>
-        </article>
+      {% if selected_backend.kind == "app" %}
+        {% include "output_ssh_access.html" %}
       {% endif %}
 
       <article class="card span-2">
@@ -569,39 +540,37 @@
       </article>
 
       <article class="card span-2">
-        <div class="section-head">
-          <div>
-            <h2>Metrics</h2>
+        <div class="section-head output-metrics-heading">
+          <h2>Metrics</h2>
+          <div class="metric-export" id="output-metric-export">
+            <button type="button" class="ghost" data-export-toggle aria-expanded="false" aria-controls="output-metric-export-options" disabled>Export</button>
+            <div class="metric-export-options" id="output-metric-export-options" hidden>
+              <button type="button" class="ghost" data-export-format="csv">Download CSV</button>
+              <button type="button" class="ghost" data-export-format="json">Download JSON</button>
+            </div>
           </div>
-          <div class="section-actions metrics-actions">
-            <label class="field metrics-select-field">
-              <span class="metric-label">metric</span>
-              <span class="select-wrap">
-                <select id="output-metric-select" {% if selected_backend.kind not in ["app", "shield"] %}disabled{% endif %}>
-                  {% for option in metric_history_options %}
-                    <option value="{{ option.key }}" {% if option.key == metric_history_default_metric %}selected{% endif %}>{{ option.label }}</option>
-                  {% endfor %}
-                </select>
-              </span>
-            </label>
-            <label class="field metrics-select-field">
-              <span class="metric-label">timeframe</span>
-              <span class="select-wrap">
-                <select id="output-timeframe-select" {% if selected_backend.kind not in ["app", "shield"] %}disabled{% endif %}>
-                  {% for option in metric_history_timeframes %}
-                    <option value="{{ option.key }}" {% if option.key == metric_history_default_timeframe %}selected{% endif %}>{{ option.label }}</option>
-                  {% endfor %}
-                </select>
-              </span>
-            </label>
-            <label class="metrics-select-field metric-export-field">Export
-              <select id="output-metric-export" aria-label="Export output metric history" disabled>
-                <option value="">Download…</option>
-                <option value="csv">CSV</option>
-                <option value="json">JSON</option>
+        </div>
+        <div class="section-actions metrics-actions">
+          <label class="field metrics-select-field">
+            <span class="metric-label">metric</span>
+            <span class="select-wrap">
+              <select id="output-metric-select" {% if selected_backend.kind not in ["app", "shield"] %}disabled{% endif %}>
+                {% for option in metric_history_options %}
+                  <option value="{{ option.key }}" {% if option.key == metric_history_default_metric %}selected{% endif %}>{{ option.label }}</option>
+                {% endfor %}
               </select>
-            </label>
-          </div>
+            </span>
+          </label>
+          <label class="field metrics-select-field">
+            <span class="metric-label">timeframe</span>
+            <span class="select-wrap">
+              <select id="output-timeframe-select" {% if selected_backend.kind not in ["app", "shield"] %}disabled{% endif %}>
+                {% for option in metric_history_timeframes %}
+                  <option value="{{ option.key }}" {% if option.key == metric_history_default_timeframe %}selected{% endif %}>{{ option.label }}</option>
+                {% endfor %}
+              </select>
+            </span>
+          </label>
         </div>
         <div
           class="metrics-chart-shell"
@@ -993,7 +962,7 @@
       <form method="dialog" class="confirm-modal-card clone-modal-card" data-clone-output-form>
         <div class="confirm-modal-copy clone-modal-copy">
           <h2>Clone output</h2>
-          <p>Clone the guest, mounted data, and backend settings into a new disabled output with no attached inputs.</p>
+          <p>Clone {% if selected_backend.kind == "app" %}the guest and mounted data{% else %}the site files{% endif %} into a new output with its own settings.</p>
         </div>
         <section class="clone-modal-state" data-clone-state="form">
           <div class="detail-grid clone-detail-grid">
@@ -1010,6 +979,7 @@
                 spellcheck="false"
               >
             </label>
+            {% if selected_backend.kind == "app" %}
             <label class="field">
               <span class="metric-label">new port</span>
               <input
@@ -1022,8 +992,9 @@
                 data-clone-port
               >
             </label>
+            {% endif %}
           </div>
-          <p class="subtle">The clone keeps its own copied guest and mounted data, starts disabled, and does not attach any inputs.</p>
+          <p class="subtle">The clone starts disabled with no attached inputs. Its {% if selected_backend.kind == "app" %}guest and mounted data{% else %}site files{% endif %} are independent of the original.</p>
         </section>
         <section class="clone-modal-state" data-clone-state="progress" hidden>
           <div class="clone-progress-head">
@@ -1226,11 +1197,15 @@
       </form>
     </dialog>
     {% endif %}
+    {% if selected_backend.kind == "app" %}
+      {% include "output_ssh_dialogs.html" %}
+    {% endif %}
   </main>
   <script id="output-detail-config" type="application/json">{{ {
     "backendId": selected_backend.id,
     "backendName": selected_backend.name,
     "csrfToken": csrf_token,
+    "sshHost": ssh_host | default("SERVER_IP"),
     "operationProgressPipelines": operation_progress_pipelines | default({}, true),
     "outputSaveProgressSteps": output_save_progress_steps | default([], true)
   } | tojson }}</script>
@@ -1238,5 +1213,6 @@
   <script src="/static/js/operation-events.js?v={{ asset_version }}"></script>
   <script src="/static/js/output-detail.js?v={{ asset_version }}"></script>
   <script src="/static/js/hardening-configuration.js?v={{ asset_version }}"></script>
+  <script src="/static/js/output-ssh.js?v={{ asset_version }}"></script>
 </body>
 </html>

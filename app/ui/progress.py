@@ -415,21 +415,45 @@ async def _complete_input_operation(
         success_message=success_message,
         failure_prefix=failure_prefix,
     )
+    if error_flash:
+        action = "delete" if success_message == "Input deleted." else "save"
+        subject = f"input {input_value}" if input_value else "input"
+        error_flash = error_flash.replace(
+            "Save failed", f"Couldn't {action} {subject}", 1
+        )
+        if action == "delete":
+            error_flash += " The input was retained."
     details: dict[str, object] = {
         "progress": 100,
         "message": success_flash or error_flash or success_message,
-        "substate": "Refreshing dashboard",
+        "substate": "Refreshing dashboard"
+        if apply_response.status == "success"
+        else "Review error",
         "flash_success": success_flash,
         "flash_error": error_flash,
         "apply_status": apply_response.status,
         "run_id": apply_response.run_id,
+        **{
+            key: apply_response.details[key]
+            for key in ("error_code", "error_inst", "failed_backend", "failure_mode")
+            if key in apply_response.details
+        },
         **({"input_id": input_id} if input_id is not None else {}),
         **({"input_value": input_value} if input_value else {}),
         **(extra_details or {}),
     }
     status = "success" if apply_response.status == "success" else "failed"
     await operation.complete(
-        status, phase="Finalize", error=error_flash, details=details
+        status,
+        phase="Finalize"
+        if status == "success"
+        else str(
+            apply_response.details.get("failed_phase")
+            or apply_response.details.get("phase")
+            or "Apply host"
+        ),
+        error=error_flash,
+        details=details,
     )
 
 

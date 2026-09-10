@@ -1,3 +1,7 @@
+import app.ui.dashboard.context as ui_dashboard_context
+import app.ui.dashboard.data as ui_dashboard_data
+import app.ui.operator_help as ui_operator_help
+
 from .support import (
     Backend,
     Input,
@@ -7,7 +11,6 @@ from .support import (
     _request,
     socket,
     ui_pages,
-    ui_shared,
 )
 
 
@@ -15,7 +18,7 @@ def test_backend_operator_commands_use_server_ip_when_request_is_ip() -> None:
     backend = Backend(id=7, name="web", kind="app")
     request = _request(path="/outputs/1", headers=[(b"host", b"203.0.113.10")])
 
-    commands = ui_shared._backend_operator_commands(backend, request)
+    commands = ui_operator_help._backend_operator_commands(backend, request)
 
     assert len(commands) == 3
     assert commands[0]["label"] == "ssh shell"
@@ -33,7 +36,7 @@ def test_backend_operator_commands_hide_disabled_app_access() -> None:
     backend = Backend(id=7, name="draft", kind="app", enabled=False)
     request = _request(path="/outputs/7", headers=[(b"host", b"203.0.113.10")])
 
-    commands = ui_shared._backend_operator_commands(backend, request)
+    commands = ui_operator_help._backend_operator_commands(backend, request)
 
     assert commands == []
 
@@ -50,9 +53,9 @@ def test_backend_operator_commands_fall_back_to_placeholder_when_host_resolution
         assert proto == socket.IPPROTO_TCP
         raise socket.gaierror("unresolvable")
 
-    monkeypatch.setattr(ui_shared.socket, "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
 
-    commands = ui_shared._backend_operator_commands(backend, request)
+    commands = ui_operator_help._backend_operator_commands(backend, request)
 
     assert len(commands) == 3
     assert commands[0]["command"] == "ssh web@SERVER_IP"
@@ -89,9 +92,9 @@ def test_backend_operator_commands_resolve_host_to_ip(monkeypatch) -> None:
             ),
         ]
 
-    monkeypatch.setattr(ui_shared.socket, "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
 
-    commands = ui_shared._backend_operator_commands(backend, request)
+    commands = ui_operator_help._backend_operator_commands(backend, request)
 
     assert len(commands) == 3
     assert commands[0]["command"] == "ssh web@203.0.113.10"
@@ -116,13 +119,15 @@ def test_backend_operator_commands_for_page_use_advertised_host_without_dns(
             "page operator commands should not resolve DNS during render"
         )
 
-    monkeypatch.setattr(ui_shared.socket, "getaddrinfo", fail_getaddrinfo)
+    monkeypatch.setattr(socket, "getaddrinfo", fail_getaddrinfo)
 
-    commands = ui_shared._backend_operator_commands_for_page(
+    commands = ui_operator_help.backend_operator_commands_for_page(
         backend,
         settings=settings,
-        host=ui_shared._backend_ssh_destination(settings, request, resolve_dns=False),
-        llm_help_url=ui_shared._output_llm_help_url(request, backend.id),
+        host=ui_operator_help.backend_ssh_destination(
+            settings, request, resolve_dns=False
+        ),
+        llm_help_url=ui_operator_help.output_llm_help_url(request, backend.id),
     )
 
     assert len(commands) == 3
@@ -147,13 +152,15 @@ def test_backend_operator_commands_for_page_prefer_configured_tailnet_host(
             "page operator commands should not resolve DNS during render"
         )
 
-    monkeypatch.setattr(ui_shared.socket, "getaddrinfo", fail_getaddrinfo)
+    monkeypatch.setattr(socket, "getaddrinfo", fail_getaddrinfo)
 
-    commands = ui_shared._backend_operator_commands_for_page(
+    commands = ui_operator_help.backend_operator_commands_for_page(
         backend,
         settings=settings,
-        host=ui_shared._backend_ssh_destination(settings, request, resolve_dns=False),
-        llm_help_url=ui_shared._output_llm_help_url(request, backend.id),
+        host=ui_operator_help.backend_ssh_destination(
+            settings, request, resolve_dns=False
+        ),
+        llm_help_url=ui_operator_help.output_llm_help_url(request, backend.id),
     )
 
     assert len(commands) == 3
@@ -168,7 +175,9 @@ def test_backend_ssh_destination_uses_tailnet_host_for_backend_access() -> None:
         headers=[(b"host", b"cnc-admin.example.ts.net")],
     )
 
-    host = ui_shared._backend_ssh_destination(Settings(), request, resolve_dns=False)
+    host = ui_operator_help.backend_ssh_destination(
+        Settings(), request, resolve_dns=False
+    )
 
     assert host == "cnc-admin.example.ts.net"
 
@@ -182,8 +191,8 @@ async def test_host_llm_help_context_uses_cold_cache_without_live_status(
     async def fail_collect_status(*_args, **_kwargs):
         raise AssertionError("host LLM help must not trigger live host status")
 
-    monkeypatch.setattr(ui_shared, "collect_status", fail_collect_status)
-    monkeypatch.setattr(ui_shared, "peek_cached_status", lambda: None)
+    monkeypatch.setattr(ui_dashboard_data, "collect_status", fail_collect_status)
+    monkeypatch.setattr(ui_dashboard_context, "peek_cached_status", lambda: None)
 
     async with maker() as session:
         session.add(
@@ -195,7 +204,7 @@ async def test_host_llm_help_context_uses_cold_cache_without_live_status(
             )
         )
         await session.commit()
-        context = await ui_shared._host_llm_help_context(session, settings)
+        context = await ui_dashboard_context.host_llm_help_context(session, settings)
 
     backends = context["backends"]
     output_details = context["output_details"]
@@ -236,7 +245,7 @@ async def test_host_llm_help_renders_plain_text(monkeypatch) -> None:
             },
         }
 
-    monkeypatch.setattr(ui_pages, "_host_llm_help_context", fake_host_llm_help_context)
+    monkeypatch.setattr(ui_pages, "host_llm_help_context", fake_host_llm_help_context)
 
     response = await ui_pages.host_llm_help(
         _request(path="/llm.txt", headers=[(b"host", b"203.0.113.10")]),
@@ -294,7 +303,7 @@ async def test_host_llm_help_uses_advertised_host_for_backend_aliases(
             },
         }
 
-    monkeypatch.setattr(ui_pages, "_host_llm_help_context", fake_host_llm_help_context)
+    monkeypatch.setattr(ui_pages, "host_llm_help_context", fake_host_llm_help_context)
 
     response = await ui_pages.host_llm_help(
         _request(
@@ -329,7 +338,7 @@ async def test_host_llm_help_prefers_tailnet_host_for_backend_aliases(
             },
         }
 
-    monkeypatch.setattr(ui_pages, "_host_llm_help_context", fake_host_llm_help_context)
+    monkeypatch.setattr(ui_pages, "host_llm_help_context", fake_host_llm_help_context)
 
     response = await ui_pages.host_llm_help(
         _request(path="/llm.txt", headers=[(b"host", b"203.0.113.10")]),
@@ -379,7 +388,7 @@ async def test_output_llm_help_renders_plain_text(monkeypatch) -> None:
             },
         }
 
-    monkeypatch.setattr(ui_pages, "_output_page_context", fake_output_page_context)
+    monkeypatch.setattr(ui_pages, "output_page_context", fake_output_page_context)
 
     response = await ui_pages.output_llm_help(
         7,
@@ -506,7 +515,7 @@ async def test_output_llm_help_uses_advertised_host_for_backend_access(
             },
         }
 
-    monkeypatch.setattr(ui_pages, "_output_page_context", fake_output_page_context)
+    monkeypatch.setattr(ui_pages, "output_page_context", fake_output_page_context)
 
     response = await ui_pages.output_llm_help(
         7,
@@ -563,7 +572,7 @@ async def test_output_llm_help_prefers_tailnet_host_for_backend_access(
             },
         }
 
-    monkeypatch.setattr(ui_pages, "_output_page_context", fake_output_page_context)
+    monkeypatch.setattr(ui_pages, "output_page_context", fake_output_page_context)
 
     response = await ui_pages.output_llm_help(
         7,

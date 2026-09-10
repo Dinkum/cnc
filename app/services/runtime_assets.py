@@ -5,6 +5,7 @@ from typing import Any
 
 from app.config import Settings
 from app.services.commands import run_command
+from app.services import guest_isolation
 from app.services.ssh_access import (
     backend_ssh_root_wrapper_script,
     reconcile_backend_ssh_root_wrapper,
@@ -55,6 +56,20 @@ def _sync_file(source: Path, destination: Path) -> bool:
     return True
 
 
+def reconcile_guest_runtime_helper(settings: Settings) -> None:
+    content = guest_isolation.guest_helper_bytes()
+    path = settings.guest_runtime_helper_path
+    if path.is_symlink():
+        raise ValueError("Guest runtime helper cannot be a symlink.")
+    if not path.exists() or path.read_bytes() != content:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.tmp")
+        temporary.write_bytes(content)
+        temporary.chmod(0o755)
+        temporary.replace(path)
+    settings.guest_runtime_helper_path.chmod(0o755)
+
+
 def inspect_managed_systemd_assets(
     settings: Settings,
     *,
@@ -82,6 +97,14 @@ def inspect_managed_systemd_assets(
         or wrapper_path.stat().st_mode & 0o777 != 0o755
     ):
         changed_files.append(str(wrapper_path))
+
+    helper_path = settings.guest_runtime_helper_path
+    if (
+        not helper_path.exists()
+        or helper_path.read_bytes() != guest_isolation.guest_helper_bytes()
+        or helper_path.stat().st_mode & 0o777 != 0o755
+    ):
+        changed_files.append(str(helper_path))
 
     timer_states: dict[str, dict[str, bool]] = {}
     for timer_name in MANAGED_TIMER_UNITS:
@@ -155,6 +178,8 @@ def reconcile_managed_systemd_assets(
 
     if str(settings.ssh_backend_root_wrapper_path) in changed_files:
         reconcile_backend_ssh_root_wrapper(settings)
+    if str(settings.guest_runtime_helper_path) in changed_files:
+        reconcile_guest_runtime_helper(settings)
 
     timer_reconciled = False
     timer_states = observed["timer_states"]
