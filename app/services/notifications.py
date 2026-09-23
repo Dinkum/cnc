@@ -1048,9 +1048,9 @@ async def send_notification_test_suite(
     scenarios = [
         (
             "host_drift_detected",
-            "CNC host drift detected",
+            "CNC firewall safeguards need attention",
             build_operator_message(
-                "Host drift detected during CNC startup. CNC stayed online.",
+                "A host safeguard needs attention after startup verification. CNC stayed online.",
                 status="warning",
                 facts=[
                     ("top_finding", "tailscale funnel exposes admin port 9090"),
@@ -1062,9 +1062,9 @@ async def send_notification_test_suite(
         ),
         (
             "host_drift_cleared",
-            "CNC host drift cleared",
+            "CNC firewall recovered",
             build_operator_message(
-                "Startup host drift cleared.",
+                "Startup verification confirms the previously reported safeguard issue is cleared.",
                 status="success",
                 facts=[("cleared_findings", "tailscale admin exposure")],
                 action="cnc-admin logs admin --errors",

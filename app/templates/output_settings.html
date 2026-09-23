@@ -1,0 +1,107 @@
+<form id="output-general-form" class="output-setting-section sf" method="post" action="/ui/backends/{{ selected_backend.id }}/settings/general" data-output-save-form data-output-settings-section="general" data-output-save-running="Saving general">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <div class="output-setting-heading"><h3>General</h3></div>
+  <div class="output-setting-fields"><div class="settings-lines">            <div class="settings-line sf-row">
+              <label class="settings-key" for="sf-name">name</label>
+              <input id="sf-name" name="name" required value="{{ selected_backend.name }}">
+            </div>
+            <div class="settings-line sf-row">
+              <label class="settings-key" for="sf-notes">notes</label>
+              <input id="sf-notes" name="notes" value="{{ '' if selected_backend.notes is none else selected_backend.notes }}">
+            </div></div>
+    {% set section_key = 'general' %}{% include 'output_section_footer.html' %}
+  </div>
+</form>
+{% if selected_backend.kind == "app" %}
+<form id="output-runtime-form" class="output-setting-section sf" method="post" action="/ui/backends/{{ selected_backend.id }}/settings/runtime" data-output-save-form data-output-settings-section="runtime" data-output-save-running="Saving runtime">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <div class="output-setting-heading"><h3>Runtime</h3></div>
+  <div class="output-setting-fields"><div class="settings-lines">            <div class="settings-line sf-row">
+              <label class="settings-key" for="sf-port">handoff port</label>
+              <input id="sf-port" name="port" type="number" value="{{ '' if selected_backend.port is none else selected_backend.port }}">
+            </div>
+            <div class="settings-line sf-row">
+              <label class="settings-key" for="sf-sandbox-profile">guest profile</label>
+              <span class="select-wrap"><select id="sf-sandbox-profile" name="sandbox_profile">
+                {% for profile in app_sandbox_profiles %}
+                  <option value="{{ profile.profile_id }}" {% if selected_backend.sandbox_profile == profile.profile_id %}selected{% endif %}>{{ profile.label }}</option>
+                {% endfor %}
+              </select></span>
+            </div>
+            <div class="settings-line sf-row">
+              <label class="settings-key" for="sf-handoff-port">internal app port</label>
+              <input id="sf-handoff-port" name="handoff_port" type="number" value="{{ selected_backend.handoff_port }}">
+            </div></div>
+    {% set section_key = 'runtime' %}{% include 'output_section_footer.html' %}
+  </div>
+</form>
+{% endif %}
+<form id="output-resources-form" class="output-setting-section sf" method="post" action="/ui/backends/{{ selected_backend.id }}/settings/resources" data-output-save-form data-output-settings-section="resources" data-output-save-running="Saving resources">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <div class="output-setting-heading"><h3>Resources</h3></div>
+  <div class="output-setting-fields"><div class="settings-lines">            <div class="settings-line sf-row">
+              <label class="settings-key" for="sf-resource-size">resource size</label>
+              <span class="select-wrap"><select id="sf-resource-size" name="resource_size" data-resource-size-control>
+                <option value="auto" {% if selected_output_detail.get("resource_size_choice") == "auto" %}selected{% endif %}>auto</option>
+                <option value="small" {% if selected_output_detail.get("resource_size_choice") == "small" %}selected{% endif %}>small</option>
+                <option value="medium" {% if selected_output_detail.get("resource_size_choice") == "medium" %}selected{% endif %}>medium</option>
+                <option value="large" {% if selected_output_detail.get("resource_size_choice") == "large" %}selected{% endif %}>large</option>
+                <option value="custom" {% if selected_output_detail.get("resource_size_choice") == "custom" %}selected{% endif %}>custom</option>
+              </select></span>
+            </div>
+            <div class="settings-line sf-row" data-custom-resource-limit {% if selected_output_detail.get("resource_size_choice") != "custom" %}hidden{% endif %}>
+              <label class="settings-key" for="sf-mem-high">memory high</label>
+              <input id="sf-mem-high" name="memory_high_override" value="{{ selected_output_detail.get('memory_high_override', '') }}" placeholder="auto" {% if selected_output_detail.get("resource_size_choice") != "custom" %}disabled{% endif %}>
+            </div>
+            <div class="settings-line sf-row" data-custom-resource-limit {% if selected_output_detail.get("resource_size_choice") != "custom" %}hidden{% endif %}>
+              <label class="settings-key" for="sf-mem-max">memory max</label>
+              <input id="sf-mem-max" name="memory_max_override" value="{{ selected_output_detail.get('memory_max_override', '') }}" placeholder="auto" {% if selected_output_detail.get("resource_size_choice") != "custom" %}disabled{% endif %}>
+            </div>
+            <div class="settings-line sf-row" data-custom-resource-limit {% if selected_output_detail.get("resource_size_choice") != "custom" %}hidden{% endif %}>
+              <label class="settings-key" for="sf-cpu">cpu quota</label>
+              <input id="sf-cpu" name="cpu_quota_override" value="{{ selected_output_detail.get('cpu_quota_override', '') }}" placeholder="auto" {% if selected_output_detail.get("resource_size_choice") != "custom" %}disabled{% endif %}>
+            </div></div>
+    {% set section_key = 'resources' %}{% include 'output_section_footer.html' %}
+  </div>
+</form>
+<form id="output-storage-form" class="output-setting-section sf" method="post" action="/ui/backends/{{ selected_backend.id }}/settings/storage" data-output-save-form data-output-settings-section="storage" data-output-save-running="Saving storage">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <div class="output-setting-heading"><h3>Storage</h3></div>
+  <div class="output-setting-fields"><div class="settings-lines">{% if selected_backend.kind == "static" %}
+            <div class="settings-line sf-row">
+              <label class="settings-key" for="sf-static-root">static root</label>
+              <input id="sf-static-root" name="static_root" value="{{ '' if selected_backend.static_root is none else selected_backend.static_root }}" placeholder="/srv/site" autocomplete="off" autocapitalize="off" spellcheck="false" title="{{ static_root_hint }}">
+            </div>
+{% else %}
+            <div class="settings-line sf-row sf-tall">
+              <label class="settings-key" for="sf-volumes">volumes json</label>
+              <textarea id="sf-volumes" name="volumes_json" rows="4">{{ selected_backend.volumes_json }}</textarea>
+            </div>
+{% endif %}</div>
+    {% set section_key = 'storage' %}{% include 'output_section_footer.html' %}
+  </div>
+</form>
+{% if selected_backend.kind == "app" %}
+<form id="output-health-form" class="output-setting-section sf" method="post" action="/ui/backends/{{ selected_backend.id }}/settings/health" data-output-save-form data-output-settings-section="health" data-output-save-running="Saving health checks">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <div class="output-setting-heading"><h3>Health checks</h3></div>
+  <div class="output-setting-fields"><div class="settings-lines">            <div class="settings-line sf-row">
+              <label class="settings-key" for="sf-hc-mode">healthcheck mode</label>
+              <span class="select-wrap"><select id="sf-hc-mode" name="healthcheck_mode">
+                <option value="none" {% if selected_output_detail.get("healthcheck_mode") == "none" %}selected{% endif %}>none</option>
+                <option value="tcp" {% if selected_output_detail.get("healthcheck_mode") == "tcp" %}selected{% endif %}>tcp</option>
+                <option value="http" {% if selected_output_detail.get("healthcheck_mode") == "http" %}selected{% endif %}>http</option>
+              </select></span>
+            </div>
+            <div class="settings-line sf-row" data-http-health-field {% if selected_output_detail.get("healthcheck_mode") != "http" %}hidden{% endif %}>
+              <label class="settings-key" for="sf-hc-path">healthcheck path</label>
+              <input id="sf-hc-path" name="healthcheck_path" value="{{ '' if selected_backend.healthcheck_path is none else selected_backend.healthcheck_path }}">
+            </div>
+            <div class="settings-line sf-row" data-http-health-field {% if selected_output_detail.get("healthcheck_mode") != "http" %}hidden{% endif %}>
+              <label class="settings-key" for="sf-hc-host">health host</label>
+              <input id="sf-hc-host" name="healthcheck_host_header" value="{{ '' if selected_backend.healthcheck_host_header is none else selected_backend.healthcheck_host_header }}" placeholder="app.example.com">
+            </div></div>
+    {% set section_key = 'health' %}{% include 'output_section_footer.html' %}
+  </div>
+</form>
+{% endif %}

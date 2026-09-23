@@ -23,6 +23,7 @@ from sqlalchemy.orm import selectinload
 
 from app.services.thread_workers import BoundedThreadWorker
 from app.config import Settings, get_settings
+from app.services.config_change import full_reconcile
 from app.database import create_configured_async_engine
 from app.logger import get_logger
 from app.models.entities import Backend, BackendBackup, Input
@@ -1813,6 +1814,11 @@ async def _converge_restored_backend_host_state(
         commit_on_success=False,
         operation_kind="restore_backend",
         operation_handle=operation,
+        # A restore rebuilds an output from an archive and can reintroduce
+        # routing and accounts that other outputs share, and this converge
+        # point does not carry the output identity. Full reconcile is the
+        # honest scope rather than a narrower one we cannot justify.
+        scope=full_reconcile("restore_backend").scope(),
         emit_success_event=False,
     )
     if response.status != "success":

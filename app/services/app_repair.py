@@ -4,14 +4,24 @@ from pathlib import Path
 from typing import Any
 
 from app.config import Settings
+from app.logger import get_logger
 from app.models.entities import Backend
 from app.services.app_containers import control_dir
 from app.services.app_diagnostics import collect_app_backend_diagnostics
-from app.services.app_quadlet import quadlet_container_service_name
+from app.services.app_quadlet import (
+    quadlet_container_service_name,
+    quadlet_network_service_name,
+)
 from app.services.bootstrap_state import bootstrap_lock_is_held
 from app.services.commands import run_command
 from app.services.guest_exec import clear_guest_exec_circuit
 from app.services.renderers import container_name, network_name, safe_slug
+
+logger = get_logger("app.repair")
+NETWORK_REMOVE_READONLY_HINT = (
+    "repair must be able to unlink /etc/containers/networks; check ProtectSystem "
+    "and ReadWritePaths on cnc-backend-alerts and cnc-auto-size"
+)
 
 
 OBSERVATION_ONLY_DIAGNOSES = {
@@ -69,13 +79,49 @@ def _remove_container(backend_name: str, settings: Settings) -> list[str]:
 
 
 def _remove_network(backend_name: str, settings: Settings) -> list[str]:
+    actions: list[str] = []
+    service = quadlet_network_service_name(backend_name)
+    stop = run_command(
+        ["systemctl", "stop", service],
+        timeout_sec=settings.command_timeout_apply_sec,
+    )
+    stop_output = "\n".join(part for part in (stop.stderr, stop.stdout) if part).lower()
+    if stop.ok:
+        actions.append(f"systemctl stop {service}")
+    elif "not loaded" in stop_output or "not found" in stop_output:
+        logger.info(
+            "app.repair.network_unit_absent",
+            backend=backend_name,
+            service=service,
+        )
+    else:
+        logger.warning(
+            "app.repair.network_unit_stop_failed",
+            backend=backend_name,
+            service=service,
+            error=stop.stderr or stop.stdout,
+        )
+
     command = ["podman", "network", "rm", network_name(backend_name)]
     result = run_command(command, timeout_sec=settings.command_timeout_apply_sec)
-    if not result.ok:
-        raise RuntimeError(
-            result.stderr or result.stdout or f"command failed: {' '.join(command)}"
+    combined_output = "\n".join(part for part in (result.stderr, result.stdout) if part)
+    combined_lower = combined_output.lower()
+    if result.ok:
+        actions.append(" ".join(command))
+        return actions
+    if "no such network" in combined_lower:
+        logger.info(
+            "app.repair.network_already_absent",
+            backend=backend_name,
+            network=network_name(backend_name),
         )
-    return [" ".join(command)]
+        actions.append(" ".join(command))
+        return actions
+    if "read-only file system" in combined_lower:
+        raise RuntimeError(
+            f"{combined_output or 'command failed'}: {NETWORK_REMOVE_READONLY_HINT}"
+        )
+    raise RuntimeError(combined_output or f"command failed: {' '.join(command)}")
 
 
 def _unmount_container_storage(candidate: str, settings: Settings) -> list[str]:
@@ -219,9 +265,15 @@ def plan_app_backend_repair(before: dict[str, Any]) -> list[dict[str, str]]:
         add("clear_runtime")
 
     should_restart = (
-        bool(issues & {"private_unreachable", "loopback_unreachable"})
+        (
+            diagnosis == "sandbox_stopped"
+            or bool(issues & {"private_unreachable", "loopback_unreachable"})
+        )
         and bool(before.get("container_exists"))
-        and (before.get("bootstrap") or {}).get("status") == "succeeded"
+        and (
+            diagnosis == "sandbox_stopped"
+            or (before.get("bootstrap") or {}).get("status") == "succeeded"
+        )
     )
     if should_restart and not remove_container:
         add("restart_quadlet")

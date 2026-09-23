@@ -14,7 +14,7 @@ from fastapi.responses import (
     StreamingResponse,
 )
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from app.config import Settings
@@ -36,8 +36,10 @@ from app.services.backend_backup_service import (
 from app.services.backend_metric_history import (
     DEFAULT_METRIC_KEY,
     DEFAULT_TIMEFRAME_KEY,
-    build_backend_metric_history,
-    build_host_metric_history,
+    load_backend_metric_history,
+    load_host_metric_history,
+    metric_history_query_key,
+    render_metric_history,
 )
 from app.services.debug_bundle import (
     build_error_debug_bundle,
@@ -53,6 +55,7 @@ from app.ui.diagnostics import (
 )
 from app.ui.errors import operator_error_json as _operator_error_json
 from app.ui.errors import operator_error_payload as _operator_error_payload
+from app.ui.metric_history import run_metric_history_request
 from app.ui.outputs.data import enabled_runtime_backends_for_resource_profile
 from app.ui.outputs.health import service_metrics_from_status_payload
 from app.ui.outputs.presentation import (
@@ -228,81 +231,112 @@ async def output_metric_history(
     settings: Settings = Depends(settings_dependency),
     session: AsyncSession = Depends(db_session_dependency),
 ) -> dict[str, object] | JSONResponse:
-    backend = (
-        await session.execute(select(Backend).where(Backend.id == backend_id))
-    ).scalar_one_or_none()
-    if backend is None:
-        return _operator_error_json(
-            "output not found",
-            ErrorCode.UI_RESOURCE_NOT_FOUND,
-            status_code=404,
-        )
+    async def build() -> dict[str, object] | JSONResponse:
+        async with async_sessionmaker(
+            session.bind, expire_on_commit=False
+        )() as read_session:
+            backend = (
+                await read_session.execute(
+                    select(Backend).where(Backend.id == backend_id)
+                )
+            ).scalar_one_or_none()
+            if backend is None:
+                return _operator_error_json(
+                    "output not found",
+                    ErrorCode.UI_RESOURCE_NOT_FOUND,
+                    status_code=404,
+                )
 
-    status_payload = peek_cached_status() or {}
-    live_metrics = service_metrics_from_status_payload(status_payload, backend)
-    payload = await build_backend_metric_history(
-        session,
-        backend,
-        metric_key=metric,
-        timeframe_key=timeframe,
-        chart_width_px=width,
-        live_metrics=live_metrics,
+            status_payload = peek_cached_status() or {}
+            live_metrics = service_metrics_from_status_payload(status_payload, backend)
+            data = await load_backend_metric_history(
+                read_session,
+                backend,
+                metric_key=metric,
+                timeframe_key=timeframe,
+                chart_width_px=width,
+                live_metrics=live_metrics,
+            )
+            metric_key = data.metric.key
+            labels: dict[str, object] = {}
+            if metric_key == "memory":
+                soft_limit_value = None
+                if backend.kind == "app":
+                    enabled_runtime_backends = (
+                        await enabled_runtime_backends_for_resource_profile(
+                            read_session
+                        )
+                    )
+                    resource_profile = build_resource_profile(
+                        settings, enabled_runtime_backends
+                    )
+                    memory_limits = memory_limit_bytes_for_profile(
+                        backend, resource_profile
+                    )
+                    soft_limit_value = memory_soft_limit_percent_for_profile(
+                        backend, resource_profile
+                    )
+                elif backend.kind == "shield" and isinstance(live_metrics, dict):
+                    live_memory_max = live_metrics.get("memory_max_bytes")
+                    memory_limits = {
+                        "soft": None,
+                        "hard": live_memory_max
+                        if isinstance(live_memory_max, int)
+                        else None,
+                    }
+                else:
+                    memory_limits = {"soft": None, "hard": None}
+                labels["memory_limit_bytes"] = memory_limits["hard"]
+                labels["soft_limit_bytes"] = memory_limits["soft"]
+                labels["soft_limit_value"] = soft_limit_value
+                labels["soft_limit_label"] = (
+                    f"SOFT LIMIT ({format_metric_data_size(memory_limits['soft'])})"
+                )
+        # All database work is finished before CPU-heavy chart calculation.
+        payload = await render_metric_history(data)
+        payload.update(labels)
+        return payload
+
+    key = (
+        session.bind,
+        backend_id,
+        *metric_history_query_key(metric, timeframe, width),
     )
-    metric_key = (
-        payload.get("metric", {}).get("key")
-        if isinstance(payload.get("metric"), dict)
-        else None
-    )
-    if metric_key == "memory":
-        soft_limit_value = None
-        if backend.kind == "app":
-            enabled_runtime_backends = (
-                await enabled_runtime_backends_for_resource_profile(session)
-            )
-            resource_profile = build_resource_profile(
-                settings, enabled_runtime_backends
-            )
-            memory_limits = memory_limit_bytes_for_profile(backend, resource_profile)
-            soft_limit_value = memory_soft_limit_percent_for_profile(
-                backend, resource_profile
-            )
-        elif backend.kind == "shield" and isinstance(live_metrics, dict):
-            live_memory_max = live_metrics.get("memory_max_bytes")
-            memory_limits = {
-                "soft": None,
-                "hard": live_memory_max if isinstance(live_memory_max, int) else None,
-            }
-        else:
-            memory_limits = {"soft": None, "hard": None}
-        payload["memory_limit_bytes"] = memory_limits["hard"]
-        payload["soft_limit_bytes"] = memory_limits["soft"]
-        payload["soft_limit_value"] = soft_limit_value
-        payload["soft_limit_label"] = (
-            f"SOFT LIMIT ({format_metric_data_size(memory_limits['soft'])})"
-        )
-    return payload
+    return await run_metric_history_request(key, build)
 
 
-@router.get("/api/host/metrics-history")
+@router.get("/api/host/metrics-history", response_model=None)
 async def host_metric_history(
     metric: str = DEFAULT_METRIC_KEY,
     timeframe: str = DEFAULT_TIMEFRAME_KEY,
     width: int | None = None,
     session: AsyncSession = Depends(db_session_dependency),
-) -> dict[str, object]:
-    status_payload = peek_cached_status() or {}
-    live_metrics = (
-        status_payload.get("host_metrics")
-        if isinstance(status_payload.get("host_metrics"), dict)
-        else None
+) -> dict[str, object] | JSONResponse:
+    async def build() -> dict[str, object]:
+        status_payload = peek_cached_status() or {}
+        live_metrics = (
+            status_payload.get("host_metrics")
+            if isinstance(status_payload.get("host_metrics"), dict)
+            else None
+        )
+        async with async_sessionmaker(
+            session.bind, expire_on_commit=False
+        )() as read_session:
+            data = await load_host_metric_history(
+                read_session,
+                metric_key=metric,
+                timeframe_key=timeframe,
+                chart_width_px=width,
+                live_metrics=live_metrics,
+            )
+        return await render_metric_history(data, host=True)
+
+    key = (
+        session.bind,
+        "host",
+        *metric_history_query_key(metric, timeframe, width, host=True),
     )
-    return await build_host_metric_history(
-        session,
-        metric_key=metric,
-        timeframe_key=timeframe,
-        chart_width_px=width,
-        live_metrics=live_metrics,
-    )
+    return await run_metric_history_request(key, build)
 
 
 @router.get("/api/backends/{backend_id}/hardening")

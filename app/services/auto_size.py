@@ -4,7 +4,6 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from inspect import signature
 import os
 from pathlib import Path
 import shutil
@@ -16,6 +15,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
+from app.services.config_change import converge_change, full_reconcile
 from app.logger import Operation as LogOperation, get_logger
 from app.models.entities import Backend, BackendResourceSample, HostResourceSample
 from app.schemas.apply import ApplyResponse
@@ -24,7 +24,6 @@ from app.services.apply_service import invalidate_apply_convergence, run_apply
 from app.services.cgroup_diagnostics import collect_container_cgroup_diagnostics
 from app.services.container_runtime import inspect_container, read_container_stats
 from app.services.control_events import emit_control_event
-from app.services.operations import OperationHandle
 from app.services.resource_profile import (
     backend_resource_profile,
     build_resource_profile,
@@ -267,68 +266,32 @@ async def run_auto_size_tick(
             changed_backends=changed_names,
             change_count=len(changed),
         )
-        apply_parameters = signature(run_apply).parameters
-        apply_kwargs: dict[str, Any] = {}
-        if "operation_kind" in apply_parameters:
-            apply_kwargs["operation_kind"] = "auto_size"
-        if "actor" in apply_parameters:
-            apply_kwargs["actor"] = "auto_size"
-        if "commit_on_success" in apply_parameters:
-            apply_kwargs["commit_on_success"] = False
-        if "emit_success_event" in apply_parameters:
-            apply_kwargs["emit_success_event"] = False
         with session.no_autoflush:
-            apply_response = await run_apply(session, settings, **apply_kwargs)
+            # Resizing moves the weighted memory denominator, so every
+            # automatic backend can be affected. This is a real full
+            # reconcile, but its commit and recovery still belong to the same
+            # configuration-change boundary as UI, API and CLI saves.
+            mutation = await converge_change(
+                session,
+                settings,
+                full_reconcile("auto_size", actor="auto_size", source="tick"),
+                apply_runner=run_apply,
+            )
+        apply_response = mutation.apply_response
         result["apply"] = {
             "status": apply_response.status,
             "message": apply_response.message,
             "run_id": apply_response.run_id,
         }
-        if apply_response.status == "success":
-            try:
-                await session.commit()
-            except Exception as exc:
-                await session.rollback()
-                retry_prepared = await _prepare_emergency_retry(
-                    session,
-                    immediate_decisions,
-                    bucket_start=_bucket_start(sample_now),
-                    invalidate_convergence=True,
-                )
-                result["apply"] = {
-                    "status": "error",
-                    "message": "apply completed but auto-size commit failed",
-                    "run_id": None,
-                    "uncommitted_run_id": apply_response.run_id,
-                    "phase": "database_commit",
-                    "error": str(exc),
-                    "emergency_retry_prepared": retry_prepared,
-                    "convergence_invalidated": True,
-                }
-                await _record_auto_size_commit_failure(settings, apply_response, exc)
-                logger.exception(
-                    "auto_size.tick.commit_failed_after_apply",
-                    run_id=apply_response.run_id,
-                    changed_backends=changed_names,
-                    error=str(exc),
-                    error_type=type(exc).__name__,
-                )
-                for decision in immediate_decisions:
-                    logger.error(
-                        "auto_size.emergency_promotion_failed",
-                        **_emergency_promotion_fields(
-                            decision, apply_run_id=apply_response.run_id
-                        ),
-                        apply_status="database_commit_failed",
-                        retry_prepared=retry_prepared,
-                    )
-                log_operation.failed(
-                    "Auto-size commit failed", status="error", phase="database_commit"
-                )
-                _finish_tick_log(log_operation, result)
-                return result
-            await _complete_deferred_apply_operation(settings, apply_response)
-            await _emit_deferred_apply_completed_event(settings, apply_response)
+        for key in (
+            "phase",
+            "failure_mode",
+            "manual_review_required",
+            "commit_outcome",
+        ):
+            if key in apply_response.details:
+                result["apply"][key] = apply_response.details[key]
+        if mutation.applied:
             for decision in changed:
                 if decision.trigger is None:
                     continue
@@ -349,13 +312,19 @@ async def run_auto_size_tick(
                 status=apply_response.status,
                 run_id=apply_response.run_id,
             )
-            await session.rollback()
-            retry_prepared = await _prepare_emergency_retry(
-                session,
-                immediate_decisions,
-                bucket_start=_bucket_start(sample_now),
-                invalidate_convergence=False,
-            )
+            # The shared boundary may prove that commit() raised only after the
+            # rows became durable. Do not prepare a retry over a change the
+            # database and host already carry.
+            commit_outcome = str(apply_response.details.get("commit_outcome") or "")
+            retry_prepared = False
+            if commit_outcome != "persisted":
+                await session.rollback()
+                retry_prepared = await _prepare_emergency_retry(
+                    session,
+                    immediate_decisions,
+                    bucket_start=_bucket_start(sample_now),
+                    invalidate_convergence=False,
+                )
             result["apply"]["emergency_retry_prepared"] = retry_prepared
             for decision in changed:
                 if decision.trigger is None:
@@ -365,14 +334,19 @@ async def run_auto_size_tick(
                     **_emergency_promotion_fields(
                         decision, apply_run_id=apply_response.run_id
                     ),
-                    apply_status=apply_response.status,
+                    apply_status=(
+                        f"{apply_response.status}:{commit_outcome}"
+                        if commit_outcome
+                        else apply_response.status
+                    ),
                     retry_prepared=retry_prepared,
                 )
-                await _emit_emergency_promotion_failed_event(
-                    settings,
-                    decision,
-                    apply_response=apply_response,
-                )
+                if commit_outcome != "persisted":
+                    await _emit_emergency_promotion_failed_event(
+                        settings,
+                        decision,
+                        apply_response=apply_response,
+                    )
         logger.info(
             "auto_size.tick.apply_completed",
             status=apply_response.status,
@@ -460,108 +434,6 @@ async def _commit_metric_sample_writes(
             error=str(exc),
         )
         return False
-
-
-def _deferred_apply_operation(
-    settings: Settings, apply_response: ApplyResponse
-) -> OperationHandle | None:
-    operation_id = apply_response.details.get("deferred_operation_id")
-    if not isinstance(operation_id, int):
-        return None
-    operation_kind = str(
-        apply_response.details.get("deferred_operation_kind") or "auto_size"
-    )
-    return OperationHandle(id=operation_id, kind=operation_kind, settings=settings)
-
-
-async def _complete_deferred_apply_operation(
-    settings: Settings, apply_response: ApplyResponse
-) -> None:
-    operation = _deferred_apply_operation(settings, apply_response)
-    if operation is None:
-        return
-    await operation.complete(
-        "success",
-        phase="completed",
-        details={
-            "apply_run_id": apply_response.run_id,
-            "status": "success",
-            "app_healthcheck_status": apply_response.details.get(
-                "app_healthcheck_status"
-            ),
-        },
-    )
-
-
-async def _record_auto_size_commit_failure(
-    settings: Settings,
-    apply_response: ApplyResponse,
-    exc: Exception,
-) -> None:
-    details = {
-        "phase": "database_commit",
-        "error": str(exc),
-        "failure_mode": "partial",
-        "manual_review_required": True,
-        "uncommitted_apply_run_id": apply_response.run_id,
-        "message": "Auto-size apply finished, but the resource-size commit failed.",
-    }
-    operation = _deferred_apply_operation(settings, apply_response)
-    if operation is not None:
-        await operation.complete(
-            "partial",
-            phase="database_commit",
-            error=str(exc),
-            details=details,
-        )
-    await emit_control_event(
-        settings,
-        kind="apply_failed",
-        source="auto_size",
-        summary="Auto-size apply completed but database commit failed",
-        severity="error",
-        scope="host",
-        affects_all=True,
-        subevents=[
-            {"label": "phase", "value": "database_commit"},
-            {"label": "status", "value": "partial"},
-            {"label": "run", "value": f"uncommitted #{apply_response.run_id}"},
-        ],
-        details=details,
-    )
-
-
-async def _emit_deferred_apply_completed_event(
-    settings: Settings, apply_response: ApplyResponse
-) -> None:
-    degraded_health = apply_response.details.get("app_healthcheck_status") == "degraded"
-    await emit_control_event(
-        settings,
-        kind="apply_completed",
-        source="apply",
-        summary="Auto-size changes applied with app health warnings"
-        if degraded_health
-        else "Auto-size changes applied",
-        severity="warn" if degraded_health else "success",
-        scope="host",
-        affects_all=True,
-        subevents=[
-            {"label": "run", "value": f"#{apply_response.run_id}"},
-            {"label": "status", "value": "degraded" if degraded_health else "success"},
-        ],
-        details={
-            "run_id": apply_response.run_id,
-            "status": "success",
-            "message": apply_response.message,
-            "app_healthcheck_status": apply_response.details.get(
-                "app_healthcheck_status"
-            ),
-            "app_healthcheck_failures": apply_response.details.get(
-                "app_healthcheck_failures"
-            )
-            or [],
-        },
-    )
 
 
 async def _notify_auto_size_changes(

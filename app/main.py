@@ -21,6 +21,7 @@ from app.access import build_access_required_response
 from app.config import Settings, get_settings
 from app.database import dispose_engine, init_db, verify_db_connection
 from app.ui.diagnostics import cancel_runtime_diagnostics
+from app.ui.metric_history import cancel_metric_history_requests
 from app.http_security import SecurityHeadersMiddleware
 from app.logger import (
     bind_log_context,
@@ -352,6 +353,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             with suppress(asyncio.CancelledError):
                 await notification_dispatch_task
         await cancel_status_cache_prefill()
+        await cancel_metric_history_requests()
         await cancel_runtime_diagnostics()
         if ssh_audit_listener is not None:
             ssh_audit_listener.close()

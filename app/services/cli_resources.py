@@ -10,12 +10,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from app.config import Settings
+from app.services.config_change import converge_change, output_change, route_change
 from app.database import create_configured_async_engine
 from app.models.entities import Backend, Input
 from app.schemas.backends import BackendIn, BackendOut, BackendUpdate
 from app.schemas.inputs import InputIn, InputOut, InputUpdate
 from app.services import backend_commands, input_commands
-from app.services.mutation_apply import commit_and_apply
 from app.services.operations import host_mutation_operation
 
 
@@ -124,6 +124,7 @@ async def mutate_resource(
         settings, kind=kind, actor="cli", phase="configure"
     ) as operation:
         async with resource_session(settings) as session:
+            config_changed = True
             if resource == "output":
                 if action == "create":
                     item = await backend_commands.create_backend(
@@ -133,6 +134,9 @@ async def mutate_resource(
                     item = await require_output(session, reference or "")
                     item = await backend_commands.update_backend(
                         session, item.id, data, commit=False
+                    )
+                    config_changed = session.is_modified(
+                        item, include_collections=True
                     )
             else:
                 if action == "create":
@@ -144,8 +148,23 @@ async def mutate_resource(
                     item = await input_commands.update_input(
                         session, item.id, data, commit=False
                     )
-            result = await commit_and_apply(
-                session, settings, operation=kind, operation_handle=operation
+                    config_changed = session.is_modified(
+                        item, include_collections=True
+                    )
+            # The edited row is known here, so the scope is real. An output
+            # edit concerns that output; an input edit concerns the outputs it
+            # attaches. Neither is a reason to reconcile the fleet.
+            if resource == "output":
+                change = output_change(kind, str(item.name or ""))
+            else:
+                change = route_change(
+                    kind, {str(b.name) for b in getattr(item, "backends", [])}
+                )
+            result = await converge_change(
+                session,
+                settings,
+                change=change,
+                operation_handle=operation,
             )
             if not result.applied:
                 raise ValueError(
@@ -158,7 +177,18 @@ async def mutate_resource(
             else:
                 item = await input_commands.require_input(session, item.id)
                 payload = input_payload(item)
-            return {resource: payload, "operation_id": operation.id, "changed": True}
+            host_changed = getattr(
+                getattr(result, "apply_response", None), "host_changed", None
+            )
+            return {
+                resource: payload,
+                "operation_id": operation.id,
+                # The request may change durable config, repair host drift, or
+                # both. Only when neither occurred is it an observed no-op.
+                # A runner without a host outcome gets the conservative answer.
+                "changed": config_changed
+                or (True if host_changed is None else host_changed),
+            }
 
 
 def route_payload(item: Input, output: Backend) -> dict[str, object]:
@@ -215,8 +245,12 @@ async def change_route(
                 await input_commands.update_input(
                     session, item.id, InputUpdate(backend_ids=sorted(ids)), commit=False
                 )
-                result = await commit_and_apply(
-                    session, settings, operation=kind, operation_handle=operation
+                result = await converge_change(
+                    session,
+                    settings,
+                    change=output_change(kind, str(output.name or "")),
+                    operation_handle=operation,
+                    # Attaching or detaching a route concerns that output.
                 )
                 if not result.applied:
                     raise ValueError(

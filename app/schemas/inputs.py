@@ -13,6 +13,7 @@ class InputIn(BaseModel):
     value: str = Field(min_length=1, max_length=255)
     backend_ids: list[int] = Field(default_factory=list)
     enabled: bool = True
+    https_enabled: bool = False
     shield_enabled: bool = False
     shield_code_hash: Optional[str] = None
     shield_access_code: Optional[str] = None
@@ -33,6 +34,7 @@ class InputUpdate(BaseModel):
     value: UpdateValue[Annotated[str, Field(min_length=1, max_length=255)]] = None
     backend_ids: Optional[list[int]] = None
     enabled: UpdateValue[bool] = None
+    https_enabled: UpdateValue[bool] = None
     shield_enabled: UpdateValue[bool] = None
     shield_code_hash: Optional[str] = None
     shield_access_code: Optional[str] = None
@@ -62,6 +64,10 @@ class InputOut(BaseModel):
     value: str
     backend_ids: list[int]
     enabled: bool
+    https_enabled: bool
+    https_provider: str
+    cloudflare_dns_enabled: bool
+    cloudflare_dns_ipv4: Optional[str]
     shield_enabled: bool
     shield_code_hash: Optional[str]
 

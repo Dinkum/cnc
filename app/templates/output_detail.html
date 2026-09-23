@@ -7,6 +7,7 @@
   <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
   <link rel="stylesheet" href="/static/css/app.css?v={{ asset_version }}">
   <link rel="stylesheet" href="/static/css/output-ssh.css?v={{ asset_version }}">
+  <link rel="stylesheet" href="/static/css/output-settings.css?v={{ asset_version }}">
 </head>
 <body data-output-kind="{{ selected_backend.kind }}" data-output-enabled="{{ 'true' if selected_backend.enabled else 'false' }}">
   <main class="shell">
@@ -26,14 +27,18 @@
       <a class="back-crumb" href="/?tab=outputs">&#x2190; outputs</a>
       <div class="output-page-title">
         <h1>{{ selected_backend.name }}</h1>
-        <div class="output-page-badges">
+        <div class="output-page-controls"><details class="output-actions-menu"><summary>Actions <span aria-hidden="true">⌄</span></summary><div class="output-actions-popover"><button type="button" class="ghost" data-clone-output-trigger>Clone output</button>
+          {% if multi_node_transfer_enabled %}
+            <button type="button" class="ghost" data-transfer-output-trigger>Transfer output</button>
+          {% endif %}
+</div></details><div class="output-page-badges">
           <span class="stat-chip {{ 'chip-on' if selected_backend.enabled else 'chip-off' }}">{{ "enabled" if selected_backend.enabled else "disabled" }}</span>
           <span
             class="pill {{ selected_output_detail.get('runtime_health_tone', 'inactive') }}"
             id="output-runtime-pill"
             {% if not selected_output_detail.get("runtime_health_label") %}hidden{% endif %}
           >{{ selected_output_detail.get("runtime_health_label", "") }}</span>
-        </div>
+        </div></div>
       </div>
     </header>
 
@@ -66,10 +71,10 @@
         </article>
       {% endif %}
     </div>
-    <div class="panel-grid status-grid">
-      <article class="card">
+    <section class="output-overview" aria-labelledby="output-overview-title"><h2 class="output-area-title" id="output-overview-title">Overview</h2>
+<div class="panel-grid output-overview-grid"><article class="card">
         <div class="section-head">
-          <h2>Status</h2>
+          <h3>Status</h3>
         </div>
         <div class="settings-lines" id="output-status-rows">
           {% for item in output_signal_cards %}
@@ -96,86 +101,75 @@
             </div>
           {% endfor %}
         </div>
-      </article>
-
-      <article class="card">
-        <div class="section-head">
-          <h2>Info</h2>
-        </div>
-        <div class="settings-lines">
-          {% for row in output_info_rows %}
-            {% set key = row[0] %}
-            {% set value = row[1] %}
-            {% set time_meta = row[2] if row|length > 2 else {} %}
-            <div class="settings-line">
-              <span class="settings-key-wrap">
-                <span class="settings-key">{{ key }}</span>
-                {% if key == "memory target" %}
-                  <span class="settings-help-badge" tabindex="0" data-tooltip="Soft memory target. The host starts applying pressure here before the hard cap.">i</span>
-                {% elif key == "memory cap" %}
-                  <span class="settings-help-badge" tabindex="0" data-tooltip="Hard memory ceiling for the output. The app can be stopped if it exceeds this.">i</span>
-                {% elif key == "cpu limit" %}
-                  <span class="settings-help-badge" tabindex="0" data-tooltip="Share of total host CPU capacity across all cores.">i</span>
-                {% endif %}
-              </span>
-              <span
-                class="settings-value mono"
-                {% if time_meta.raw %}data-local-time="{{ time_meta.raw }}"{% endif %}
-                {% if time_meta.format %}data-local-time-format="{{ time_meta.format }}"{% endif %}
-              >{{ value }}</span>
+      </article><article class="card span-2">
+        <div class="section-head output-metrics-heading">
+          <h3>Metrics</h3>
+          <div class="metric-export" id="output-metric-export">
+            <button type="button" class="ghost" data-export-toggle aria-expanded="false" aria-controls="output-metric-export-options" disabled>Export</button>
+            <div class="metric-export-options" id="output-metric-export-options" hidden>
+              <button type="button" class="ghost" data-export-format="csv">Download CSV</button>
+              <button type="button" class="ghost" data-export-format="json">Download JSON</button>
             </div>
-          {% endfor %}
+          </div>
         </div>
-      </article>
+        <div class="section-actions metrics-actions">
+          <label class="field metrics-select-field">
+            <span class="metric-label">metric</span>
+            <span class="select-wrap">
+              <select id="output-metric-select" {% if selected_backend.kind not in ["app", "shield"] %}disabled{% endif %}>
+                {% for option in metric_history_options %}
+                  <option value="{{ option.key }}" {% if option.key == metric_history_default_metric %}selected{% endif %}>{{ option.label }}</option>
+                {% endfor %}
+              </select>
+            </span>
+          </label>
+          <label class="field metrics-select-field">
+            <span class="metric-label">timeframe</span>
+            <span class="select-wrap">
+              <select id="output-timeframe-select" {% if selected_backend.kind not in ["app", "shield"] %}disabled{% endif %}>
+                {% for option in metric_history_timeframes %}
+                  <option value="{{ option.key }}" {% if option.key == metric_history_default_timeframe %}selected{% endif %}>{{ option.label }}</option>
+                {% endfor %}
+              </select>
+            </span>
+          </label>
+        </div>
+        <div
+          class="metrics-chart-shell"
+          data-output-kind="{{ selected_backend.kind }}"
+          data-output-live-metrics='{{ (selected_output_live_metrics or {}) | tojson | forceescape }}'
+        >
+          <div class="metrics-summary-grid" id="output-metrics-summary"></div>
+          <div class="metrics-chart-frame">
+            <div class="metrics-chart-canvas-wrap">
+              <canvas
+                id="output-metrics-chart"
+                aria-label="Output metric history chart"
+              ></canvas>
+            </div>
+            <div class="metrics-chart-loading" id="output-metrics-loading" hidden aria-hidden="true">
+              <span class="metrics-loading-core"></span>
+            </div>
+            <div class="metrics-chart-empty subtle" id="output-metrics-empty" {% if selected_backend.kind in ["app", "shield"] %}hidden{% endif %}>
+              Resource history is only available for app and Shield outputs.
+            </div>
+          </div>
+        </div>
+      </article></div></section>
+<section class="output-configuration" aria-labelledby="output-configuration-title"><h2 class="output-area-title" id="output-configuration-title">Configuration</h2>
+<div class="output-section-surface">
+{% include 'output_settings.html' %}
+<div class="panel-grid status-grid output-configuration-extra">
 
-      {% if selected_backend.kind == "app" %}
-        {% include "output_ssh_access.html" %}
-      {% endif %}
+
+
+
 
       <article class="card span-2">
         <div class="section-head">
-          <h2>Recent event history</h2>
-          <div class="section-actions">
-            <span class="summary-pill">{{ recent_event_rows|length }} shown</span>
-          </div>
+          <h3>Attached inputs</h3>
         </div>
-        {% if recent_event_rows %}
-          <div class="event-list compact output-event-history-scroll">
-            {% for item in recent_event_rows %}
-              <div class="event-row output-event-row {{ item.tone }}">
-                <div class="event-time-cell">
-                  <div class="event-time" data-local-time="{{ item.created_at_raw }}">{{ item.created_at }}</div>
-                </div>
-                <div class="event-main">
-                  <div class="event-main-head">
-                    <div class="event-summary">{{ item.summary }}</div>
-                    <span class="event-tone-pill {{ item.tone }}">{{ item.severity or "info" }}</span>
-                  </div>
-                  {% if item.pairs %}
-                    <div class="event-subevents">
-                      {% for pair in item.pairs %}
-                        <span class="event-subevent"><span>{{ pair.label }}</span><strong>{{ pair.value }}</strong></span>
-                      {% endfor %}
-                    </div>
-                  {% endif %}
-                  <details class="event-details">
-                    <summary>Details</summary>
-                    <pre>{{ item.details }}</pre>
-                  </details>
-                </div>
-              </div>
-            {% endfor %}
-          </div>
-        {% else %}
-          <p class="subtle">No recent high-level events yet.</p>
-        {% endif %}
-      </article>
-
-      <article class="card span-2">
-        <div class="section-head">
-          <h2>Attached inputs</h2>
-        </div>
-        <form method="post" action="/ui/backends/{{ selected_backend.id }}/inputs" class="sf" data-output-save-form data-output-save-running="Saving attached inputs" data-output-save-fallback="Attached inputs saved.">
+        <form method="post" action="/ui/backends/{{ selected_backend.id }}/inputs" class="sf" data-output-settings-section="inputs" data-output-save-form data-output-save-running="Saving attached inputs" data-output-save-fallback="Attached inputs saved.">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <div class="sf-wide output-input-card" data-output-attach-form>
             <div class="output-tags" data-output-tags>
@@ -222,27 +216,7 @@
             {% if not input_attach_options and not input_attach_lazy_available %}
               <div class="picker-empty">No inputs yet &#x2014; add one first.</div>
             {% endif %}
-            <div class="editor-actions output-card-actions" data-output-attach-save hidden>
-              <button type="submit">Save attached inputs</button>
-            </div>
-            <div class="output-inline-save-progress" data-output-save-inline-progress hidden aria-live="polite">
-              <div class="output-inline-save-head">
-                <span data-output-save-inline-label>Saving</span>
-                <span data-output-save-inline-value>0%</span>
-              </div>
-              <div
-                class="clone-progress-track output-inline-save-track"
-                role="progressbar"
-                aria-label="Attached inputs save progress"
-                aria-valuemin="0"
-                aria-valuemax="100"
-                aria-valuenow="0"
-                data-output-save-inline-track
-              >
-                <span class="clone-progress-fill" data-output-save-inline-fill></span>
-              </div>
-            </div>
-          </div>
+            {% set section_key = 'inputs' %}{% include 'output_section_footer.html' %}
         </form>
       </article>
 
@@ -255,6 +229,7 @@
             data-output-save-running="Saving multi-node"
             data-output-save-fallback="Multi-node saved."
             data-output-save-error-fallback="Multi-node save failed."
+            data-output-settings-section="placement"
             data-placement-form
           >
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -271,21 +246,8 @@
               data-placement-active-input
             >
             <div class="placement-card-head">
-              <h2>Multi-node</h2>
-              <label class="placement-toggle" aria-label="Configure multi-node">
-                <span class="toggle-switch{% if multi_node_placement.enabled %} is-on{% endif %}">
-                  <input
-                    name="placement_enabled"
-                    type="checkbox"
-                    value="true"
-                    data-placement-enabled
-                    {% if multi_node_placement.enabled %}checked{% endif %}
-                  >
-                  <span class="toggle-switch-track">
-                    <span class="toggle-switch-thumb"></span>
-                  </span>
-                </span>
-              </label>
+              <h3>Multi-node</h3>
+<label class="output-checkbox"><input name="placement_enabled" type="checkbox" value="true" data-placement-enabled {% if multi_node_placement.enabled %}checked{% endif %}>Enable multi-node</label>
             </div>
             <p class="placement-empty-line" data-placement-empty {% if multi_node_placement.enabled %}hidden{% endif %}>No failover or live replicas are configured.</p>
             <section
@@ -429,360 +391,15 @@
                 </div>
               </div>
             </section>
-            <div class="editor-actions placement-card-actions">
-              <button type="submit" data-placement-save>Save</button>
-            </div>
+            {% set section_key = 'placement' %}{% include 'output_section_footer.html' %}
           </form>
         </article>
       {% endif %}
 
-      <article class="card span-2">
-        <div class="section-head">
-          <h2>Actions</h2>
-        </div>
-        <div class="editor-actions action-card-actions">
-          <button type="button" class="ghost" data-clone-output-trigger>Clone output</button>
-          {% if multi_node_transfer_enabled %}
-            <button type="button" class="ghost" data-transfer-output-trigger>Transfer output</button>
-          {% endif %}
-          <form method="post" action="/ui/backends/{{ selected_backend.id }}/state" data-output-save-form data-output-save-running="{{ 'Disabling output' if selected_backend.enabled else 'Enabling output' }}" data-output-save-fallback="{{ 'Output disabled.' if selected_backend.enabled else 'Output enabled.' }}">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-            <input type="hidden" name="action" value="{{ 'disable' if selected_backend.enabled else 'enable' }}">
-            <button type="submit" class="ghost">{{ 'Disable output' if selected_backend.enabled else 'Enable output' }}</button>
-          </form>
-          <form method="post" action="/ui/backends/{{ selected_backend.id }}/delete" data-delete-output-form>
-            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-            <button type="button" class="danger" data-delete-output-trigger>Delete output</button>
-          </form>
-        </div>
-      </article>
 
-      <article class="card span-2">
-        <div class="section-head">
-          <h2>Backup</h2>
-          <div class="section-actions">
-            <span class="summary-pill" id="backup-history-count">{{ backup_history|length }} saved</span>
-          </div>
-        </div>
-        <div class="settings-lines status-lines" id="backup-summary-rows">
-          {% for key, value in backup_summary.rows %}
-            <div class="settings-line">
-              <span class="settings-key">{{ key }}</span>
-              <span class="settings-value mono">{{ value }}</span>
-            </div>
-          {% endfor %}
-        </div>
-        {% if backup_signals_pending %}
-          <p class="subtle" id="backup-signals-note">Loading backup details.</p>
-        {% endif %}
-        <div class="editor-actions backup-create-actions">
-          <form method="post" action="/ui/backends/{{ selected_backend.id }}/backup" data-backup-form>
-            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-            <button type="submit" data-backup-submit>Create backup</button>
-          </form>
-        </div>
-        <section class="backup-progress-shell" id="backup-progress-shell" hidden>
-          <div class="clone-progress-track" aria-hidden="true">
-            <span class="clone-progress-fill" data-backup-progress-fill></span>
-          </div>
-          <div class="clone-progress-log" data-backup-progress-log></div>
-        </section>
-        <div id="backup-history-block">
-        {% if backup_history %}
-          <div class="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>ID</th><th>Created</th><th>Status</th><th>Size</th><th>Covered paths</th><th>File</th><th>Action</th>
-                </tr>
-              </thead>
-              <tbody>
-                {% for item in backup_history %}
-                  <tr>
-                    <td class="mono">#{{ item.id }}</td>
-                    <td class="mono" data-local-time="{{ item.created_at_raw }}">{{ item.created_at }}</td>
-                    <td><span class="pill {{ item.tone }}">{{ item.status }}</span></td>
-                    <td class="mono">{{ item.size }}</td>
-                    <td>{{ item.covered_paths_summary }}</td>
-                    <td class="mono">{{ item.bundle }}</td>
-                    <td>
-                      <div class="backup-action-buttons">
-                        <form method="post" action="/ui/backends/{{ selected_backend.id }}/restore" data-restore-form>
-                          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                          <input type="hidden" name="backup_id" value="{{ item.id }}">
-                          <button type="submit" class="ghost" {% if not item.restorable %}disabled{% endif %}>Restore</button>
-                        </form>
-                        <form method="post" action="/ui/backends/{{ selected_backend.id }}/backups/{{ item.id }}/delete" data-delete-backup-form data-backup-id="{{ item.id }}" data-backup-label="#{{ item.id }}" data-backup-file="{{ item.bundle }}">
-                          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                          <button type="button" class="danger" data-delete-backup-trigger>Delete</button>
-                        </form>
-                      </div>
-                    </td>
-                  </tr>
-                {% endfor %}
-              </tbody>
-            </table>
-          </div>
-        {% else %}
-          <p class="subtle">No backups yet.</p>
-        {% endif %}
-        </div>
-        <section class="backup-import-card">
-          <h3>Import backup</h3>
-          <form method="post" action="/ui/backends/{{ selected_backend.id }}/import" enctype="multipart/form-data" class="stack-form" data-import-backup-form>
-            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-            <label class="field">
-              <input type="file" name="bundle" accept=".tar,.tar.gz,application/gzip,application/x-gzip,application/x-tar" required>
-            </label>
-            <button type="submit" class="ghost">Verify and import</button>
-          </form>
-        </section>
-      </article>
 
-      <article class="card span-2">
-        <div class="section-head output-metrics-heading">
-          <h2>Metrics</h2>
-          <div class="metric-export" id="output-metric-export">
-            <button type="button" class="ghost" data-export-toggle aria-expanded="false" aria-controls="output-metric-export-options" disabled>Export</button>
-            <div class="metric-export-options" id="output-metric-export-options" hidden>
-              <button type="button" class="ghost" data-export-format="csv">Download CSV</button>
-              <button type="button" class="ghost" data-export-format="json">Download JSON</button>
-            </div>
-          </div>
-        </div>
-        <div class="section-actions metrics-actions">
-          <label class="field metrics-select-field">
-            <span class="metric-label">metric</span>
-            <span class="select-wrap">
-              <select id="output-metric-select" {% if selected_backend.kind not in ["app", "shield"] %}disabled{% endif %}>
-                {% for option in metric_history_options %}
-                  <option value="{{ option.key }}" {% if option.key == metric_history_default_metric %}selected{% endif %}>{{ option.label }}</option>
-                {% endfor %}
-              </select>
-            </span>
-          </label>
-          <label class="field metrics-select-field">
-            <span class="metric-label">timeframe</span>
-            <span class="select-wrap">
-              <select id="output-timeframe-select" {% if selected_backend.kind not in ["app", "shield"] %}disabled{% endif %}>
-                {% for option in metric_history_timeframes %}
-                  <option value="{{ option.key }}" {% if option.key == metric_history_default_timeframe %}selected{% endif %}>{{ option.label }}</option>
-                {% endfor %}
-              </select>
-            </span>
-          </label>
-        </div>
-        <div
-          class="metrics-chart-shell"
-          data-output-kind="{{ selected_backend.kind }}"
-          data-output-live-metrics='{{ (selected_output_live_metrics or {}) | tojson | forceescape }}'
-        >
-          <div class="metrics-summary-grid" id="output-metrics-summary"></div>
-          <div class="metrics-chart-frame">
-            <div class="metrics-chart-canvas-wrap">
-              <canvas
-                id="output-metrics-chart"
-                aria-label="Output metric history chart"
-              ></canvas>
-            </div>
-            <div class="metrics-chart-loading" id="output-metrics-loading" hidden aria-hidden="true">
-              <span class="metrics-loading-core"></span>
-            </div>
-            <div class="metrics-chart-empty subtle" id="output-metrics-empty" {% if selected_backend.kind in ["app", "shield"] %}hidden{% endif %}>
-              Resource history is only available for app and Shield outputs.
-            </div>
-          </div>
-        </div>
-      </article>
 
-      <article class="card span-2 debug-card">
-        <div class="section-head">
-          <h2>Debug</h2>
-        </div>
-        <div class="detail-columns">
-          <div class="code-block compact-block">
-            <div class="code-head">debug dump</div>
-            <pre>{{ selected_output_detail.get("debug_dump", "&#x2014;") }}</pre>
-          </div>
-          <div class="code-block compact-block">
-            <div class="code-head">service status</div>
-            <pre>{% if selected_output_detail.get("service_status") %}{{ selected_output_detail.get("service_status") | tojson(indent=2) }}{% else %}No live service status.{% endif %}</pre>
-          </div>
-          <div class="code-block compact-block">
-            <div class="code-head">env</div>
-            <pre>{{ selected_output_detail.get("env_view") | tojson(indent=2) }}</pre>
-          </div>
-          <div class="code-block compact-block">
-            <div class="code-head">volumes</div>
-            <pre>{{ selected_output_detail.get("volume_view") | tojson(indent=2) }}</pre>
-          </div>
-        </div>
-      </article>
 
-      <article class="card span-2">
-        <div class="section-head">
-          <h2>Settings</h2>
-        </div>
-        <form
-          id="output-settings-form"
-          method="post"
-          action="/ui/backends/{{ selected_backend.id }}"
-          class="sf"
-          data-output-save-form
-          data-output-save-running="Saving output"
-          data-output-save-fallback="Output saved."
-          data-shield-code-configured="{{ 'true' if selected_backend.shield_code_hash else 'false' }}"
-        >
-          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-
-          <div class="settings-lines">
-            <div class="settings-line sf-row">
-              <label class="settings-key" for="sf-name">name</label>
-              <input id="sf-name" name="name" required value="{{ selected_backend.name }}">
-            </div>
-            <div class="settings-line sf-row">
-              <span class="settings-key">kind</span>
-              <span class="settings-value mono">{{ selected_backend.kind }}</span>
-              <input type="hidden" name="kind" value="{{ selected_backend.kind }}">
-            </div>
-            <div class="settings-line sf-row">
-              <label class="settings-key" for="sf-port">handoff port</label>
-              <input id="sf-port" name="port" type="number" value="{{ '' if selected_backend.port is none else selected_backend.port }}">
-            </div>
-            <div class="settings-line sf-row">
-              <label class="settings-key" for="sf-static-root">static root</label>
-              <input id="sf-static-root" name="static_root" value="{{ '' if selected_backend.static_root is none else selected_backend.static_root }}" placeholder="/srv/site" autocomplete="off" autocapitalize="off" spellcheck="false" title="{{ static_root_hint }}">
-            </div>
-            <div class="settings-line sf-row">
-              <label class="settings-key" for="sf-sandbox-profile">guest profile</label>
-              <span class="select-wrap"><select id="sf-sandbox-profile" name="sandbox_profile">
-                {% for profile in app_sandbox_profiles %}
-                  <option value="{{ profile.profile_id }}" {% if selected_backend.sandbox_profile == profile.profile_id %}selected{% endif %}>{{ profile.label }}</option>
-                {% endfor %}
-              </select></span>
-            </div>
-            <div class="settings-line sf-row">
-              <label class="settings-key" for="sf-handoff-port">internal app port</label>
-              <input id="sf-handoff-port" name="handoff_port" type="number" value="{{ selected_backend.handoff_port }}">
-            </div>
-            <div class="settings-line sf-row">
-              <label class="settings-key" for="sf-hc-mode">healthcheck mode</label>
-              <span class="select-wrap"><select id="sf-hc-mode" name="healthcheck_mode">
-                <option value="none" {% if selected_output_detail.get("healthcheck_mode") == "none" %}selected{% endif %}>none</option>
-                <option value="tcp" {% if selected_output_detail.get("healthcheck_mode") == "tcp" %}selected{% endif %}>tcp</option>
-                <option value="http" {% if selected_output_detail.get("healthcheck_mode") == "http" %}selected{% endif %}>http</option>
-              </select></span>
-            </div>
-            <div class="settings-line sf-row">
-              <label class="settings-key" for="sf-hc-path">healthcheck path</label>
-              <input id="sf-hc-path" name="healthcheck_path" value="{{ '' if selected_backend.healthcheck_path is none else selected_backend.healthcheck_path }}">
-            </div>
-            <div class="settings-line sf-row">
-              <label class="settings-key" for="sf-hc-host">health host</label>
-              <input id="sf-hc-host" name="healthcheck_host_header" value="{{ '' if selected_backend.healthcheck_host_header is none else selected_backend.healthcheck_host_header }}" placeholder="app.example.com">
-            </div>
-            <div class="settings-line sf-row">
-              <label class="settings-key" for="sf-resource-size">resource size</label>
-              <span class="select-wrap"><select id="sf-resource-size" name="resource_size" data-resource-size-control>
-                <option value="auto" {% if selected_output_detail.get("resource_size_choice") == "auto" %}selected{% endif %}>auto</option>
-                <option value="small" {% if selected_output_detail.get("resource_size_choice") == "small" %}selected{% endif %}>small</option>
-                <option value="medium" {% if selected_output_detail.get("resource_size_choice") == "medium" %}selected{% endif %}>medium</option>
-                <option value="large" {% if selected_output_detail.get("resource_size_choice") == "large" %}selected{% endif %}>large</option>
-                <option value="custom" {% if selected_output_detail.get("resource_size_choice") == "custom" %}selected{% endif %}>custom</option>
-              </select></span>
-            </div>
-            <div class="settings-line sf-row" data-custom-resource-limit {% if selected_output_detail.get("resource_size_choice") != "custom" %}hidden{% endif %}>
-              <label class="settings-key" for="sf-mem-high">memory high</label>
-              <input id="sf-mem-high" name="memory_high_override" value="{{ selected_output_detail.get('memory_high_override', '') }}" placeholder="auto" {% if selected_output_detail.get("resource_size_choice") != "custom" %}disabled{% endif %}>
-            </div>
-            <div class="settings-line sf-row" data-custom-resource-limit {% if selected_output_detail.get("resource_size_choice") != "custom" %}hidden{% endif %}>
-              <label class="settings-key" for="sf-mem-max">memory max</label>
-              <input id="sf-mem-max" name="memory_max_override" value="{{ selected_output_detail.get('memory_max_override', '') }}" placeholder="auto" {% if selected_output_detail.get("resource_size_choice") != "custom" %}disabled{% endif %}>
-            </div>
-            <div class="settings-line sf-row" data-custom-resource-limit {% if selected_output_detail.get("resource_size_choice") != "custom" %}hidden{% endif %}>
-              <label class="settings-key" for="sf-cpu">cpu quota</label>
-              <input id="sf-cpu" name="cpu_quota_override" value="{{ selected_output_detail.get('cpu_quota_override', '') }}" placeholder="auto" {% if selected_output_detail.get("resource_size_choice") != "custom" %}disabled{% endif %}>
-            </div>
-            <div class="settings-line sf-row sf-tall">
-              <label class="settings-key" for="sf-volumes">volumes json</label>
-              <textarea id="sf-volumes" name="volumes_json" rows="4">{{ selected_backend.volumes_json }}</textarea>
-            </div>
-            <div class="settings-line sf-row">
-              <label class="settings-key" for="sf-notes">notes</label>
-              <input id="sf-notes" name="notes" value="{{ '' if selected_backend.notes is none else selected_backend.notes }}">
-            </div>
-          </div>
-
-          <div class="sf-wide editor-actions">
-            <button type="submit">Save</button>
-          </div>
-          <div class="output-inline-save-progress output-settings-save-progress" data-output-save-inline-progress hidden aria-live="polite">
-            <div class="output-inline-save-head">
-              <span data-output-save-inline-label>Saving</span>
-              <span data-output-save-inline-value>0%</span>
-            </div>
-            <div
-              class="clone-progress-track output-inline-save-track"
-              role="progressbar"
-              aria-label="Output settings save progress"
-              aria-valuemin="0"
-              aria-valuemax="100"
-              aria-valuenow="0"
-              data-output-save-inline-track
-            >
-              <span class="clone-progress-fill" data-output-save-inline-fill></span>
-            </div>
-          </div>
-        </form>
-      </article>
-
-      {% if selected_backend.kind == "app" %}
-        <article class="card span-2 output-shield-card">
-          <div class="section-head">
-            <h2>Shield</h2>
-          </div>
-          <div class="settings-lines">
-            <div class="settings-line sf-row">
-              <span class="settings-key">shield</span>
-              <span class="toggle-switch{% if selected_backend.shield_enabled %} is-on{% endif %}">
-                <input
-                  form="output-settings-form"
-                  name="shield_enabled"
-                  type="checkbox"
-                  value="true"
-                  {% if selected_backend.shield_enabled %}checked{% endif %}
-                  {% if (not shield_status.server_enabled or not shield_status.ready) and not selected_backend.shield_enabled %}disabled{% endif %}
-                >
-                <span class="toggle-switch-track">
-                  <span class="toggle-switch-thumb"></span>
-                </span>
-              </span>
-            </div>
-            <div class="settings-line sf-row">
-              <label class="settings-key" for="sf-shield-code">access key</label>
-              <input
-                id="sf-shield-code"
-                form="output-settings-form"
-                name="shield_access_code"
-                type="text"
-                value="{{ selected_output_detail.get('shield_access_code', '') }}"
-                placeholder="{{ 're-enter access key' if selected_backend.shield_code_hash else 'required before enable' }}"
-                autocomplete="off"
-                spellcheck="false"
-              >
-            </div>
-            {% if not shield_status.server_enabled or not shield_status.ready %}
-              <div class="settings-line sf-row sf-tall">
-                <span class="settings-key">shield prereq</span>
-                <span class="settings-value">Enable Shield in Settings, create the reserved shield output, then attach a shield input to it.</span>
-              </div>
-            {% endif %}
-          </div>
-          <div class="sf-wide editor-actions">
-            <button type="submit" form="output-settings-form">Save</button>
-          </div>
-        </article>
-      {% endif %}
 
       {% if beta_hardening and selected_backend.kind == "app" %}
       <article class="card span-2 beta-output-card" data-hardening-card>
@@ -842,8 +459,8 @@
               </div>
               <section class="hardening-progress" data-hardening-phase-two-progress hidden>
                 <p class="hardening-narrative mono" data-hardening-phase-two-narrative>Preparing clone test.</p>
-                <div class="clone-progress-track" aria-hidden="true">
-                  <span class="clone-progress-fill" data-hardening-phase-two-fill></span>
+                <div class="progress-track" data-progress-track aria-hidden="true">
+                  <span class="progress-fill" data-hardening-phase-two-fill></span>
                 </div>
                 <div class="hardening-progress-meta mono" data-hardening-phase-two-meta hidden></div>
               </section>
@@ -910,6 +527,195 @@
       </article>
       {% endif %}
     </div>
+</div></section>
+{% if selected_backend.kind == "app" %}<section class="output-access" aria-labelledby="output-access-title"><h2 class="output-area-title" id="output-access-title">Access</h2><div class="output-section-surface">
+{% include 'output_ssh_access.html' %}
+{% include 'output_shield_settings.html' %}
+</div></section>{% endif %}
+<article class="card span-2">
+        <div class="section-head">
+          <h2>Backups</h2>
+          <div class="section-actions">
+            <span class="summary-pill" id="backup-history-count">{{ backup_history|length }} saved</span>
+          </div>
+        </div>
+        <div class="settings-lines status-lines" id="backup-summary-rows">
+          {% for key, value in backup_summary.rows %}
+            <div class="settings-line">
+              <span class="settings-key">{{ key }}</span>
+              <span class="settings-value mono">{{ value }}</span>
+            </div>
+          {% endfor %}
+        </div>
+        {% if backup_signals_pending %}
+          <p class="subtle" id="backup-signals-note">Loading backup details.</p>
+        {% endif %}
+        <div class="editor-actions backup-create-actions">
+          <form method="post" action="/ui/backends/{{ selected_backend.id }}/backup" data-backup-form>
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit" data-backup-submit>Create backup</button>
+          </form>
+        </div>
+        {# The bar lives in the card stack; the log stays here because it is a
+           record of what happened, next to the history it refreshes. #}
+        <section class="backup-progress-shell" id="backup-progress-shell" hidden>
+          <div class="progress-log" data-progress-log></div>
+        </section>
+        <div id="backup-history-block">
+        {% if backup_history %}
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>ID</th><th>Created</th><th>Status</th><th>Size</th><th>Covered paths</th><th>File</th><th>Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for item in backup_history %}
+                  <tr>
+                    <td class="mono">#{{ item.id }}</td>
+                    <td class="mono" data-local-time="{{ item.created_at_raw }}">{{ item.created_at }}</td>
+                    <td><span class="pill {{ item.tone }}">{{ item.status }}</span></td>
+                    <td class="mono">{{ item.size }}</td>
+                    <td>{{ item.covered_paths_summary }}</td>
+                    <td class="mono">{{ item.bundle }}</td>
+                    <td>
+                      <div class="backup-action-buttons">
+                        <form method="post" action="/ui/backends/{{ selected_backend.id }}/restore" data-restore-form>
+                          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                          <input type="hidden" name="backup_id" value="{{ item.id }}">
+                          <button type="submit" class="ghost" {% if not item.restorable %}disabled{% endif %}>Restore</button>
+                        </form>
+                        <form method="post" action="/ui/backends/{{ selected_backend.id }}/backups/{{ item.id }}/delete" data-delete-backup-form data-backup-id="{{ item.id }}" data-backup-label="#{{ item.id }}" data-backup-file="{{ item.bundle }}">
+                          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                          <button type="button" class="danger" data-delete-backup-trigger>Delete</button>
+                        </form>
+                      </div>
+                    </td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% else %}
+          <p class="subtle">No backups yet.</p>
+        {% endif %}
+        </div>
+        <section class="backup-import-card">
+          <h3>Import backup</h3>
+          <form method="post" action="/ui/backends/{{ selected_backend.id }}/import" enctype="multipart/form-data" class="stack-form" data-import-backup-form>
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <label class="field">
+              <input type="file" name="bundle" accept=".tar,.tar.gz,application/gzip,application/x-gzip,application/x-tar" required>
+            </label>
+            <button type="submit" class="ghost">Verify and import</button>
+          </form>
+        </section>
+      </article>
+<details class="output-diagnostics"><summary>Diagnostics <span class="subtle">Events and debug details</span></summary><div class="output-diagnostics-content"><article class="card">
+        <div class="section-head">
+          <h3>Details</h3>
+        </div>
+        <div class="settings-lines">
+          {% for row in output_info_rows %}
+            {% set key = row[0] %}
+            {% set value = row[1] %}
+            {% set time_meta = row[2] if row|length > 2 else {} %}
+            <div class="settings-line">
+              <span class="settings-key-wrap">
+                <span class="settings-key">{{ key }}</span>
+                {% if key == "memory target" %}
+                  <span class="settings-help-badge" tabindex="0" data-tooltip="Soft memory target. The host starts applying pressure here before the hard cap.">i</span>
+                {% elif key == "memory cap" %}
+                  <span class="settings-help-badge" tabindex="0" data-tooltip="Hard memory ceiling for the output. The app can be stopped if it exceeds this.">i</span>
+                {% elif key == "cpu limit" %}
+                  <span class="settings-help-badge" tabindex="0" data-tooltip="Share of total host CPU capacity across all cores.">i</span>
+                {% endif %}
+              </span>
+              <span
+                class="settings-value mono"
+                {% if time_meta.raw %}data-local-time="{{ time_meta.raw }}"{% endif %}
+                {% if time_meta.format %}data-local-time-format="{{ time_meta.format }}"{% endif %}
+              >{{ value }}</span>
+            </div>
+          {% endfor %}
+        </div>
+      </article><article class="card span-2">
+        <div class="section-head">
+          <h3>Recent event history</h3>
+          <div class="section-actions">
+            <span class="summary-pill">{{ recent_event_rows|length }} shown</span>
+          </div>
+        </div>
+        {% if recent_event_rows %}
+          <div class="event-list compact output-event-history-scroll">
+            {% for item in recent_event_rows %}
+              <div class="event-row output-event-row {{ item.tone }}">
+                <div class="event-time-cell">
+                  <div class="event-time" data-local-time="{{ item.created_at_raw }}">{{ item.created_at }}</div>
+                </div>
+                <div class="event-main">
+                  <div class="event-main-head">
+                    <div class="event-summary">{{ item.summary }}</div>
+                    <span class="event-tone-pill {{ item.tone }}">{{ item.severity or "info" }}</span>
+                  </div>
+                  {% if item.pairs %}
+                    <div class="event-subevents">
+                      {% for pair in item.pairs %}
+                        <span class="event-subevent"><span>{{ pair.label }}</span><strong>{{ pair.value }}</strong></span>
+                      {% endfor %}
+                    </div>
+                  {% endif %}
+                  <details class="event-details">
+                    <summary>Details</summary>
+                    <pre>{{ item.details }}</pre>
+                  </details>
+                </div>
+              </div>
+            {% endfor %}
+          </div>
+        {% else %}
+          <p class="subtle">No recent high-level events yet.</p>
+        {% endif %}
+      </article><article class="card span-2 debug-card">
+        <div class="section-head">
+          <h3>Debug</h3>
+        </div>
+        <div class="detail-columns">
+          <div class="code-block compact-block">
+            <div class="code-head">debug dump</div>
+            <pre>{{ selected_output_detail.get("debug_dump", "&#x2014;") }}</pre>
+          </div>
+          <div class="code-block compact-block">
+            <div class="code-head">service status</div>
+            <pre>{% if selected_output_detail.get("service_status") %}{{ selected_output_detail.get("service_status") | tojson(indent=2) }}{% else %}No live service status.{% endif %}</pre>
+          </div>
+          <div class="code-block compact-block">
+            <div class="code-head">env</div>
+            <pre>{{ selected_output_detail.get("env_view") | tojson(indent=2) }}</pre>
+          </div>
+          <div class="code-block compact-block">
+            <div class="code-head">volumes</div>
+            <pre>{{ selected_output_detail.get("volume_view") | tojson(indent=2) }}</pre>
+          </div>
+        </div>
+      </article></div></details>
+<article class="output-danger-zone">
+        <div class="section-head">
+          <h2>Danger zone</h2>
+        </div>
+        <div class="editor-actions action-card-actions">
+                    <form method="post" action="/ui/backends/{{ selected_backend.id }}/state" data-output-save-form data-output-save-running="{{ 'Disabling output' if selected_backend.enabled else 'Enabling output' }}" data-output-save-fallback="{{ 'Output disabled.' if selected_backend.enabled else 'Output enabled.' }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="action" value="{{ 'disable' if selected_backend.enabled else 'enable' }}">
+            <button type="submit" class="ghost">{{ 'Disable output' if selected_backend.enabled else 'Enable output' }}</button>
+          </form>
+          <form method="post" action="/ui/backends/{{ selected_backend.id }}/delete" data-delete-output-form>
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="button" class="danger" data-delete-output-trigger>Delete output</button>
+          </form>
+        </div>
+      </article>
     <dialog class="confirm-modal" id="shield-code-error-modal">
       <form method="dialog" class="confirm-modal-card">
         <button type="button" class="modal-close-button" data-shield-error-close aria-label="Close Shield error">&times;</button>
@@ -925,24 +731,24 @@
     <dialog class="confirm-modal" id="delete-output-modal">
       <form method="dialog" class="confirm-modal-card">
         <button type="button" class="modal-close-button" data-delete-close aria-label="Close delete dialog">&times;</button>
-        <div class="confirm-modal-copy" data-delete-state="form">
+        <div class="confirm-modal-copy" data-progress-state="form">
           <h2>Delete output?</h2>
           <p>This deletes the saved output.</p>
         </div>
-        <section class="delete-progress-state" data-delete-state="progress" hidden>
-          <div class="clone-progress-head">
-            <strong data-delete-progress-label>Deleting output</strong>
+        <section class="progress-state" data-progress-state="progress" hidden>
+          <div class="progress-head">
+            <strong data-progress-label>Deleting output</strong>
           </div>
-          <div class="clone-progress-track" aria-hidden="true">
-            <span class="clone-progress-fill delete-progress-fill" data-delete-progress-fill></span>
+          <div class="progress-track" data-progress-track aria-hidden="true">
+            <span class="progress-fill" data-progress-fill></span>
           </div>
-          <p class="subtle" data-delete-progress-note>Removing the output.</p>
+          <p class="subtle" data-progress-note>Removing the output.</p>
         </section>
-        <div class="editor-actions" data-delete-actions="form">
+        <div class="editor-actions" data-progress-actions-for="form">
           <button type="button" class="ghost" data-confirm-cancel>Cancel</button>
           <button type="button" class="danger" data-confirm-accept>Delete output</button>
         </div>
-        <div class="editor-actions" data-delete-actions="progress" hidden>
+        <div class="editor-actions" data-progress-actions-for="progress" hidden>
         </div>
       </form>
     </dialog>
@@ -964,7 +770,7 @@
           <h2>Clone output</h2>
           <p>Clone {% if selected_backend.kind == "app" %}the guest and mounted data{% else %}the site files{% endif %} into a new output with its own settings.</p>
         </div>
-        <section class="clone-modal-state" data-clone-state="form">
+        <section class="clone-modal-state" data-progress-state="form">
           <div class="detail-grid clone-detail-grid">
             <label class="field">
               <span class="metric-label">new name</span>
@@ -996,18 +802,18 @@
           </div>
           <p class="subtle">The clone starts disabled with no attached inputs. Its {% if selected_backend.kind == "app" %}guest and mounted data{% else %}site files{% endif %} are independent of the original.</p>
         </section>
-        <section class="clone-modal-state" data-clone-state="progress" hidden>
-          <div class="clone-progress-head">
-            <strong data-clone-progress-label>Preparing clone</strong>
-            <span class="summary-pill pending" data-clone-progress-value>0%</span>
+        <section class="clone-modal-state" data-progress-state="progress" hidden>
+          <div class="progress-head">
+            <strong data-progress-label>Preparing clone</strong>
+            <span class="summary-pill pending" data-progress-value>0%</span>
           </div>
-          <div class="clone-progress-track" aria-hidden="true">
-            <span class="clone-progress-fill" data-clone-progress-fill></span>
+          <div class="progress-track" data-progress-track aria-hidden="true">
+            <span class="progress-fill" data-progress-fill></span>
           </div>
-          <div class="clone-progress-log" data-clone-progress-log></div>
-          <p class="subtle" data-clone-progress-note>Starting clone.</p>
+          <div class="progress-log" data-progress-log></div>
+          <p class="subtle" data-progress-note>Starting clone.</p>
         </section>
-        <section class="clone-modal-state" data-clone-state="success" hidden>
+        <section class="clone-modal-state" data-progress-state="success" hidden>
           <div class="clone-success-copy">
             <strong data-clone-success-title>Clone ready</strong>
             <p class="subtle" data-clone-success-note></p>
@@ -1017,17 +823,17 @@
             <button type="button" class="ghost" data-clone-close>Close</button>
           </div>
         </section>
-        <section class="clone-modal-state" data-clone-state="error" hidden>
+        <section class="clone-modal-state" data-progress-state="error" hidden>
           <div class="clone-error-copy">
             <strong>Clone failed</strong>
             <p class="subtle" data-clone-error-text></p>
           </div>
         </section>
-        <div class="editor-actions" data-clone-actions="form">
+        <div class="editor-actions" data-progress-actions-for="form">
           <button type="button" class="ghost" data-clone-cancel>Cancel</button>
           <button type="submit" data-clone-submit>Start clone</button>
         </div>
-        <div class="editor-actions" data-clone-actions="progress" hidden>
+        <div class="editor-actions" data-progress-actions-for="progress error" hidden>
           <button type="button" class="ghost" data-clone-close>Close</button>
         </div>
       </form>
@@ -1037,13 +843,13 @@
       <form method="post" action="/ui/backends/{{ selected_backend.id }}/transfer" class="confirm-modal-card clone-modal-card" data-transfer-output-form>
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <button type="button" class="modal-close-button" data-transfer-close aria-label="Close transfer dialog">&times;</button>
-        <section class="clone-modal-state" data-transfer-state="confirm">
+        <section class="clone-modal-state" data-progress-state="confirm">
           <div class="confirm-modal-copy clone-modal-copy">
             <h2>Transfer output</h2>
             <p>CNC will snapshot this output, restore it on the selected node, verify health, switch placement, render routes, then stop the source.</p>
           </div>
         </section>
-        <section class="clone-modal-state" data-transfer-state="target" hidden>
+        <section class="clone-modal-state" data-progress-state="target" hidden>
           <div class="confirm-modal-copy clone-modal-copy">
             <h2>Pick target node</h2>
             <p>Select where {{ selected_backend.name }} should run after transfer.</p>
@@ -1102,43 +908,35 @@
             </div>
           </div>
         </section>
-        <section class="clone-modal-state" data-transfer-state="progress" hidden>
-          <div class="clone-progress-head">
-            <strong data-transfer-progress-label>Preparing transfer</strong>
-            <span class="summary-pill pending" data-transfer-progress-value>0%</span>
+        <section class="clone-modal-state" data-progress-state="progress" hidden>
+          <div class="progress-head">
+            <strong data-progress-label>Preparing transfer</strong>
+            <span class="summary-pill pending" data-progress-value>0%</span>
           </div>
-          <div class="clone-progress-track" aria-hidden="true">
-            <span class="clone-progress-fill" data-transfer-progress-fill></span>
+          <div class="progress-track" data-progress-track aria-hidden="true">
+            <span class="progress-fill" data-progress-fill></span>
           </div>
-          <p class="subtle" data-transfer-progress-note>Starting transfer.</p>
+          <p class="subtle" data-progress-note>Starting transfer.</p>
         </section>
-        <div class="editor-actions" data-transfer-actions="confirm">
+        <div class="editor-actions" data-progress-actions-for="confirm">
           <button type="button" class="ghost" data-transfer-cancel>Cancel</button>
           <button type="button" data-transfer-next>Continue</button>
         </div>
-        <div class="editor-actions" data-transfer-actions="target" hidden>
+        <div class="editor-actions" data-progress-actions-for="target" hidden>
           <button type="button" class="ghost" data-transfer-back>Back</button>
           <button type="submit" data-transfer-start>Start transfer</button>
         </div>
-        <div class="editor-actions" data-transfer-actions="progress" hidden></div>
+        <div class="editor-actions" data-progress-actions-for="progress" hidden>
+          <button type="button" class="ghost" data-transfer-close>Close</button>
+        </div>
       </form>
     </dialog>
-    <section class="transfer-mini-card" data-transfer-mini hidden aria-live="polite">
-      <div>
-        <strong data-transfer-mini-label>Transfer output</strong>
-        <span data-transfer-mini-note>Working.</span>
-      </div>
-      <div class="clone-progress-track" aria-hidden="true">
-        <span class="clone-progress-fill" data-transfer-mini-fill></span>
-      </div>
-      <button type="button" class="ghost" data-transfer-reopen>Open</button>
-    </section>
     <dialog class="confirm-modal replica-setup-modal" id="replica-setup-modal">
       <form method="post" action="/ui/backends/{{ selected_backend.id }}/replica-setup" class="confirm-modal-card clone-modal-card" data-replica-setup-form>
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <input type="hidden" name="target_node" value="" data-replica-setup-target>
         <button type="button" class="modal-close-button" data-replica-setup-cancel aria-label="Close setup dialog">&times;</button>
-        <section class="clone-modal-state" data-replica-setup-state="form">
+        <section class="clone-modal-state" data-progress-state="form">
           <div class="confirm-modal-copy clone-modal-copy">
             <h2>Set up node</h2>
             <p><span data-replica-setup-node-name>Selected node</span> needs a runtime for {{ selected_backend.name }}.</p>
@@ -1160,37 +958,37 @@
             </label>
           </div>
         </section>
-        <section class="clone-modal-state" data-replica-setup-state="progress" hidden>
-          <div class="clone-progress-head">
-            <strong data-replica-setup-progress-label>Setting up node</strong>
-            <span class="summary-pill pending" data-replica-setup-progress-value>0%</span>
+        <section class="clone-modal-state" data-progress-state="progress" hidden>
+          <div class="progress-head">
+            <strong data-progress-label>Setting up node</strong>
+            <span class="summary-pill pending" data-progress-value>0%</span>
           </div>
-          <div class="clone-progress-track" aria-hidden="true">
-            <span class="clone-progress-fill" data-replica-setup-progress-fill></span>
+          <div class="progress-track" data-progress-track aria-hidden="true">
+            <span class="progress-fill" data-progress-fill></span>
           </div>
-          <p class="subtle" data-replica-setup-progress-note>Starting setup.</p>
+          <p class="subtle" data-progress-note>Starting setup.</p>
         </section>
-        <section class="clone-modal-state" data-replica-setup-state="success" hidden>
+        <section class="clone-modal-state" data-progress-state="success" hidden>
           <div class="clone-success-copy">
             <strong>Node ready</strong>
             <p class="subtle" data-replica-setup-success-note></p>
           </div>
         </section>
-        <section class="clone-modal-state" data-replica-setup-state="error" hidden>
+        <section class="clone-modal-state" data-progress-state="error" hidden>
           <div class="clone-error-copy">
             <strong>Setup failed</strong>
             <p class="subtle" data-replica-setup-error-text></p>
           </div>
         </section>
-        <div class="editor-actions" data-replica-setup-actions="form">
+        <div class="editor-actions" data-progress-actions-for="form">
           <button type="button" class="ghost" data-replica-setup-cancel>Cancel</button>
           <button type="submit" data-replica-setup-submit>Create</button>
         </div>
-        <div class="editor-actions" data-replica-setup-actions="progress" hidden></div>
-        <div class="editor-actions" data-replica-setup-actions="success" hidden>
+        <div class="editor-actions" data-progress-actions-for="progress" hidden></div>
+        <div class="editor-actions" data-progress-actions-for="success" hidden>
           <button type="button" data-replica-setup-done>Continue</button>
         </div>
-        <div class="editor-actions" data-replica-setup-actions="error" hidden>
+        <div class="editor-actions" data-progress-actions-for="error" hidden>
           <button type="button" class="ghost" data-replica-setup-cancel>Cancel</button>
           <button type="button" data-replica-setup-retry>Try again</button>
         </div>
@@ -1211,6 +1009,8 @@
   } | tojson }}</script>
   <script src="/static/js/cnc-ui.js?v={{ asset_version }}"></script>
   <script src="/static/js/operation-events.js?v={{ asset_version }}"></script>
+  <script src="/static/js/progress-ui.js?v={{ asset_version }}"></script>
+  <script src="/static/js/output-settings.js?v={{ asset_version }}"></script>
   <script src="/static/js/output-detail.js?v={{ asset_version }}"></script>
   <script src="/static/js/hardening-configuration.js?v={{ asset_version }}"></script>
   <script src="/static/js/output-ssh.js?v={{ asset_version }}"></script>

@@ -20,6 +20,40 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
         needs_settings=True,
     )
 
+    domains = cloudflare_subparsers.add_parser("domains")
+    domain_subcommands = domains.add_subparsers(dest="domain_command", required=True)
+    domain_sync = domain_subcommands.add_parser("sync")
+    domain_sync.add_argument("--json", action="store_true", dest="json_output")
+    bind_command(
+        domain_sync,
+        handler=_run_domain_sync,
+        formatter=lambda payload: str(payload),
+        needs_settings=True,
+    )
+
+
+async def _run_domain_sync(
+    args: argparse.Namespace, settings: Settings | None
+) -> CommandResult:
+    from app.database import SessionLocal
+    from app.services.cloudflare_domains import sync_cloudflare_domains
+    from app.services.operations import HostMutationLockError
+
+    assert settings is not None
+    try:
+        async with SessionLocal() as session:
+            payload = await sync_cloudflare_domains(settings, session)
+    except HostMutationLockError:
+        return (
+            0,
+            {
+                "status": "deferred",
+                "message": "Another host change is running; the timer will retry.",
+            },
+            None,
+        )
+    return (0 if payload["ok"] else 2), payload, None
+
 
 def format_cloudflare_sync_text(payload: dict[str, object]) -> str:
     firewall = (

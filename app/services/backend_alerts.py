@@ -39,12 +39,14 @@ BACKEND_ALERTS_RUN_LEASE_SEC = 900
 AUTO_FIX_SAFE_DIAGNOSES = {
     "sandbox_missing",
     "sandbox_publish_broken",
+    "sandbox_stopped",
 }
 AUTO_FIX_SAFE_ISSUES = {
     "bootstrap_failed",
     "bootstrap_stuck",
     "bridge_dns_enabled",
     "container_missing",
+    "container_not_running",
     "legacy_direct_podman_runtime_owner",
     "legacy_loopback_proxy_present",
     "loopback_publish_missing",
@@ -423,9 +425,6 @@ async def _maybe_auto_fix_backend(
             record_event=False,
         )
     except Exception as exc:
-        payload["outcome"] = "failed"
-        payload["reason"] = "auto_fix_exception"
-        payload["failure"] = {"error": str(exc), "phase": "auto_fix"}
         logger.warning(
             "backend_alerts.auto_fix.failed",
             backend_id=backend.id,
@@ -435,28 +434,15 @@ async def _maybe_auto_fix_backend(
             issues=payload["considered_issues"],
             error=str(exc),
         )
-        await send_pushover_notification_async(
-            settings,
-            title=f"CNC backend auto-fix failed: {backend.name}",
-            message=build_operator_message(
-                "Backend auto-fix raised an exception.",
-                status="failure",
-                facts=[
-                    ("backend", backend.name),
-                    ("diagnosis", payload["diagnosis"]),
-                    ("issues", payload["considered_issues"]),
-                    ("error", str(exc)),
-                ],
-                action=f"cnc-admin app doctor {backend.name}",
-            ),
-            priority=0,
-            event="backend_auto_fix_failed",
-            source=logger_name,
-            backend=backend.name,
-            url=admin_dashboard_url(settings, path=f"/outputs/{backend.id}"),
-            url_title=f"Open {backend.name}",
-        )
-        return payload, diagnostics
+        fix_payload = {
+            "ok": False,
+            "changed": False,
+            "failure": {"error": str(exc), "phase": "auto_fix"},
+            "repair_plan": [],
+            "repair_actions": [],
+            "pre_recovery_evidence": diagnostics,
+            "after": diagnostics,
+        }
 
     payload["changed"] = bool(fix_payload.get("changed"))
     payload["failure"] = (
@@ -544,29 +530,6 @@ async def _maybe_auto_fix_backend(
             "pre_recovery_evidence": payload["pre_recovery_evidence"],
         },
     )
-    if payload["outcome"] == "failed":
-        failure = payload["failure"] if isinstance(payload["failure"], dict) else {}
-        await send_pushover_notification_async(
-            settings,
-            title=f"CNC backend auto-fix failed: {backend.name}",
-            message=build_operator_message(
-                "Backend auto-fix completed but did not recover the output.",
-                status="failure",
-                facts=[
-                    ("backend", backend.name),
-                    ("diagnosis", payload["diagnosis"]),
-                    ("issues", payload["considered_issues"]),
-                    ("error", failure.get("error") or payload["reason"]),
-                ],
-                action=f"cnc-admin app doctor {backend.name}",
-            ),
-            priority=0,
-            event="backend_auto_fix_failed",
-            source=logger_name,
-            backend=backend.name,
-            url=admin_dashboard_url(settings, path=f"/outputs/{backend.id}"),
-            url_title=f"Open {backend.name}",
-        )
     return payload, after
 
 
@@ -610,12 +573,28 @@ def _problem_summary(diagnostics: dict[str, Any]) -> str:
     return ""
 
 
+def _condition_title(diagnostics: dict[str, Any]) -> str:
+    diagnosis = str(diagnostics.get("diagnosis") or "").strip()
+    labels = {
+        "sandbox_stopped": "sandbox stopped",
+        "sandbox_missing": "sandbox missing",
+        "sandbox_publish_broken": "publication unavailable",
+        "backend_exec_unavailable": "health inspection unavailable",
+        "app_service_down": "app service unavailable",
+        "guest_init_broken": "guest initialization failed",
+        "diagnostics_failed": "diagnostics failed",
+    }
+    return labels.get(diagnosis) or _problem_summary(diagnostics) or "unavailable"
+
+
 def _diagnostics_failure_payload(backend: Backend, exc: Exception) -> dict[str, Any]:
     return {
         "ok": False,
         "issues": ["diagnostics_failed"],
         "maintenance_issues": [],
         "diagnosis": "diagnostics_failed",
+        "observation_deferred": True,
+        "observation_issues": ["diagnostics_failed"],
         "bootstrap": {"status": "unknown"},
         "private_ip": "",
         "loopback_port": backend.port,
@@ -629,6 +608,7 @@ def _down_message(
     backend: Backend,
     hostnames: list[str],
     diagnostics: dict[str, Any],
+    auto_fix: dict[str, Any],
     down_for_seconds: int,
     reminder: bool,
 ) -> str:
@@ -640,14 +620,32 @@ def _down_message(
         bootstrap_status = str(bootstrap.get("status") or "").strip()
     private_ip = str(diagnostics.get("private_ip") or "").strip()
     loopback_port = diagnostics.get("loopback_port")
+    attempted_repair = bool(auto_fix.get("attempted"))
+    failure = auto_fix.get("failure")
+    failure = failure if isinstance(failure, dict) else {}
     return build_operator_message(
-        "Backend is still down." if reminder else "Backend is down.",
+        (
+            "CNC attempted its scoped repair, but verification still found the output unavailable."
+            if attempted_repair
+            else ("Output is still unavailable." if reminder else "Output is unavailable.")
+        ),
         status="failure",
         facts=[
-            ("backend", backend.name),
+            ("output", backend.name),
             ("routes", summarize_list(hostnames, limit=3) if hostnames else ""),
-            ("problem", _problem_summary(diagnostics)),
+            ("condition", _condition_title(diagnostics)),
             ("issues", summarize_list(issue_list, limit=4) if issue_list else ""),
+            (
+                "repair",
+                summarize_list(auto_fix.get("repair_actions") or [], limit=2)
+                if attempted_repair
+                else "",
+            ),
+            (
+                "repair_result",
+                "verification failed" if attempted_repair else "",
+            ),
+            ("repair_error", failure.get("error") if attempted_repair else ""),
             (
                 "bootstrap",
                 bootstrap_status
@@ -657,6 +655,31 @@ def _down_message(
             ("private_ip", private_ip),
             ("loopback_port", loopback_port if loopback_port is not None else ""),
             ("down_for", _format_duration(down_for_seconds)),
+        ],
+        action=f"cnc-admin app doctor {backend.name}",
+    )
+
+
+def _observation_unknown_message(
+    *,
+    backend: Backend,
+    hostnames: list[str],
+    diagnostics: dict[str, Any],
+) -> str:
+    observation_issues = diagnostics.get("observation_issues")
+    issues = (
+        [str(item) for item in observation_issues]
+        if isinstance(observation_issues, list)
+        else []
+    )
+    return build_operator_message(
+        "CNC could not establish the output's current state, so no repair was attempted.",
+        status="warning",
+        facts=[
+            ("output", backend.name),
+            ("routes", summarize_list(hostnames, limit=3) if hostnames else ""),
+            ("observation", summarize_list(issues, limit=4) if issues else "unknown"),
+            ("error", diagnostics.get("error") or ""),
         ],
         action=f"cnc-admin app doctor {backend.name}",
     )
@@ -840,6 +863,51 @@ async def run_backend_alerts_check(settings: Settings) -> dict[str, Any]:
                         "observation_issues": observation_issues,
                     }
                 )
+                observation_signature = ",".join(
+                    sorted(str(item) for item in observation_issues)
+                ) or str(diagnostics.get("diagnosis") or "observation_unknown")
+                last_observation_attempt_at = _parse_iso(
+                    previous.get("last_observation_notification_attempt_at")
+                )
+                observation_retry_due = (
+                    last_observation_attempt_at is None
+                    or settings.backend_alert_down_retry_sec <= 0
+                    or (now - last_observation_attempt_at).total_seconds()
+                    >= settings.backend_alert_down_retry_sec
+                )
+                observation_notified = (
+                    str(previous.get("last_observation_notification_signature") or "")
+                    == observation_signature
+                )
+                observation_notification_due = (
+                    notifications_configured
+                    and not observation_notified
+                    and observation_retry_due
+                )
+                if observation_notification_due:
+                    pending_notifications.append(
+                        {
+                            "backend": backend.name,
+                            "hostnames": hostnames,
+                            "kind": "observation_unknown",
+                            "observation_signature": observation_signature,
+                            "title": f"CNC cannot inspect output {backend.name}",
+                            "message": _observation_unknown_message(
+                                backend=backend,
+                                hostnames=hostnames,
+                                diagnostics=diagnostics,
+                            ),
+                            "priority": 0,
+                            "event": "backend_observation_unknown",
+                            "url": admin_dashboard_url(
+                                settings, path=f"/outputs/{backend.id}"
+                            ),
+                            "url_title": f"Open {backend.name}",
+                        }
+                    )
+                    preserved_state["last_observation_notification_attempt_at"] = (
+                        now_iso
+                    )
                 next_state["backends"][backend.name] = preserved_state
                 backend_payloads.append(
                     {
@@ -857,9 +925,17 @@ async def run_backend_alerts_check(settings: Settings) -> dict[str, Any]:
                         "down_for_seconds": 0,
                         "alert_grace_remaining_sec": 0,
                         "notified": False,
-                        "notification_attempted": False,
-                        "notification_kind": "",
-                        "notification_reason": "observation_deferred",
+                        "notification_attempted": observation_notification_due,
+                        "notification_kind": (
+                            "observation_unknown"
+                            if observation_notification_due
+                            else ""
+                        ),
+                        "notification_reason": (
+                            "observation_notification_due"
+                            if observation_notification_due
+                            else "observation_deferred"
+                        ),
                         "notification_configured": notifications_configured,
                         "previous_status": previous_status or "unknown",
                         "auto_fix": auto_fix,
@@ -955,7 +1031,7 @@ async def run_backend_alerts_check(settings: Settings) -> dict[str, Any]:
                             "backend": backend.name,
                             "hostnames": hostnames,
                             "kind": notification_kind,
-                            "title": f"CNC backend recovered: {backend.name}",
+                            "title": f"CNC output {backend.name} recovered",
                             "message": _recovery_message(
                                 backend=backend,
                                 hostnames=hostnames,
@@ -1096,14 +1172,20 @@ async def run_backend_alerts_check(settings: Settings) -> dict[str, Any]:
                             "hostnames": hostnames,
                             "kind": notification_kind,
                             "title": (
-                                f"CNC backend still down: {backend.name}"
-                                if notification_kind == "reminder"
-                                else f"CNC backend down: {backend.name}"
+                                f"CNC output {backend.name} still unavailable — repair failed"
+                                if auto_fix.get("attempted")
+                                and auto_fix.get("outcome") == "failed"
+                                else (
+                                    f"CNC output {backend.name} still unavailable — {_condition_title(diagnostics)}"
+                                    if notification_kind == "reminder"
+                                    else f"CNC output {backend.name} unavailable — {_condition_title(diagnostics)}"
+                                )
                             ),
                             "message": _down_message(
                                 backend=backend,
                                 hostnames=hostnames,
                                 diagnostics=diagnostics,
+                                auto_fix=auto_fix,
                                 down_for_seconds=down_for_seconds,
                                 reminder=notification_kind == "reminder",
                             ),
@@ -1265,6 +1347,10 @@ async def run_backend_alerts_check(settings: Settings) -> dict[str, Any]:
                 "kind": kind,
                 "sent": sent,
             }
+            if kind == "observation_unknown":
+                notification_result["observation_signature"] = str(
+                    notification.get("observation_signature") or ""
+                )
             notifications.append(notification_result)
             for backend_payload in backend_payloads:
                 if backend_payload["backend"] == backend_name:
@@ -1290,6 +1376,10 @@ async def run_backend_alerts_check(settings: Settings) -> dict[str, Any]:
                     entry["last_notification_kind"] = kind
                     if kind == "down":
                         entry["notified_down_at"] = now_iso
+                    if kind == "observation_unknown":
+                        entry["last_observation_notification_signature"] = str(
+                            notification.get("observation_signature") or ""
+                        )
                     persisted_backends[backend_name] = entry
                 state_transaction.replace(persisted_state)
             _log_backend_alerts_state_written(settings.host_state_path, persisted_state)
@@ -1339,18 +1429,20 @@ async def send_backend_alert_test_notifications(
     scenarios = [
         (
             "down",
-            f"CNC backend down: {backend_name}",
+            f"CNC output {backend_name} unavailable — sandbox missing",
             _down_message(
                 backend=Backend(
                     name=backend_name, kind="app", handoff_port=8337, port=12001
                 ),
                 hostnames=hostnames,
                 diagnostics={
+                    "diagnosis": "sandbox_missing",
                     "issues": ["private_ip_missing", "loopback_unreachable"],
                     "bootstrap": {"status": "failed"},
                     "private_ip": "",
                     "loopback_port": 12001,
                 },
+                auto_fix={"attempted": False},
                 down_for_seconds=480,
                 reminder=False,
             ),
@@ -1358,18 +1450,20 @@ async def send_backend_alert_test_notifications(
         ),
         (
             "reminder",
-            f"CNC backend still down: {backend_name}",
+            f"CNC output {backend_name} still unavailable — sandbox missing",
             _down_message(
                 backend=Backend(
                     name=backend_name, kind="app", handoff_port=8337, port=12001
                 ),
                 hostnames=hostnames,
                 diagnostics={
+                    "diagnosis": "sandbox_missing",
                     "issues": ["private_ip_missing", "loopback_unreachable"],
                     "bootstrap": {"status": "failed"},
                     "private_ip": "",
                     "loopback_port": 12001,
                 },
+                auto_fix={"attempted": False},
                 down_for_seconds=7200,
                 reminder=True,
             ),
@@ -1377,7 +1471,7 @@ async def send_backend_alert_test_notifications(
         ),
         (
             "recovered",
-            f"CNC backend recovered: {backend_name}",
+            f"CNC output {backend_name} recovered",
             _recovery_message(
                 backend=Backend(
                     name=backend_name, kind="app", handoff_port=8337, port=12001

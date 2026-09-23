@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import json
@@ -8,6 +8,7 @@ from math import floor
 import re
 
 from sqlalchemy import or_, select
+from sqlalchemy.engine import RowMapping
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.entities import (
@@ -17,6 +18,7 @@ from app.models.entities import (
     HostResourceSample,
 )
 from app.services.control_events import event_applies_to_backend
+from app.services.thread_workers import BoundedThreadWorker
 
 
 @dataclass(frozen=True)
@@ -163,7 +165,25 @@ def _timeframe_spec(timeframe_key: str | None) -> TimeframeSpec:
     return TIMEFRAME_SPECS.get(normalized, TIMEFRAME_SPECS[DEFAULT_TIMEFRAME_KEY])
 
 
+def metric_history_query_key(
+    metric_key: str | None,
+    timeframe_key: str | None,
+    chart_width_px: int | None,
+    *,
+    host: bool = False,
+) -> tuple[str, str, int]:
+    metric = _host_metric_spec(metric_key) if host else _metric_spec(metric_key)
+    timeframe = _timeframe_spec(timeframe_key)
+    return metric.key, timeframe.key, _target_point_count(timeframe, chart_width_px)
+
+
 def _field(row: object, key: str) -> object:
+    if isinstance(row, RowMapping):
+        # RowMapping.get performs ABC checks for every field on every sample.
+        try:
+            return row[key]
+        except KeyError:
+            return None
     if isinstance(row, Mapping):
         return row.get(key)
     mapping = getattr(row, "_mapping", None)
@@ -929,6 +949,32 @@ def _memory_limit_changes_in_range(
     return len(set(values)) > 1
 
 
+@dataclass(frozen=True)
+class MetricHistoryData:
+    """Detached inputs: no session or ORM instance crosses into the worker."""
+
+    metric: MetricSpec
+    timeframe: TimeframeSpec
+    target_points: int
+    now_utc: datetime
+    samples: Sequence[Mapping[str, object]]
+    chart_events: list[dict[str, object]]
+    live_metrics: dict[str, object] | None
+    previous_network_sample: Mapping[str, object] | None = None
+    available: bool = True
+
+
+_history_workers = BoundedThreadWorker(2)
+
+
+async def render_metric_history(
+    data: MetricHistoryData, *, host: bool = False
+) -> dict[str, object]:
+    """Keep chart math off the event loop and retain ownership on cancellation."""
+    renderer = _render_host_metric_history if host else _render_backend_metric_history
+    return await _history_workers.run(renderer, data)
+
+
 async def build_backend_metric_history(
     session: AsyncSession,
     backend: Backend,
@@ -939,25 +985,64 @@ async def build_backend_metric_history(
     live_metrics: dict[str, object] | None = None,
     now: datetime | None = None,
 ) -> dict[str, object]:
+    data = await load_backend_metric_history(
+        session,
+        backend,
+        metric_key=metric_key,
+        timeframe_key=timeframe_key,
+        chart_width_px=chart_width_px,
+        live_metrics=live_metrics,
+        now=now,
+    )
+    return await render_metric_history(data)
+
+
+async def build_host_metric_history(
+    session: AsyncSession,
+    *,
+    metric_key: str | None,
+    timeframe_key: str | None,
+    chart_width_px: int | None = None,
+    live_metrics: dict[str, object] | None = None,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    data = await load_host_metric_history(
+        session,
+        metric_key=metric_key,
+        timeframe_key=timeframe_key,
+        chart_width_px=chart_width_px,
+        live_metrics=live_metrics,
+        now=now,
+    )
+    return await render_metric_history(data, host=True)
+
+
+async def load_backend_metric_history(
+    session: AsyncSession,
+    backend: Backend,
+    *,
+    metric_key: str | None,
+    timeframe_key: str | None,
+    chart_width_px: int | None = None,
+    live_metrics: dict[str, object] | None = None,
+    now: datetime | None = None,
+) -> MetricHistoryData:
     metric = _metric_spec(metric_key)
     timeframe = _timeframe_spec(timeframe_key)
     target_points = _target_point_count(timeframe, chart_width_px)
     now_utc = now.astimezone(UTC) if now is not None else datetime.now(UTC)
 
     if str(backend.kind or "").lower() not in {"app", "shield"}:
-        return {
-            "available": False,
-            "metric": metric.__dict__,
-            "timeframe": timeframe.__dict__,
-            "range_start_at": (now_utc - timedelta(hours=timeframe.hours)).isoformat(),
-            "range_end_at": now_utc.isoformat(),
-            "series": [],
-            "chart_events": [],
-            "summary": {},
-            "note": "Resource history is available for app and shield outputs only.",
-            "sample_cadence": "1min",
-            "target_points": target_points,
-        }
+        return MetricHistoryData(
+            metric,
+            timeframe,
+            target_points,
+            now_utc,
+            [],
+            [],
+            live_metrics,
+            available=False,
+        )
 
     cutoff = now_utc - timedelta(hours=timeframe.hours)
     chart_events = await _chart_events_for_range(
@@ -981,15 +1066,6 @@ async def build_backend_metric_history(
         .mappings()
         .all()
     )
-    if metric.key == "memory" and _memory_limit_changes_in_range(
-        list(samples), live_metrics
-    ):
-        metric = MetricSpec(
-            key="memory",
-            label="Memory",
-            unit_kind="bytes",
-            description="Memory used by this output.",
-        )
     previous_network_sample = None
     if metric.key == "network":
         previous_network_sample = (
@@ -1013,6 +1089,49 @@ async def build_backend_metric_history(
             .one_or_none()
         )
 
+    return MetricHistoryData(
+        metric,
+        timeframe,
+        target_points,
+        now_utc,
+        samples,
+        chart_events,
+        dict(live_metrics) if live_metrics is not None else None,
+        previous_network_sample,
+    )
+
+
+def _render_backend_metric_history(data: MetricHistoryData) -> dict[str, object]:
+    metric, timeframe = data.metric, data.timeframe
+    target_points, now_utc = data.target_points, data.now_utc
+    samples, chart_events = data.samples, data.chart_events
+    live_metrics = data.live_metrics
+    cutoff = now_utc - timedelta(hours=timeframe.hours)
+    previous_network_sample = data.previous_network_sample
+    if not data.available:
+        return {
+            "available": False,
+            "metric": metric.__dict__,
+            "timeframe": timeframe.__dict__,
+            "range_start_at": (now_utc - timedelta(hours=timeframe.hours)).isoformat(),
+            "range_end_at": now_utc.isoformat(),
+            "series": [],
+            "chart_events": [],
+            "summary": {},
+            "note": "Resource history is available for app and shield outputs only.",
+            "sample_cadence": "1min",
+            "target_points": target_points,
+        }
+
+    if metric.key == "memory" and _memory_limit_changes_in_range(
+        list(samples), live_metrics
+    ):
+        metric = MetricSpec(
+            key="memory",
+            label="Memory",
+            unit_kind="bytes",
+            description="Memory used by this output.",
+        )
     raw_points: list[dict[str, object]] = []
     for sample in samples:
         memory_percent_rollup = (
@@ -1252,7 +1371,7 @@ async def build_backend_metric_history(
     }
 
 
-async def build_host_metric_history(
+async def load_host_metric_history(
     session: AsyncSession,
     *,
     metric_key: str | None,
@@ -1260,7 +1379,7 @@ async def build_host_metric_history(
     chart_width_px: int | None = None,
     live_metrics: dict[str, object] | None = None,
     now: datetime | None = None,
-) -> dict[str, object]:
+) -> MetricHistoryData:
     metric = _host_metric_spec(metric_key)
     timeframe = _timeframe_spec(timeframe_key)
     target_points = _target_point_count(timeframe, chart_width_px)
@@ -1286,6 +1405,23 @@ async def build_host_metric_history(
         .all()
     )
 
+    return MetricHistoryData(
+        metric,
+        timeframe,
+        target_points,
+        now_utc,
+        samples,
+        chart_events,
+        dict(live_metrics) if live_metrics is not None else None,
+    )
+
+
+def _render_host_metric_history(data: MetricHistoryData) -> dict[str, object]:
+    metric, timeframe = data.metric, data.timeframe
+    target_points, now_utc = data.target_points, data.now_utc
+    samples, chart_events = data.samples, data.chart_events
+    live_metrics = data.live_metrics
+    cutoff = now_utc - timedelta(hours=timeframe.hours)
     raw_points: list[dict[str, object]] = []
     for sample in samples:
         rollup = _host_sample_rollup(sample, metric)

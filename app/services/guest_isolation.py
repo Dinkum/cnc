@@ -12,17 +12,20 @@ from dataclasses import dataclass
 import fcntl
 import grp
 import io
+import json
 from itertools import combinations
 import os
 from pathlib import Path
 import pwd
 import re
+import shutil
 import subprocess
+import sys
 import tempfile
 import tarfile
 import zipfile
 
-GUEST_RUNTIME_REVISION = 1
+GUEST_RUNTIME_REVISION = 2
 GUEST_ID_COUNT = 65536
 GUEST_APPARMOR_PROFILE = "cnc-systemd-guest-v1"
 GUEST_IDMAP = "idmap=uids=@0-0-65536;gids=@0-0-65536"
@@ -50,6 +53,8 @@ _POOL_END = 1 << 31
 def guest_podman_args() -> list[str]:
     return [
         f"--userns=auto:size={GUEST_ID_COUNT}",
+        f"--annotation={GUEST_ROOTFS_ANNOTATION}=true",
+        f"--hooks-dir={GUEST_ROOTFS_HOOK.parent}",
         "--cap-add=SYS_ADMIN",
         "--cap-add=MKNOD",
         # Audit writes address the host audit subsystem, not a guest resource.
@@ -413,6 +418,126 @@ def preflight_guest_storage(
     return repaired
 
 
+GUEST_ROOTFS_ANNOTATION = "io.cnc.private-rootfs"
+GUEST_ROOTFS_HOOK = Path("/etc/containers/oci/hooks.d/90-cnc-rootfs.json")
+
+
+def install_guest_rootfs_hook(helper: Path) -> None:
+    content = (
+        json.dumps(
+            {
+                "version": "1.0.0",
+                "hook": {
+                    "path": str(helper),
+                    "args": [str(helper), "--rootfs-access-hook"],
+                    "timeout": 15,
+                },
+                "when": {"annotations": {GUEST_ROOTFS_ANNOTATION: "^true$"}},
+                "stages": ["precreate"],
+            },
+            indent=2,
+        )
+        + "\n"
+    ).encode()
+    if GUEST_ROOTFS_HOOK.is_symlink():
+        raise ValueError("Guest rootfs hook cannot be a symlink.")
+    if not GUEST_ROOTFS_HOOK.exists() or GUEST_ROOTFS_HOOK.read_bytes() != content:
+        _atomic_write(GUEST_ROOTFS_HOOK, content, 0o644)
+
+
+def prepare_rootfs_access(spec: dict) -> None:
+    if spec.get("annotations", {}).get(GUEST_ROOTFS_ANNOTATION) != "true":
+        raise ValueError("Rootfs access hook requires a CNC guest annotation.")
+    rootfs = Path(spec.get("root", {}).get("path", ""))
+    sandbox = rootfs.parent
+    profile = sandbox / "profile.json"
+    if (
+        not rootfs.is_absolute()
+        or rootfs.name != "rootfs"
+        or rootfs.is_symlink()
+        or not rootfs.is_dir()
+        or profile.is_symlink()
+        or not profile.is_file()
+        or profile.stat().st_uid != os.geteuid()
+        or profile.stat().st_mode & 0o022
+    ):
+        raise ValueError("Rootfs access hook requires a managed guest filesystem.")
+    for parent in (sandbox, *sandbox.parents):
+        observed = parent.stat()
+        if (
+            parent.is_symlink()
+            or observed.st_uid not in {0, os.geteuid()}
+            or (observed.st_mode & 0o022 and not observed.st_mode & 0o1000)
+        ):
+            raise ValueError("Guest rootfs must have trusted host ancestors.")
+    mappings = spec.get("linux", {}).get("uidMappings", [])
+    roots = [m for m in mappings if m.get("containerID") == 0]
+    if (
+        len(roots) != 1
+        or not isinstance(roots[0].get("hostID"), int)
+        or roots[0]["hostID"] < GUEST_ID_COUNT
+    ):
+        raise ValueError("Rootfs access hook requires an isolated guest UID map.")
+    protect_sandbox_directory(sandbox)
+    # Grant traversal only to this guest's allocated UID. The directory remains
+    # root-owned, with no group/other access, and stale named entries are replaced.
+    subprocess.run(
+        [
+            "setfacl",
+            "--set",
+            f"u::rwx,u:{roots[0]['hostID']}:--x,g::---,m::--x,o::---",
+            str(sandbox),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+
+def require_supported_podman() -> None:
+    try:
+        result = subprocess.run(
+            ["podman", "version", "--format", "{{.Client.Version}}"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except FileNotFoundError as error:
+        # A host with no podman at all is a different problem from a host whose
+        # podman is broken, and the two must not read the same.
+        raise ValueError(
+            "podman is not installed on this host. The installer installs CNC's "
+            "pinned runtime; a host without it has not had that step applied."
+        ) from error
+    except subprocess.TimeoutExpired as error:
+        raise ValueError(
+            "podman did not report its version within 15s. A runtime that hangs "
+            "on `podman version` cannot run app guests."
+        ) from error
+    except subprocess.CalledProcessError as error:
+        # The interesting text is the runtime's own message, not a traceback:
+        # a broken runtime (an unusable lock store, a missing helper) fails here
+        # first, and this is the line an operator has to act on.
+        detail = (error.stderr or error.stdout or "").strip().splitlines()
+        reason = " / ".join(line.strip() for line in detail[-3:]) or "no output"
+        raise ValueError(
+            f"podman could not report its version (exit {error.returncode}): {reason}"
+        ) from error
+    version = result.stdout.strip()
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:[+~-].*)?", version)
+    # Earlier Podman widens every rootfs ancestor to be world-traversable when
+    # starting a user-namespaced guest, defeating the private host boundary.
+    if match is None or tuple(map(int, match.groups())) < (5, 2, 0):
+        raise ValueError(
+            "CNC app guests require Podman 5.2.0 or newer to preserve private "
+            f"rootfs permissions (found {version or 'unknown'}). "
+            "The installer installs the pinned runtime; a host below the floor "
+            "has not had it applied yet."
+        )
+
+
 def prepare_guest_host(
     rootfs: Path | None = None, volumes: list[str] | None = None
 ) -> None:
@@ -427,6 +552,10 @@ def prepare_guest_host(
         raise ValueError(
             "Ubuntu guest isolation requires AppArmor enabled on the host."
         )
+    require_supported_podman()
+    if shutil.which("setfacl") is None:
+        raise ValueError("CNC guest startup requires the Ubuntu acl package (setfacl).")
+    install_guest_rootfs_hook(Path(sys.argv[0]).resolve())
     validate_guest_volume_paths(volumes or [])
     ensure_subid_pool()
     profile_path = Path("/etc/apparmor.d") / GUEST_APPARMOR_PROFILE
@@ -519,8 +648,23 @@ def main() -> None:
     parser.add_argument("--extract-rootfs", type=Path)
     parser.add_argument("--destination", type=Path)
     parser.add_argument("--name")
+    parser.add_argument("--check-runtime-only", action="store_true")
+    parser.add_argument("--rootfs-access-hook", action="store_true")
     args = parser.parse_args()
-    if args.archive is not None:
+    if args.rootfs_access_hook:
+        spec = json.load(sys.stdin)
+        prepare_rootfs_access(spec)
+        json.dump(spec, sys.stdout)
+    elif args.check_runtime_only:
+        try:
+            require_supported_podman()
+        except ValueError as error:
+            # The installer calls this to decide whether a host can run guests.
+            # Its output is read by an operator, so it gets one line naming the
+            # reason instead of a traceback through this module.
+            print(f"[runtime] {error}", file=sys.stderr)
+            raise SystemExit(1) from error
+    elif args.archive is not None:
         if args.destination is None or args.name is None:
             parser.error("--archive requires --destination and --name")
         archive_guest(args.archive, args.destination, "cnc-app-" + args.name)

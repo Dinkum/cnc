@@ -5,25 +5,15 @@ import hashlib
 import json
 from typing import Any
 
-from app.config import Settings
 from app.models.entities import Backend
-from app.services.app_containers import runtime_spec
-from app.services.app_quadlet import (
-    quadlet_container_policy_content,
-    render_quadlet_container,
-)
 from app.services.inter_app_interfaces import RuntimeInterAppInterface
 from app.services.error_reporting import CNCError, ErrorCode
-from app.services.netdata_constants import NETDATA_SERVICE_NAME, NETDATA_SYSTEMD_SERVICE
-from app.services.renderers import network_name
 from app.services.resource_profile import (
     ResourceProfile,
-    calculate_app_memory_budget_bytes,
 )
 
 
-APPLY_SLICE_SCHEMA_VERSION = 3
-CLUSTER_FOLLOWERS_RECONCILER_VERSION = 2
+CLUSTER_FOLLOWERS_RECONCILER_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -153,260 +143,26 @@ class DesiredState:
     static_replicas: dict[str, dict[str, str]] = field(default_factory=dict)
 
 
-@dataclass(frozen=True)
-class ApplySlice:
-    name: str
-    payload: dict[str, Any]
-    hash: str
 
 
 def canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
 
 
-def hash_apply_slice_payload(name: str, payload: dict[str, Any]) -> str:
-    framed = {
-        "schema": APPLY_SLICE_SCHEMA_VERSION,
-        "slice": name,
-        "payload": payload,
-    }
-    return hashlib.sha256(canonical_json(framed).encode("utf-8")).hexdigest()
 
 
-def _slice(name: str, payload: dict[str, Any]) -> ApplySlice:
-    return ApplySlice(
-        name=name, payload=payload, hash=hash_apply_slice_payload(name, payload)
-    )
 
 
-def runtime_backend_slice_name(backend: Backend) -> str:
-    backend_id = getattr(backend, "id", None)
-    suffix = str(backend_id) if backend_id is not None else str(backend.name)
-    return f"runtime.backend.{suffix}"
 
 
-def nginx_managed_slice_payload(nginx_files: dict[str, str]) -> dict[str, Any]:
-    return {
-        "files": [
-            {"name": filename, "content": nginx_files[filename]}
-            for filename in sorted(nginx_files)
-        ]
-    }
 
 
-def tailscale_slice_payload(
-    paths: dict[str, str], services: dict[str, str]
-) -> dict[str, Any]:
-    return {
-        "paths": [{"path": path, "target": paths[path]} for path in sorted(paths)],
-        "services": [
-            {"service": service, "target": services[service]}
-            for service in sorted(services)
-        ],
-    }
 
 
-def cluster_followers_slice_payload(desired: DesiredState) -> dict[str, Any]:
-    return {
-        "reconciler_version": CLUSTER_FOLLOWERS_RECONCILER_VERSION,
-        "nodes": list(desired.cluster_nodes),
-        "app_nginx_files": {
-            node_uid: [
-                {"name": filename, "content": files[filename]}
-                for filename in sorted(files)
-            ]
-            for node_uid, files in sorted(desired.cluster_node_app_nginx_files.items())
-        },
-        "admin_nginx_files": {
-            node_uid: [
-                {"name": filename, "content": files[filename]}
-                for filename in sorted(files)
-            ]
-            for node_uid, files in sorted(
-                desired.cluster_node_admin_nginx_files.items()
-            )
-        },
-        "static_replicas": [
-            {
-                "backend": backend,
-                "replica_root": replica["replica_root"],
-                "content_hash": replica["content_hash"],
-            }
-            for backend, replica in sorted(desired.static_replicas.items())
-        ],
-    }
 
 
-def _runtime_slice_spec(
-    backend: Backend,
-    settings: Settings,
-    resource_profile: ResourceProfile,
-    *,
-    inter_app_interfaces: tuple[RuntimeInterAppInterface, ...] = (),
-) -> dict[str, Any]:
-    spec = dict(
-        runtime_spec(
-            backend,
-            settings,
-            base_profile=resource_profile,
-            inter_app_interfaces=inter_app_interfaces,
-        )
-    )
-    resource_mode = str(spec.get("resource_mode") or "auto")
-    has_resource_override = any(
-        str(getattr(backend, key, "") or "").strip()
-        for key in ("memory_high_override", "memory_max_override", "cpu_quota_override")
-    )
-    if (
-        resource_profile.mode == "auto"
-        and resource_mode == "auto"
-        and not has_resource_override
-    ):
-        # CPU remains a live Podman setting. Memory belongs to the generated
-        # service, so its calculated values must participate in convergence.
-        spec.pop("cpu_quota", None)
-    return spec
 
 
-def render_apply_slices(
-    desired: DesiredState, settings: Settings
-) -> dict[str, ApplySlice]:
-    slices: dict[str, ApplySlice] = {}
-    app_memory_budget = (
-        desired.resource_profile.app_memory_budget_bytes
-        or calculate_app_memory_budget_bytes(settings)
-    )
-    slices["apps_memory"] = _slice(
-        "apps_memory",
-        {
-            "unit": "cnc-apps.slice",
-            "memory_max_bytes": app_memory_budget,
-            "host_memory_reserve_bytes": desired.resource_profile.host_memory_reserve_bytes,
-        },
-    )
-    interface_links = tuple(desired.runtime_graph.inter_app_interfaces)
-    for backend in sorted(
-        desired.known_app_backends, key=lambda item: (item.id or 0, item.name)
-    ):
-        name = runtime_backend_slice_name(backend)
-        payload: dict[str, Any] = {
-            "backend_id": backend.id,
-            "backend": backend.name,
-            "enabled": bool(backend.enabled),
-        }
-        if backend.enabled:
-            related_interfaces = tuple(
-                item
-                for item in interface_links
-                if item.source_backend == backend.name
-                or item.target_backend == backend.name
-            )
-            payload["runtime_spec"] = _runtime_slice_spec(
-                backend,
-                settings,
-                desired.resource_profile,
-                inter_app_interfaces=related_interfaces,
-            )
-            payload["quadlet_container_sha256"] = hashlib.sha256(
-                quadlet_container_policy_content(
-                    render_quadlet_container(
-                        backend,
-                        settings,
-                        base_profile=desired.resource_profile,
-                        inter_app_interfaces=related_interfaces,
-                    )
-                ).encode("utf-8")
-            ).hexdigest()
-        slices[name] = _slice(name, payload)
-
-    slices["nginx.managed"] = _slice(
-        "nginx.managed", nginx_managed_slice_payload(desired.nginx_files)
-    )
-    slices["tailscale"] = _slice(
-        "tailscale",
-        tailscale_slice_payload(desired.tailscale_paths, desired.tailscale_services),
-    )
-    slices["cluster_followers"] = _slice(
-        "cluster_followers",
-        cluster_followers_slice_payload(desired),
-    )
-    slices["ssh_access"] = _slice(
-        "ssh_access",
-        {
-            "app_backends": [
-                {"backend_id": backend.id, "backend": backend.name}
-                | (
-                    {
-                        "ssh_public_key_sha256": hashlib.sha256(
-                            backend.ssh_public_key.encode("utf-8")
-                        ).hexdigest()
-                    }
-                    if backend.ssh_public_key
-                    else {}
-                )
-                for backend in sorted(
-                    desired.enabled_app_backends,
-                    key=lambda item: (item.id or 0, item.name),
-                )
-            ]
-        },
-    )
-    slices["shield"] = _slice(
-        "shield",
-        {
-            "required": bool(desired.shield_required),
-            "outputs": [
-                {
-                    "backend": name,
-                    "code_hash_sha256": hashlib.sha256(
-                        code_hash.encode("utf-8")
-                    ).hexdigest(),
-                }
-                for name, code_hash in sorted(desired.shield_output_code_hashes.items())
-            ],
-            "container_image": settings.shield_container_image,
-            "port": settings.shield_port,
-        },
-    )
-    slices["netdata"] = _slice(
-        "netdata",
-        {
-            "required": bool(desired.netdata_required),
-            "install": "native-kickstart",
-            "config_path": str(settings.netdata_config_path),
-            "port": settings.netdata_port,
-            "service": NETDATA_SYSTEMD_SERVICE,
-            "tailnet_service": NETDATA_SERVICE_NAME,
-        },
-    )
-    slices["network_isolation"] = _slice(
-        "network_isolation",
-        {
-            "backend_networks": [
-                {"backend": name, "network": network_name(name)}
-                for name in sorted(desired.runtime_graph.enabled_app_backend_names)
-            ],
-            "policy": "deny-private-cross-output",
-            "inter_app_interfaces": [
-                {
-                    "name": item.name,
-                    "source_backend": item.source_backend,
-                    "target_backend": item.target_backend,
-                    "network": item.network,
-                    "direction": item.direction,
-                }
-                for item in interface_links
-            ],
-        },
-    )
-    slices["host_base"] = _slice(
-        "host_base",
-        {
-            "managed_systemd_assets": "cnc service/timer units",
-            "nginx_generated_dir": str(settings.nginx_generated_dir),
-        },
-    )
-    return {name: slices[name] for name in sorted(slices)}
 
 
 def desired_state_snapshot(desired: DesiredState) -> dict[str, Any]:

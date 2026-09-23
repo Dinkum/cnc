@@ -1,0 +1,23 @@
+<article class="card span-2" data-cloudflare-settings>
+  <div class="section-head">
+    <h2>Cloudflare</h2>
+    <span class="summary-pill {{ 'active' if cloudflare_connection.connected else 'inactive' }}">{{ cloudflare_connection.status }}</span>
+  </div>
+  {% if cloudflare_connection.configured %}
+  <div class="settings-status-list">
+    <div class="settings-status-row"><span class="metric-label">API token</span><span class="mono">{{ cloudflare_connection.token_display }}</span></div>
+    <div class="settings-status-row"><span class="metric-label">domains</span><span>{{ cloudflare_connection.zones | length }} available</span></div>
+  </div>
+  {% if cloudflare_connection.error %}<p class="cf-message is-error" role="status">{{ cloudflare_connection.error }}</p>{% endif %}
+  <div class="cf-zone-list">{% for zone in cloudflare_connection.zones %}<span class="summary-pill">{{ zone.name }}</span>{% endfor %}</div>
+  <div class="editor-actions">
+    <button type="button" class="ghost" data-cf-retest>Retest</button>
+    <button type="button" class="ghost" data-cf-open>Replace token</button>
+    <button type="button" class="ghost" data-cf-disconnect>Disconnect</button>
+  </div>
+  {% else %}
+  <p class="subtle">Connect your domains to create DNS records and use Cloudflare Origin CA certificates.</p>
+  <div class="editor-actions"><button type="button" data-cf-open>Configure Cloudflare</button></div>
+  {% endif %}
+  <p class="cf-message" data-cf-settings-message role="status"></p>
+</article>

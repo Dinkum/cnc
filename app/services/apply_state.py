@@ -37,6 +37,7 @@ from app.services.placement_config import (
 )
 from app.services.port_allocator import PortAllocationError, allocate_ports
 from app.services.replica_readiness import backend_replica_readiness_status_map
+from app.services.cloudflare_certificates import input_certificate_path
 from app.services.renderers import (
     SHIELD_BACKEND_NAME,
     SHIELD_PORT,
@@ -44,6 +45,7 @@ from app.services.renderers import (
     nginx_filename,
     render_follower_admin_proxy,
     render_nginx_http,
+    render_nginx_https_default,
     render_nginx_shield_closed,
     render_nginx_static,
     safe_slug,
@@ -493,6 +495,8 @@ def _route_contracts(
                 "input_kind": input_kind,
                 "input_value": input_value,
                 "enabled": bool(item.enabled),
+                "https_enabled": bool(item.https_enabled),
+                "https_provider": item.https_provider or "self_signed",
                 "backend_names": [backend.name for backend in attached_backends],
                 "target": _render_route_target(
                     input_kind, input_value, attached_backends, settings, nodes_by_uid
@@ -717,6 +721,7 @@ def _build_cluster_follower_ingress(
                     ],
                     cloudflare_only=settings.nginx_cloudflare_only,
                     cloudflare_ips=settings.cloudflare_ip_list,
+                    tls_certificate=input_certificate_path(route_input),
                     shield_enabled=shield_enabled,
                     shield_port=SHIELD_PORT,
                     shield_target=shield_target,
@@ -762,11 +767,17 @@ def _build_cluster_follower_ingress(
                     replica_root,
                     cloudflare_only=settings.nginx_cloudflare_only,
                     cloudflare_ips=settings.cloudflare_ip_list,
+                    tls_certificate=input_certificate_path(route_input),
                     shield_enabled=shield_enabled,
                     shield_port=SHIELD_PORT,
                     shield_target=shield_target,
                     shield_output_key=shield_route_key,
                 )
+        if any("listen 443 ssl;" in content for content in app_files.values()):
+            app_files["cnc-origin-https-default.conf"] = render_nginx_https_default(
+                cloudflare_only=settings.nginx_cloudflare_only,
+                cloudflare_ips=settings.cloudflare_ip_list,
+            )
         app_node_files[node.node_uid] = app_files
         admin_node_files[node.node_uid] = admin_files
 
@@ -931,6 +942,9 @@ async def build_desired_state(
                 ],
                 cloudflare_only=settings.nginx_cloudflare_only,
                 cloudflare_ips=ingress_allow_ips,
+                tls_certificate=input_certificate_path(
+                    route_input, settings.app_control_dir
+                ),
                 shield_enabled=shield_enabled,
                 shield_port=SHIELD_PORT,
                 shield_output_key=shield_route_key,
@@ -968,10 +982,19 @@ async def build_desired_state(
                 primary_backend.static_root,
                 cloudflare_only=settings.nginx_cloudflare_only,
                 cloudflare_ips=ingress_allow_ips,
+                tls_certificate=input_certificate_path(
+                    route_input, settings.app_control_dir
+                ),
                 shield_enabled=shield_enabled,
                 shield_port=SHIELD_PORT,
                 shield_output_key=shield_route_key,
             )
+
+    if any("listen 443 ssl;" in content for content in nginx_files.values()):
+        nginx_files["cnc-origin-https-default.conf"] = render_nginx_https_default(
+            cloudflare_only=settings.nginx_cloudflare_only,
+            cloudflare_ips=ingress_allow_ips,
+        )
 
     (
         cluster_node_payload,

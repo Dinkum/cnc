@@ -202,6 +202,10 @@ async def fix_app_backend(
         )
         host_recovery_only = (
             diagnosis == "backend_exec_unavailable"
+            or (
+                diagnosis == "sandbox_stopped"
+                and repair_plan == [{"action": "restart_quadlet"}]
+            )
             or diagnosis in OBSERVATION_ONLY_DIAGNOSES
         )
 

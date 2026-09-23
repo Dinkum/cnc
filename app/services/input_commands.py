@@ -41,11 +41,14 @@ async def create_input(
     *,
     commit: bool = True,
 ) -> Input:
+    if payload.https_enabled and payload.kind != "domain":
+        raise ValidationError("HTTPS can only be enabled on domain inputs")
     value = ensure_input_value(payload.kind, payload.value)
     item = Input(
         kind=payload.kind,
         hostname=value,
         enabled=payload.enabled,
+        https_enabled=payload.https_enabled,
         shield_enabled=payload.shield_enabled,
         shield_code_hash=payload.shield_code_hash,
         shield_access_code=payload.shield_access_code,
@@ -70,6 +73,8 @@ async def update_input(
     item = await require_input(session, input_id)
     values = payload.model_dump(exclude_unset=True)
     next_kind = str(values.get("kind") or item.kind or "domain")
+    if values.get("https_enabled", item.https_enabled) and next_kind != "domain":
+        raise ValidationError("HTTPS can only be enabled on domain inputs")
     if "value" in values or "kind" in values:
         item.hostname = ensure_input_value(
             next_kind, str(values.pop("value", item.hostname))

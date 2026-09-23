@@ -9,6 +9,7 @@ from typing import Any
 
 from app.config import Settings
 from app.services.apply_core import DesiredState
+from app.services.cloudflare_certificates import reconcile_follower_certificates
 from app.services.commands import (
     CommandResult,
     command_result_is_retryable,
@@ -76,6 +77,7 @@ def reconcile_cluster_followers(
                     f"root@{node_ip}:{remote_path}",
                     settings,
                 )
+                reconcile_follower_certificates(node_uid, node_ip, app_files, settings)
                 _ssh_checked(
                     node_uid, node_ip, settings, _remote_sync_script(remote_path)
                 )
@@ -157,7 +159,19 @@ def _build_node_bundle(
             encoding="utf-8",
         )
 
+        source_root = Path(__file__).resolve().parents[2]
         with tarfile.open(bundle_path, "w:gz") as archive:
+            archive.add(
+                Path(__file__).with_name("origin_tls.py"), arcname="origin_tls.py"
+            )
+            archive.add(
+                source_root / "packaging/cnc-origin-tls.service",
+                arcname="cnc-origin-tls.service",
+            )
+            archive.add(
+                source_root / "packaging/cnc-origin-tls.timer",
+                arcname="cnc-origin-tls.timer",
+            )
             archive.add(app_nginx_dir, arcname="app-nginx")
             archive.add(admin_nginx_dir, arcname="admin-nginx")
             archive.add(stage / "manifest.json", arcname="manifest.json")
@@ -179,7 +193,7 @@ def _remote_sync_script(remote_path: str) -> str:
 export DEBIAN_FRONTEND=noninteractive
 if ! command -v nginx >/dev/null 2>&1; then
   apt-get -qq update
-  apt-get -qq install -y nginx ca-certificates curl tar gzip >/dev/null
+  apt-get -qq install -y nginx ca-certificates curl tar gzip openssl python3 >/dev/null
 fi
 install -d -m 0755 /etc/nginx/generated /etc/nginx/cnc-admin-generated /etc/nginx/conf.d /var/lib/cnc/static-replicas
 cat > /etc/nginx/conf.d/cnc-generated.conf <<'EOF'
@@ -201,6 +215,13 @@ cleanup() {{
 }}
 trap cleanup EXIT
 tar -C "$stage" -xzf {quoted_remote_path}
+install -d -m 0755 /usr/local/lib/cnc
+install -m 0644 "$stage/origin_tls.py" /usr/local/lib/cnc/origin_tls.py
+sed 's|/var/lib/cnc/current/app/services/origin_tls.py|/usr/local/lib/cnc/origin_tls.py|' "$stage/cnc-origin-tls.service" > /etc/systemd/system/cnc-origin-tls.service
+install -m 0644 "$stage/cnc-origin-tls.timer" /etc/systemd/system/cnc-origin-tls.timer
+python3 /usr/local/lib/cnc/origin_tls.py --prepare --nginx-dir "$stage/app-nginx"
+systemctl daemon-reload
+systemctl enable --now cnc-origin-tls.timer >/dev/null
 if [ -d "$stage/static" ]; then
   for source in "$stage"/static/*; do
     [ -d "$source" ] || continue
@@ -253,8 +274,8 @@ fi
 """
 
 
-def _ssh_checked(node_uid: str, node_ip: str, settings: Settings, script: str) -> None:
-    _run_checked(
+def _ssh_checked(node_uid: str, node_ip: str, settings: Settings, script: str) -> str:
+    return _run_checked(
         [
             "ssh",
             *SSH_BATCH_OPTIONS,
@@ -284,10 +305,10 @@ def _run_checked(
     *,
     node_uid: str,
     node_ip: str,
-) -> None:
+) -> str:
     result = run_command(command, timeout_sec=settings.command_timeout_apply_sec)
     if result.ok:
-        return
+        return result.stdout
     if command_result_is_retryable(result):
         raise ClusterFollowerUnavailable(node_uid, node_ip, result)
     message = result.stderr or result.stdout or "command failed"

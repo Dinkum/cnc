@@ -37,6 +37,10 @@
   });
   syncResourceSizeControls(document);
 
+  document.querySelectorAll('[data-output-settings-section]').forEach(form => {
+    form.addEventListener('output-section-restored', () => syncResourceSizeControls(form));
+  });
+
   const outputAttachFormIds = (form) => (
     Array.from(form?.querySelectorAll("input[name='input_ids']") || [])
       .map((input) => String(input.value || "").trim())
@@ -221,6 +225,11 @@
     syncAddButton();
     syncDirty();
     form?.addEventListener("output-attach-dirtycheck", syncDirty);
+    form?.addEventListener("output-section-restored", () => {
+      const ids = new Set(Array.from(tagsWrap.querySelectorAll('[name="input_ids"]')).map(input => input.value));
+      listWrap?.querySelectorAll('[data-output-option]').forEach(option => { option.hidden = ids.has(option.dataset.outputId); });
+      syncEmpty(); syncAddButton(); syncDirty();
+    });
   });
 
   document.querySelectorAll("[data-copy-target]").forEach((button) => {
@@ -251,11 +260,6 @@
   const deleteAccept = deleteModal?.querySelector("[data-confirm-accept]");
   const deleteCancel = deleteModal?.querySelector("[data-confirm-cancel]");
   const deleteCloseButtons = deleteModal ? Array.from(deleteModal.querySelectorAll("[data-delete-close]")) : [];
-  const deleteStates = deleteModal ? Array.from(deleteModal.querySelectorAll("[data-delete-state]")) : [];
-  const deleteActionGroups = deleteModal ? Array.from(deleteModal.querySelectorAll("[data-delete-actions]")) : [];
-  const deleteProgressLabel = deleteModal?.querySelector("[data-delete-progress-label]");
-  const deleteProgressFill = deleteModal?.querySelector("[data-delete-progress-fill]");
-  const deleteProgressNote = deleteModal?.querySelector("[data-delete-progress-note]");
   const cloneModal = document.getElementById("clone-output-modal");
   const cloneTrigger = document.querySelector("[data-clone-output-trigger]");
   const cloneForm = cloneModal?.querySelector("[data-clone-output-form]");
@@ -263,11 +267,7 @@
   const clonePortInput = cloneModal?.querySelector("[data-clone-port]");
   const cloneCancelButtons = cloneModal ? Array.from(cloneModal.querySelectorAll("[data-clone-cancel], [data-clone-close]")) : [];
   const cloneSubmit = cloneModal?.querySelector("[data-clone-submit]");
-  const cloneProgressLabel = cloneModal?.querySelector("[data-clone-progress-label]");
-  const cloneProgressValue = cloneModal?.querySelector("[data-clone-progress-value]");
-  const cloneProgressFill = cloneModal?.querySelector("[data-clone-progress-fill]");
-  const cloneProgressLog = cloneModal?.querySelector("[data-clone-progress-log]");
-  const cloneProgressNote = cloneModal?.querySelector("[data-clone-progress-note]");
+  const cloneProgressLog = cloneModal?.querySelector("[data-progress-log]");
   const cloneSuccessNote = cloneModal?.querySelector("[data-clone-success-note]");
   const cloneOpenLink = cloneModal?.querySelector("[data-clone-open-link]");
   const cloneErrorText = cloneModal?.querySelector("[data-clone-error-text]");
@@ -287,36 +287,20 @@
   const transferTargetOptions = transferTargetList
     ? Array.from(transferTargetList.querySelectorAll("[data-transfer-target-option]"))
     : [];
-  const transferProgressLabel = transferModal?.querySelector("[data-transfer-progress-label]");
-  const transferProgressValue = transferModal?.querySelector("[data-transfer-progress-value]");
-  const transferProgressFill = transferModal?.querySelector("[data-transfer-progress-fill]");
-  const transferProgressNote = transferModal?.querySelector("[data-transfer-progress-note]");
-  const transferMini = document.querySelector("[data-transfer-mini]");
-  const transferMiniLabel = document.querySelector("[data-transfer-mini-label]");
-  const transferMiniNote = document.querySelector("[data-transfer-mini-note]");
-  const transferMiniFill = document.querySelector("[data-transfer-mini-fill]");
-  const transferReopen = document.querySelector("[data-transfer-reopen]");
   const replicaSetupModal = document.getElementById("replica-setup-modal");
   const replicaSetupForm = replicaSetupModal?.querySelector("[data-replica-setup-form]");
   const replicaSetupTarget = replicaSetupModal?.querySelector("[data-replica-setup-target]");
   const replicaSetupNodeName = replicaSetupModal?.querySelector("[data-replica-setup-node-name]");
-  const replicaSetupStates = replicaSetupModal ? Array.from(replicaSetupModal.querySelectorAll("[data-replica-setup-state]")) : [];
-  const replicaSetupActionGroups = replicaSetupModal ? Array.from(replicaSetupModal.querySelectorAll("[data-replica-setup-actions]")) : [];
   const replicaSetupCancelButtons = replicaSetupModal ? Array.from(replicaSetupModal.querySelectorAll("[data-replica-setup-cancel]")) : [];
   const replicaSetupDone = replicaSetupModal?.querySelector("[data-replica-setup-done]");
   const replicaSetupRetry = replicaSetupModal?.querySelector("[data-replica-setup-retry]");
-  const replicaSetupProgressLabel = replicaSetupModal?.querySelector("[data-replica-setup-progress-label]");
-  const replicaSetupProgressValue = replicaSetupModal?.querySelector("[data-replica-setup-progress-value]");
-  const replicaSetupProgressFill = replicaSetupModal?.querySelector("[data-replica-setup-progress-fill]");
-  const replicaSetupProgressNote = replicaSetupModal?.querySelector("[data-replica-setup-progress-note]");
   const replicaSetupSuccessNote = replicaSetupModal?.querySelector("[data-replica-setup-success-note]");
   const replicaSetupErrorText = replicaSetupModal?.querySelector("[data-replica-setup-error-text]");
   const flashBlock = document.getElementById("output-flash-block");
   const backupForm = document.querySelector("[data-backup-form]");
   const backupSubmit = backupForm?.querySelector("[data-backup-submit]");
   const backupProgressShell = document.getElementById("backup-progress-shell");
-  const backupProgressFill = backupProgressShell?.querySelector("[data-backup-progress-fill]");
-  const backupProgressLog = backupProgressShell?.querySelector("[data-backup-progress-log]");
+  const backupProgressLog = backupProgressShell?.querySelector("[data-progress-log]");
   const deleteBackupModal = document.getElementById("delete-backup-modal");
   const deleteBackupCopy = deleteBackupModal?.querySelector("[data-delete-backup-copy]");
   const deleteBackupAccept = deleteBackupModal?.querySelector("[data-delete-backup-accept]");
@@ -335,23 +319,20 @@
   let backupPending = false;
   let backupSignalsRequestId = 0;
 
-  const setDeleteMode = (mode) => {
-    deleteStates.forEach((section) => {
-      section.hidden = section.dataset.deleteState !== mode;
-    });
-    deleteActionGroups.forEach((group) => {
-      group.hidden = group.dataset.deleteActions !== mode;
-    });
-  };
+  // Every progress dialog drives the same markup contract through the shared
+  // surface, so these four are the only per-dialog code left: a default label
+  // and, at terminal states, an explicit tone.
+  const deleteSurface = window.CNCProgress.dialog(deleteModal);
 
-  const setDeleteProgress = (percent, label, note, statusText) => {
-    const normalized = Math.max(0, Math.min(100, Number(percent) || 0));
-    if (deleteProgressFill) {
-      deleteProgressFill.style.width = `${normalized}%`;
-      deleteProgressFill.classList.toggle("is-complete", normalized >= 100);
-    }
-    if (deleteProgressLabel) deleteProgressLabel.textContent = label || "Deleting output";
-    if (deleteProgressNote) deleteProgressNote.textContent = statusText || note || "Removing the output.";
+  const setDeleteMode = (mode) => deleteSurface?.setState(mode);
+
+  const setDeleteProgress = (percent, label, note, statusText, tone = "running") => {
+    deleteSurface?.render({
+      tone,
+      progress: Math.max(0, Math.min(100, Number(percent) || 0)),
+      headline: label || "Deleting output",
+      note: statusText || note || "Removing the output.",
+    });
   };
 
   const firstOperationStep = (pipelineName, fallbackLabel, fallbackNote, fallbackProgress = 4) => {
@@ -455,7 +436,7 @@
         }
         const operationId = payload.operation_id;
         if (!operationId) {
-          setDeleteProgress(100, "Delete output", "Output deleted.", "Done.");
+          setDeleteProgress(100, "Delete output", "Output deleted.", "Done.", "success");
           finishDeleteWithoutReload(payload.redirect_url || "/?tab=outputs");
           return;
         }
@@ -476,26 +457,26 @@
           },
           onSuccess: (operation) => {
             const progress = operationProgress(operation, 100, "deleteOutput");
-            setDeleteProgress(100, "Delete output", progress.message || "Output deleted.", "Done.");
+            setDeleteProgress(100, "Delete output", progress.message || "Output deleted.", "Done.", "success");
             finishDeleteWithoutReload(progress.details.redirect_url || "/?tab=outputs");
           },
           onFailure: (operation) => {
             deletePending = false;
             setDeleteMode("form");
             const progress = operationProgress(operation, 100, "deleteOutput");
-            setDeleteProgress(100, "Delete failed", progress.flashError || progress.message || "Delete failed.", "Failed.");
+            setDeleteProgress(100, "Delete failed", progress.flashError || progress.message || "Delete failed.", "Failed.", "error");
             renderFlashBanner("error", progress.flashError || "Delete failed.");
           },
           onError: (error) => {
             deletePending = false;
             setDeleteMode("form");
-            setDeleteProgress(100, "Delete failed", error instanceof Error ? error.message : "Delete failed.", "Failed.");
+            setDeleteProgress(100, "Delete failed", error instanceof Error ? error.message : "Delete failed.", "Failed.", "error");
             renderFlashBanner("error", error instanceof Error ? error.message : "Delete failed.");
           },
         }).catch((error) => {
           deletePending = false;
           setDeleteMode("form");
-          setDeleteProgress(100, "Delete failed", error instanceof Error ? error.message : "Delete failed.", "Failed.");
+          setDeleteProgress(100, "Delete failed", error instanceof Error ? error.message : "Delete failed.", "Failed.", "error");
           renderFlashBanner("error", error instanceof Error ? error.message : "Delete failed.");
         });
       } catch (error) {
@@ -533,51 +514,45 @@
       },
       onSuccess: (payload) => {
         const progress = operationProgress(payload, 100, "deleteOutput");
-        setDeleteProgress(100, "Delete output", progress.message || "Output deleted.", "Done.");
+        setDeleteProgress(100, "Delete output", progress.message || "Output deleted.", "Done.", "success");
         finishDeleteWithoutReload(progress.details.redirect_url || "/?tab=outputs");
       },
       onFailure: (payload) => {
         deletePending = false;
         setDeleteMode("form");
         const progress = operationProgress(payload, 100, "deleteOutput");
-        setDeleteProgress(100, "Delete failed", progress.flashError || progress.message || "Delete failed.", "Failed.");
+        setDeleteProgress(100, "Delete failed", progress.flashError || progress.message || "Delete failed.", "Failed.", "error");
         renderFlashBanner("error", progress.flashError || "Delete failed.");
       },
       onError: (error) => {
         deletePending = false;
         setDeleteMode("form");
-        setDeleteProgress(100, "Delete failed", error instanceof Error ? error.message : "Delete failed.", "Failed.");
+        setDeleteProgress(100, "Delete failed", error instanceof Error ? error.message : "Delete failed.", "Failed.", "error");
         renderFlashBanner("error", error instanceof Error ? error.message : "Delete failed.");
       },
     }).catch((error) => {
       deletePending = false;
       setDeleteMode("form");
-      setDeleteProgress(100, "Delete failed", error instanceof Error ? error.message : "Delete failed.", "Failed.");
+      setDeleteProgress(100, "Delete failed", error instanceof Error ? error.message : "Delete failed.", "Failed.", "error");
       renderFlashBanner("error", error instanceof Error ? error.message : "Delete failed.");
     });
   };
 
-  const cloneStates = cloneModal ? Array.from(cloneModal.querySelectorAll("[data-clone-state]")) : [];
-  const cloneActionGroups = cloneModal ? Array.from(cloneModal.querySelectorAll("[data-clone-actions]")) : [];
-  const setCloneMode = (mode) => {
-    cloneStates.forEach((section) => {
-      section.hidden = section.dataset.cloneState !== mode;
-    });
-    cloneActionGroups.forEach((group) => {
-      group.hidden = group.dataset.cloneActions !== (mode === "form" ? "form" : "progress");
+  const cloneSurface = window.CNCProgress.dialog(cloneModal);
+
+  // The success state carries its own actions, so it no longer also shows the
+  // progress group's Close button.
+  const setCloneMode = (mode) => cloneSurface?.setState(mode);
+
+  const setCloneProgress = (percent, label, note, tone = "running") => {
+    cloneSurface?.render({
+      tone,
+      progress: Math.max(0, Math.min(100, Number(percent) || 0)),
+      headline: label,
+      note,
     });
   };
 
-  const setCloneProgress = (percent, label, note) => {
-    const normalized = Math.max(0, Math.min(100, Number(percent) || 0));
-    if (cloneProgressFill) cloneProgressFill.style.width = `${normalized}%`;
-    if (cloneProgressValue) cloneProgressValue.textContent = `${Math.round(normalized)}%`;
-    if (cloneProgressLabel && label) cloneProgressLabel.textContent = label;
-    if (cloneProgressNote && note) cloneProgressNote.textContent = note;
-  };
-
-  const transferStates = transferModal ? Array.from(transferModal.querySelectorAll("[data-transfer-state]")) : [];
-  const transferActionGroups = transferModal ? Array.from(transferModal.querySelectorAll("[data-transfer-actions]")) : [];
 
   const setTransferTargetOpen = (isOpen) => {
     if (!transferTargetPicker || !transferTargetToggle || !transferTargetList) return;
@@ -612,30 +587,58 @@
     transferTargetToggle?.focus();
   };
 
+  const transferSurface = window.CNCProgress.dialog(transferModal);
+
   const setTransferMode = (mode) => {
-    transferStates.forEach((section) => {
-      section.hidden = section.dataset.transferState !== mode;
-    });
-    transferActionGroups.forEach((group) => {
-      group.hidden = group.dataset.transferActions !== mode;
-    });
+    transferSurface?.setState(mode);
     if (mode !== "target") setTransferTargetOpen(false);
   };
 
-  const setTransferProgress = (percent, label, note) => {
-    const normalized = Math.max(0, Math.min(100, Number(percent) || 0));
-    if (transferProgressFill) transferProgressFill.style.width = `${normalized}%`;
-    if (transferProgressValue) transferProgressValue.textContent = `${Math.round(normalized)}%`;
-    if (transferProgressLabel && label) transferProgressLabel.textContent = label;
-    if (transferProgressNote && note) transferProgressNote.textContent = note;
-    if (transferMiniFill) transferMiniFill.style.width = `${normalized}%`;
-    if (transferMiniLabel && label) transferMiniLabel.textContent = label;
-    if (transferMiniNote && note) transferMiniNote.textContent = note;
+  // Minimising a transfer hands it to the card stack rather than to a bespoke
+  // bottom bar. The card's own dismissal rule then applies, so a finished or
+  // failed transfer can no longer strand at 100% with nothing to close it.
+  const TRANSFER_CARD_KEY = "transfer";
+  let transferMinimised = false;
+  let transferLastFrame = null;
+
+  const reopenTransfer = () => {
+    transferMinimised = false;
+    window.CNCProgress.card.dismiss(TRANSFER_CARD_KEY);
+    openProgressDialog(transferModal);
+  };
+
+  const paintTransferCard = () => {
+    if (!transferMinimised || !transferLastFrame) return;
+    const { tone } = transferLastFrame;
+    window.CNCProgress.card.show(TRANSFER_CARD_KEY, transferLastFrame, {
+      actions: tone === "running" ? [{ label: "Open", onClick: reopenTransfer, ghost: true }] : [],
+    });
+  };
+
+  const minimiseTransfer = () => {
+    transferMinimised = true;
+    transferModal?.close("minimize");
+    paintTransferCard();
+  };
+
+  const setTransferProgress = (percent, label, note, tone = "running") => {
+    const progress = Math.max(0, Math.min(100, Number(percent) || 0));
+    transferSurface?.render({ tone, progress, headline: label, note });
+    transferLastFrame = {
+      tone,
+      title: "Transfer output",
+      headline: label || "Transfer output",
+      note: note || "",
+      progress,
+      meta: [],
+    };
+    paintTransferCard();
   };
 
   transferTrigger?.addEventListener("click", () => {
     transferPending = false;
-    if (transferMini) transferMini.hidden = true;
+    transferMinimised = false;
+    window.CNCProgress.card.dismiss(TRANSFER_CARD_KEY);
     setTransferMode("confirm");
     setTransferProgress(0, "Preparing transfer", "Starting transfer.");
     if (typeof transferModal?.showModal === "function") {
@@ -738,39 +741,33 @@
         onSuccess: (operation) => {
           const progress = operationProgress(operation, 100, "transferOutput");
           transferPending = false;
-          setTransferProgress(100, "Transfer complete", progress.flashSuccess || progress.message || "Output transferred.");
+          setTransferProgress(100, "Transfer complete", progress.flashSuccess || progress.message || "Output transferred.", "success");
           window.setTimeout(() => window.location.reload(), 900);
         },
         onFailure: (operation) => {
           const progress = operationProgress(operation, 100, "transferOutput");
           transferPending = false;
-          setTransferProgress(100, "Transfer failed", progress.flashError || progress.message || "Transfer failed.");
+          setTransferProgress(100, "Transfer failed", progress.flashError || progress.message || "Transfer failed.", "error");
         },
         onError: (error) => {
           transferPending = false;
-          setTransferProgress(100, "Transfer failed", error instanceof Error ? error.message : "Transfer failed.");
+          setTransferProgress(100, "Transfer failed", error instanceof Error ? error.message : "Transfer failed.", "error");
         },
       });
     } catch (error) {
       transferPending = false;
-      setTransferProgress(100, "Transfer failed", error instanceof Error ? error.message : "Transfer failed.");
+      setTransferProgress(100, "Transfer failed", error instanceof Error ? error.message : "Transfer failed.", "error");
     }
   });
 
   transferClose?.addEventListener("click", () => {
+    // Closing a running transfer minimises it to the card stack; closing a
+    // finished one just dismisses the dialog.
     if (transferPending) {
-      if (transferMini) transferMini.hidden = false;
-      transferModal?.close("minimize");
+      minimiseTransfer();
       return;
     }
     transferModal?.close("close");
-  });
-
-  transferReopen?.addEventListener("click", () => {
-    if (transferMini) transferMini.hidden = true;
-    if (typeof transferModal?.showModal === "function") {
-      transferModal.showModal();
-    }
   });
 
   const resumeTransferOperation = async (operation) => {
@@ -797,36 +794,27 @@
         onSuccess: (payload) => {
           const progress = operationProgress(payload, 100, "transferOutput");
           transferPending = false;
-          setTransferProgress(100, "Transfer complete", progress.flashSuccess || progress.message || "Output transferred.");
+          setTransferProgress(100, "Transfer complete", progress.flashSuccess || progress.message || "Output transferred.", "success");
           window.setTimeout(() => window.location.reload(), 900);
         },
         onFailure: (payload) => {
           const progress = operationProgress(payload, 100, "transferOutput");
           transferPending = false;
-          setTransferProgress(100, "Transfer failed", progress.flashError || progress.message || "Transfer failed.");
+          setTransferProgress(100, "Transfer failed", progress.flashError || progress.message || "Transfer failed.", "error");
         },
         onError: (error) => {
           transferPending = false;
-          setTransferProgress(100, "Transfer failed", error instanceof Error ? error.message : "Transfer failed.");
+          setTransferProgress(100, "Transfer failed", error instanceof Error ? error.message : "Transfer failed.", "error");
         },
       });
     } catch (error) {
       transferPending = false;
-      setTransferProgress(100, "Transfer failed", error instanceof Error ? error.message : "Transfer failed.");
+      setTransferProgress(100, "Transfer failed", error instanceof Error ? error.message : "Transfer failed.", "error");
     }
   };
 
   const appendProgressNarrative = (target, message) => {
-    if (!target || !message) return;
-    const normalized = String(message).trim();
-    if (!normalized) return;
-    const lastLine = target.lastElementChild;
-    if (lastLine && lastLine.textContent.trim() === normalized) return;
-    const line = document.createElement("div");
-    line.className = "clone-progress-line";
-    line.textContent = normalized;
-    target.appendChild(line);
-    target.scrollTop = target.scrollHeight;
+    window.CNCProgress.appendNarrative(target, message);
   };
 
   const appendCloneNarrative = (message) => {
@@ -840,44 +828,32 @@
     flashBlock.innerHTML = text ? `<section class="banner ${normalizedKind}">${escapeHtml(text)}</section>` : "";
   };
 
+  // A settings section reports its own save state inline (CNCOutputSettings
+  // renders "Saving…" / "Saved" next to the buttons), so the page must not
+  // also raise a banner for it.
   const hasLocalOutputSaveProgress = (form) => (
-    Boolean(form?.querySelector("[data-output-save-inline-progress]"))
+    Boolean(form?.matches?.("[data-output-settings-section]"))
   );
 
+  const OUTPUT_SAVE_CARD_KEY = "output-save";
+
   const clearOutputSaveProgressBanner = () => {
-    if (!flashBlock) return;
-    if (flashBlock.querySelector(".output-save-progress-banner")) {
-      flashBlock.innerHTML = "";
-    }
+    window.CNCProgress.card.dismiss(OUTPUT_SAVE_CARD_KEY);
   };
 
-
+  // Saving an output is work the reader can walk away from, so it reports in
+  // the card stack rather than pinning a progress banner to the top of the page.
   const renderOutputSaveProgress = ({ kind = "success", title = "Saving output", step = "", note = "", progress = 8 }) => {
-    if (!flashBlock) return;
-    const normalizedKind = kind === "error" ? "error" : kind === "success" ? "success" : "pending";
-    const normalizedProgress = Math.max(0, Math.min(100, Number(progress) || 0));
+    const tone = kind === "error" ? "error" : kind === "success" ? "success" : "running";
     const headline = String(title || "Saving output").trim();
-    const substep = String(step || headline).trim();
-    const detail = String(note || "").trim();
-    flashBlock.innerHTML = `
-      <section class="banner ${normalizedKind} output-save-progress-banner">
-        <div class="output-save-progress-copy">
-          <strong>${escapeHtml(headline)}</strong>
-          <span>${escapeHtml(substep)}${detail ? ` - ${escapeHtml(detail)}` : ""}</span>
-        </div>
-        <span class="summary-pill pending">${Math.round(normalizedProgress)}%</span>
-        <div
-          class="clone-progress-track output-save-progress-track"
-          role="progressbar"
-          aria-label="${escapeHtml(headline)} progress"
-          aria-valuemin="0"
-          aria-valuemax="100"
-          aria-valuenow="${Math.round(normalizedProgress)}"
-        >
-          <span class="clone-progress-fill" style="width: ${normalizedProgress}%"></span>
-        </div>
-      </section>
-    `;
+    window.CNCProgress.card.show(OUTPUT_SAVE_CARD_KEY, {
+      tone,
+      title: headline,
+      headline: String(step || headline).trim(),
+      note: String(note || "").trim(),
+      progress: Math.max(0, Math.min(100, Number(progress) || 0)),
+      meta: [],
+    });
   };
 
   const renderOutputSaveProgressForForm = (form, options) => {
@@ -911,21 +887,11 @@
     return firstProgress;
   };
 
-  const renderInlineOutputSaveProgress = (form, { kind = "running", title = "Saving output", step = "", progress = 8 }) => {
-    const shell = form?.querySelector("[data-output-save-inline-progress]");
-    if (!shell) return;
-    const normalizedProgress = Math.max(0, Math.min(100, Number(progress) || 0));
-    const boundedProgress = kind === "running" ? Math.max(4, Math.min(96, normalizedProgress)) : normalizedProgress;
-    const label = shell.querySelector("[data-output-save-inline-label]");
-    const value = shell.querySelector("[data-output-save-inline-value]");
-    const track = shell.querySelector("[data-output-save-inline-track]");
-    const fill = shell.querySelector("[data-output-save-inline-fill]");
-    shell.hidden = false;
-    shell.dataset.state = kind;
-    if (label) label.textContent = String(step || title || "Saving").trim();
-    if (value) value.textContent = `${Math.round(boundedProgress)}%`;
-    if (track) track.setAttribute("aria-valuenow", String(Math.round(boundedProgress)));
-    if (fill) fill.style.width = `${boundedProgress}%`;
+  // Every section form carries [data-output-settings-section], so the settings
+  // module owns this feedback: it renders "Saving…" / "Saved" as text rather
+  // than a bar, which is the right affordance for a dirty-state form.
+  const renderInlineOutputSaveProgress = (form, { kind = "running", step = "" }) => {
+    window.CNCOutputSettings?.render(form, { kind, step });
   };
 
   const stopOutputSaveProgress = () => {};
@@ -991,9 +957,19 @@
     return token;
   };
 
-  const setBackupProgress = (percent, label, note) => {
-    const normalized = Math.max(0, Math.min(100, Number(percent) || 0));
-    if (backupProgressFill) backupProgressFill.style.width = `${normalized}%`;
+  // Backups are work the reader can walk away from, so the bar reports in the
+  // card stack. The narrative log stays on the page as a record.
+  const BACKUP_CARD_KEY = "backup";
+
+  const setBackupProgress = (percent, label, note, tone = "running") => {
+    window.CNCProgress.card.show(BACKUP_CARD_KEY, {
+      tone,
+      title: label || "Backup",
+      headline: label || "Backup",
+      note: note || "",
+      progress: Math.max(0, Math.min(100, Number(percent) || 0)),
+      meta: [],
+    });
   };
 
   const shouldAppendBackupNarrative = (message) => {
@@ -1152,6 +1128,7 @@
   const renderOutputSaveOperationResult = (form, title, operation, submitButton, fallbackMessage) => {
     const progress = operationProgress(operation, 100, "outputSave");
     const failed = String(operation?.status || "").toLowerCase() !== "success";
+    if (!failed) window.CNCOutputSettings?.acceptValues(form, progress.details?.saved_values);
     const message = failed
       ? (progress.flashError || progress.message || fallbackMessage || "Save failed.")
       : (progress.flashSuccess || progress.message || fallbackMessage || "Saved.");
@@ -1179,6 +1156,7 @@
 
   const submitOutputSaveForm = async (form, submitter) => {
     if (form.dataset.submitting === "1") return;
+    window.CNCOutputSettings?.begin(form);
     form.dataset.submitting = "1";
     const submitButton = submitter || form.querySelector("button[type='submit']");
     const originalLabel = submitButton ? submitButton.textContent : "";
@@ -1341,7 +1319,8 @@
   const outputSaveFormForOperation = (operation) => {
     const kind = String(operation?.kind || "");
     if (kind === "ui.backend.update") {
-      return document.getElementById("output-settings-form");
+      const section = String(operation?.details?.section || "");
+      return Array.from(document.querySelectorAll("[data-output-settings-section]")).find(form => form.dataset.outputSettingsSection === section) || null;
     }
     if (kind === "ui.backend.inputs") {
       return document.querySelector('[data-output-save-form][action$="/inputs"]');
@@ -1490,7 +1469,7 @@
         },
         onSuccess: async (operation) => {
           const progress = operationProgress(operation, 100, pipeline);
-          setBackupProgress(100, `${label} complete`, progress.message || "Done.");
+          setBackupProgress(100, `${label} complete`, progress.message || "Done.", "success");
           appendBackupNarrative(progress.message || "Done.");
           if (showSuccessBanner) {
             renderFlashBanner("success", progress.flashSuccess || progress.message || "Done.");
@@ -1501,17 +1480,17 @@
         },
         onFailure: (operation) => {
           const progress = operationProgress(operation, 100, pipeline);
-          setBackupProgress(100, `${label} failed`, progress.message || failedMessage);
+          setBackupProgress(100, `${label} failed`, progress.message || failedMessage, "error");
           appendBackupNarrative(progress.flashError || progress.message || failedMessage);
           renderFlashBanner("error", progress.flashError || failedMessage);
         },
         onError: (error) => {
-          setBackupProgress(100, `${label} failed`, failedMessage);
+          setBackupProgress(100, `${label} failed`, failedMessage, "error");
           renderFlashBanner("error", error instanceof Error ? error.message : failedMessage);
         },
       });
     } catch (error) {
-      setBackupProgress(100, `${label} failed`, failedMessage);
+      setBackupProgress(100, `${label} failed`, failedMessage, "error");
       renderFlashBanner("error", error instanceof Error ? error.message : failedMessage);
     } finally {
       if (submitter) {
@@ -1574,7 +1553,7 @@
         },
         onSuccess: async (payload) => {
           const progress = operationProgress(payload, 100, config.pipeline);
-          setBackupProgress(100, `${config.label} complete`, progress.message || "Done.");
+          setBackupProgress(100, `${config.label} complete`, progress.message || "Done.", "success");
           appendBackupNarrative(progress.message || "Done.");
           if (config.showSuccessBanner !== false) {
             renderFlashBanner("success", progress.flashSuccess || progress.message || "Done.");
@@ -1584,17 +1563,17 @@
         },
         onFailure: (payload) => {
           const progress = operationProgress(payload, 100, config.pipeline);
-          setBackupProgress(100, `${config.label} failed`, progress.message || config.failedMessage);
+          setBackupProgress(100, `${config.label} failed`, progress.message || config.failedMessage, "error");
           appendBackupNarrative(progress.flashError || progress.message || config.failedMessage);
           renderFlashBanner("error", progress.flashError || config.failedMessage);
         },
         onError: (error) => {
-          setBackupProgress(100, `${config.label} failed`, config.failedMessage);
+          setBackupProgress(100, `${config.label} failed`, config.failedMessage, "error");
           renderFlashBanner("error", error instanceof Error ? error.message : config.failedMessage);
         },
       });
     } catch (error) {
-      setBackupProgress(100, `${config.label} failed`, config.failedMessage);
+      setBackupProgress(100, `${config.label} failed`, config.failedMessage, "error");
       renderFlashBanner("error", error instanceof Error ? error.message : config.failedMessage);
     } finally {
       if (backupSubmit) backupSubmit.disabled = false;
@@ -1721,7 +1700,7 @@
           onSuccess: (operation) => {
             const progress = operationProgress(operation, 100, "clone");
             const details = progress.details || {};
-            setCloneProgress(100, "Clone ready", progress.message || "The new output is ready.");
+            setCloneProgress(100, "Clone ready", progress.message || "The new output is ready.", "success");
             appendCloneNarrative(progress.message || "Clone ready.");
             appendCloneNarrative(`Copied ${details.copied_paths ?? 0} mounted path(s) and left inputs detached.`);
             if (cloneSuccessNote) cloneSuccessNote.textContent = String(progress.flashSuccess || progress.message || "");
@@ -1730,18 +1709,18 @@
           },
           onFailure: (operation) => {
             const progress = operationProgress(operation, 100, "clone");
-            setCloneProgress(100, "Clone failed", progress.message || "The clone could not be completed.");
+            setCloneProgress(100, "Clone failed", progress.message || "The clone could not be completed.", "error");
             if (cloneErrorText) cloneErrorText.textContent = String(progress.flashError || progress.message || "Clone failed.");
             setCloneMode("error");
           },
           onError: (error) => {
-            setCloneProgress(100, "Clone failed", "The clone could not be completed.");
+            setCloneProgress(100, "Clone failed", "The clone could not be completed.", "error");
             if (cloneErrorText) cloneErrorText.textContent = error instanceof Error ? error.message : "Clone failed.";
             setCloneMode("error");
           },
         });
       } catch (error) {
-        setCloneProgress(100, "Clone failed", "The clone could not be completed.");
+        setCloneProgress(100, "Clone failed", "The clone could not be completed.", "error");
         if (cloneErrorText) cloneErrorText.textContent = error instanceof Error ? error.message : "Clone failed.";
         setCloneMode("error");
       } finally {
@@ -1778,7 +1757,7 @@
       onSuccess: (payload) => {
         const progress = operationProgress(payload, 100, "clone");
         const details = progress.details || {};
-        setCloneProgress(100, "Clone ready", progress.message || "The new output is ready.");
+        setCloneProgress(100, "Clone ready", progress.message || "The new output is ready.", "success");
         appendCloneNarrative(progress.message || "Clone ready.");
         appendCloneNarrative(`Copied ${details.copied_paths ?? 0} mounted path(s) and left inputs detached.`);
         if (cloneSuccessNote) cloneSuccessNote.textContent = String(progress.flashSuccess || progress.message || "");
@@ -1787,17 +1766,17 @@
       },
       onFailure: (payload) => {
         const progress = operationProgress(payload, 100, "clone");
-        setCloneProgress(100, "Clone failed", progress.message || "The clone could not be completed.");
+        setCloneProgress(100, "Clone failed", progress.message || "The clone could not be completed.", "error");
         if (cloneErrorText) cloneErrorText.textContent = String(progress.flashError || progress.message || "Clone failed.");
         setCloneMode("error");
       },
       onError: (error) => {
-        setCloneProgress(100, "Clone failed", "The clone could not be completed.");
+        setCloneProgress(100, "Clone failed", "The clone could not be completed.", "error");
         if (cloneErrorText) cloneErrorText.textContent = error instanceof Error ? error.message : "Clone failed.";
         setCloneMode("error");
       },
     }).catch((error) => {
-      setCloneProgress(100, "Clone failed", "The clone could not be completed.");
+      setCloneProgress(100, "Clone failed", "The clone could not be completed.", "error");
       if (cloneErrorText) cloneErrorText.textContent = error instanceof Error ? error.message : "Clone failed.";
       setCloneMode("error");
     }).finally(() => {
@@ -3404,21 +3383,17 @@
       }
     };
 
-    const setReplicaSetupMode = (state) => {
-      replicaSetupStates.forEach((section) => {
-        section.hidden = section.dataset.replicaSetupState !== state;
-      });
-      replicaSetupActionGroups.forEach((group) => {
-        group.hidden = group.dataset.replicaSetupActions !== state;
-      });
-    };
+    const replicaSetupSurface = window.CNCProgress.dialog(replicaSetupModal);
 
-    const setReplicaSetupProgress = (percent, label, note) => {
-      const normalized = Math.max(0, Math.min(100, Number(percent) || 0));
-      if (replicaSetupProgressFill) replicaSetupProgressFill.style.width = `${normalized}%`;
-      if (replicaSetupProgressValue) replicaSetupProgressValue.textContent = `${Math.round(normalized)}%`;
-      if (replicaSetupProgressLabel && label) replicaSetupProgressLabel.textContent = label;
-      if (replicaSetupProgressNote && note) replicaSetupProgressNote.textContent = note;
+    const setReplicaSetupMode = (state) => replicaSetupSurface?.setState(state);
+
+    const setReplicaSetupProgress = (percent, label, note, tone = "running") => {
+      replicaSetupSurface?.render({
+        tone,
+        progress: Math.max(0, Math.min(100, Number(percent) || 0)),
+        headline: label,
+        note,
+      });
     };
 
     const revertPendingReplicaSetup = () => {
@@ -3544,7 +3519,7 @@
               replicaSetupSuccessNote.textContent = progress.flashSuccess || progress.message || "Node setup complete.";
             }
             setReplicaSetupMode("success");
-            setReplicaSetupProgress(100, "Node ready", progress.flashSuccess || progress.message || "Node setup complete.");
+            setReplicaSetupProgress(100, "Node ready", progress.flashSuccess || progress.message || "Node setup complete.", "success");
           },
           onFailure: (operation) => {
             replicaSetupPending = false;
@@ -3553,28 +3528,28 @@
               replicaSetupErrorText.textContent = progress.flashError || progress.message || "Setup failed.";
             }
             setReplicaSetupMode("error");
-            setReplicaSetupProgress(100, "Setup failed", progress.flashError || progress.message || "Setup failed.");
+            setReplicaSetupProgress(100, "Setup failed", progress.flashError || progress.message || "Setup failed.", "error");
           },
           onError: (error) => {
             replicaSetupPending = false;
             const message = error instanceof Error ? error.message : "Setup failed.";
             if (replicaSetupErrorText) replicaSetupErrorText.textContent = message;
             setReplicaSetupMode("error");
-            setReplicaSetupProgress(100, "Setup failed", message);
+            setReplicaSetupProgress(100, "Setup failed", message, "error");
           },
         }).catch((error) => {
           replicaSetupPending = false;
           const message = error instanceof Error ? error.message : "Setup failed.";
           if (replicaSetupErrorText) replicaSetupErrorText.textContent = message;
           setReplicaSetupMode("error");
-          setReplicaSetupProgress(100, "Setup failed", message);
+          setReplicaSetupProgress(100, "Setup failed", message, "error");
         });
       } catch (error) {
         replicaSetupPending = false;
         const message = error instanceof Error ? error.message : "Setup failed.";
         if (replicaSetupErrorText) replicaSetupErrorText.textContent = message;
         setReplicaSetupMode("error");
-        setReplicaSetupProgress(100, "Setup failed", message);
+        setReplicaSetupProgress(100, "Setup failed", message, "error");
       }
     });
 
@@ -3624,7 +3599,7 @@
             replicaSetupSuccessNote.textContent = progress.flashSuccess || progress.message || "Node setup complete.";
           }
           setReplicaSetupMode("success");
-          setReplicaSetupProgress(100, "Node ready", progress.flashSuccess || progress.message || "Node setup complete.");
+          setReplicaSetupProgress(100, "Node ready", progress.flashSuccess || progress.message || "Node setup complete.", "success");
         },
         onFailure: (payload) => {
           replicaSetupPending = false;
@@ -3633,21 +3608,21 @@
             replicaSetupErrorText.textContent = progress.flashError || progress.message || "Setup failed.";
           }
           setReplicaSetupMode("error");
-          setReplicaSetupProgress(100, "Setup failed", progress.flashError || progress.message || "Setup failed.");
+          setReplicaSetupProgress(100, "Setup failed", progress.flashError || progress.message || "Setup failed.", "error");
         },
         onError: (error) => {
           replicaSetupPending = false;
           const message = error instanceof Error ? error.message : "Setup failed.";
           if (replicaSetupErrorText) replicaSetupErrorText.textContent = message;
           setReplicaSetupMode("error");
-          setReplicaSetupProgress(100, "Setup failed", message);
+          setReplicaSetupProgress(100, "Setup failed", message, "error");
         },
       }).catch((error) => {
         replicaSetupPending = false;
         const message = error instanceof Error ? error.message : "Setup failed.";
         if (replicaSetupErrorText) replicaSetupErrorText.textContent = message;
         setReplicaSetupMode("error");
-        setReplicaSetupProgress(100, "Setup failed", message);
+        setReplicaSetupProgress(100, "Setup failed", message, "error");
       });
     };
 
@@ -3707,6 +3682,10 @@
       });
     });
 
+    form.addEventListener('output-section-restored', () => {
+      setMode(mode()); renderPlacementNodes();
+      interfaceRows().forEach(updateInterfaceMeta);
+    });
     setMode(mode());
     renderPlacementNodes();
   };

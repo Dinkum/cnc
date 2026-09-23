@@ -108,6 +108,8 @@ _TERMINAL_GUEST_EXEC_OUTCOMES = {
     "guard_busy",
     "guard_unavailable",
     "timeout",
+    "guest_deadline_or_exit_124",
+    "deadline_before_exec",
 }
 
 
@@ -166,6 +168,11 @@ async def apply_app_backends(
     selected_backend_names: set[str] | None = None,
     cleanup_deleted: bool = True,
     cleanup_deleted_filesystem: bool = True,
+    #: Which absent runtimes this call may remove. None means every one, which
+    #: is what a full reconcile wants. A scoped save passes the outputs it
+    #: concerns, so deleting one output cannot also tear down a runtime whose
+    #: row is momentarily missing for an unrelated reason.
+    removable_backend_names: set[str] | None = None,
     reconcile_network_isolation: bool = True,
     operation_id: int | None = None,
 ) -> dict[str, Any]:
@@ -205,6 +212,7 @@ async def apply_app_backends(
             services=services,
             desired_interface_network_names=desired_interface_network_names,
             cleanup_filesystem=cleanup_deleted_filesystem,
+            removable_backend_names=removable_backend_names,
         )
     else:
         cleanup = {
@@ -374,6 +382,7 @@ async def _cleanup_deleted_app_runtime(
     services: AppRuntimeServices | None = None,
     desired_interface_network_names: set[str] | None = None,
     cleanup_filesystem: bool = True,
+    removable_backend_names: set[str] | None = None,
 ) -> dict[str, list[str]]:
     services = services or default_app_runtime_services()
     desired_interface_network_names = set(desired_interface_network_names or set())
@@ -403,6 +412,13 @@ async def _cleanup_deleted_app_runtime(
         backend_name = _entry_backend_label(entry)
         if not backend_name or backend_name in desired_app_names:
             continue
+        if (
+            removable_backend_names is not None
+            and backend_name not in removable_backend_names
+        ):
+            # Absent from desired state but not this change's to remove. A
+            # scoped save leaves it for the reconcile that owns it.
+            continue
         deleted_backend_names.add(backend_name)
         target = _entry_primary_name(entry) or _entry_id(entry)
         if not target:
@@ -431,6 +447,13 @@ async def _cleanup_deleted_app_runtime(
         backend_name = _entry_backend_label(entry)
         if not backend_name or backend_name in desired_app_names:
             continue
+        if (
+            removable_backend_names is not None
+            and backend_name not in removable_backend_names
+        ):
+            # Absent from desired state but not this change's to remove. A
+            # scoped save leaves it for the reconcile that owns it.
+            continue
         deleted_backend_names.add(backend_name)
         target = _entry_primary_name(entry) or _entry_id(entry)
         if not target:
@@ -444,10 +467,17 @@ async def _cleanup_deleted_app_runtime(
 
     quadlet_files_removed: list[str] = []
     legacy_reboot_bridges_removed: list[str] = []
+    # Orphaned Quadlet units get the same filter as containers and networks.
+    # Without it a scoped delete swept up every unit whose row was absent,
+    # including outputs this change was never meant to touch.
     deleted_backend_names.update(
         backend_name
         for backend_name in managed_quadlet_backend_names(settings)
         if backend_name not in desired_app_names
+        and (
+            removable_backend_names is None
+            or backend_name in removable_backend_names
+        )
     )
     networks_removed.extend(interface_cleanup["networks_removed"])
     quadlet_files_removed.extend(interface_cleanup["quadlet_files_removed"])
@@ -468,8 +498,12 @@ async def _cleanup_deleted_app_runtime(
         or legacy_reboot_bridges_removed
     ):
         await _systemctl_daemon_reload(settings, services=services)
+    # Guest filesystems are the least recoverable thing CNC removes, so the
+    # scope filter matters most here.
     filesystem_artifacts_removed = (
-        _cleanup_deleted_app_filesystem_artifacts(desired_app_names, settings)
+        _cleanup_deleted_app_filesystem_artifacts(
+            desired_app_names, settings, removable=removable_backend_names
+        )
         if cleanup_filesystem
         else []
     )
@@ -533,7 +567,15 @@ async def _cleanup_stale_interface_runtime(
 def _cleanup_deleted_app_filesystem_artifacts(
     desired_app_names: set[str],
     settings: Settings,
+    *,
+    removable: set[str] | None = None,
 ) -> list[str]:
+    """Remove guest storage for outputs desired state no longer names.
+
+    ``removable`` narrows that to the outputs the change actually concerns.
+    Destroying another output's guest filesystem is the least recoverable
+    mistake CNC can make, so a scoped save never reaches past its own.
+    """
     backend_names: set[str] = set()
     if settings.app_control_dir.exists():
         for path in settings.app_control_dir.iterdir():
@@ -552,6 +594,8 @@ def _cleanup_deleted_app_filesystem_artifacts(
             ):
                 backend_names.add(path.name)
 
+    if removable is not None:
+        backend_names &= removable
     return _remove_deleted_app_filesystem_artifacts(backend_names, settings)
 
 
@@ -573,7 +617,11 @@ def _remove_deleted_app_filesystem_artifacts(
         control_path = control_dir(settings, backend_name)
         sandbox_path = app_sandbox_rootfs_path(settings, backend_name).parent
         marked = (
-            control_path.is_dir() and _control_dir_has_runtime_artifacts(control_path)
+            control_path.is_dir()
+            and (
+                _control_dir_has_runtime_artifacts(control_path)
+                or (control_path / "failure.json").exists()
+            )
         ) or (
             sandbox_path.is_dir() and _sandbox_dir_has_runtime_artifacts(sandbox_path)
         )
@@ -589,14 +637,10 @@ def _remove_deleted_app_filesystem_artifacts(
 
 
 def _control_dir_has_runtime_artifacts(path: Path) -> bool:
-    return any(
-        (path / filename).exists()
-        for filename in (
-            "spec.json",
-            "bootstrap.json",
-            "failure.json",
-            "bootstrap.lock",
-        )
+    return (
+        (path / "spec.json").exists()
+        or (path / "bootstrap.lock").exists()
+        or ((path / "bootstrap.json").exists() and not (path / "failure.json").exists())
     )
 
 
@@ -984,7 +1028,7 @@ async def _cleanup_failed_new_app_runtimes(
         if removed_files:
             actions.extend(f"removed {path}" for path in removed_files)
         removed_artifacts = _clear_runtime_artifacts_for_recreate(
-            settings, backend_name, clear_lock=True
+            settings, backend_name, clear_lock=True, preserve_failure=True
         )
         if removed_artifacts:
             actions.extend(f"removed {name}" for name in removed_artifacts)
@@ -1323,6 +1367,10 @@ async def _seed_persistent_guest_rootfs(
     allow_reseed: bool = False,
 ) -> dict[str, Any]:
     expected_profile = _expected_profile_state(backend)
+    # The shared directory is traversable; each root-owned guest directory is
+    # private and receives only its allocated UID's traversal ACL at startup.
+    protect_sandbox_directory(settings.app_sandbox_dir)
+    settings.app_sandbox_dir.chmod(0o755)
     sandbox_dir = app_sandbox_rootfs_path(settings, backend.name).parent
     protect_sandbox_directory(sandbox_dir)
     rootfs_dir = app_sandbox_rootfs_path(settings, backend.name)
@@ -1447,6 +1495,10 @@ async def _seed_persistent_guest_rootfs(
                 guest_symlink_roots={PurePosixPath()},
                 guest_metadata_roots={PurePosixPath()},
             )
+        # Exported images may omit a root-directory entry. The extractor's
+        # private staging mode must not become guest /: nonroot services need
+        # traversal. Its enclosing TemporaryDirectory and sandbox stay private.
+        extracted_rootfs.chmod(0o755)
         _record_guest_seed_step(settings, backend, "seed_archive_extract", "succeeded")
         (extracted_rootfs / "etc").mkdir(parents=True, exist_ok=True)
         machine_id_path = extracted_rootfs / "etc/machine-id"
@@ -2814,11 +2866,15 @@ def _guest_systemd_state(
         EXEC_CIRCUIT_OPEN_RETURN_CODE: "circuit_open",
         EXEC_GUARD_BUSY_RETURN_CODE: "guard_busy",
         EXEC_GUARD_UNAVAILABLE_RETURN_CODE: "guard_unavailable",
-        124: "timeout",
+        124: "guest_deadline_or_exit_124",
     }.get(system_state_result.returncode, "completed")
-    exec_timed_out = exec_outcome == "timeout"
+    if system_state_result.timed_out:
+        exec_outcome = "timeout"
+    elif system_state_result.deadline_before_start:
+        exec_outcome = "deadline_before_exec"
+    exec_timed_out = system_state_result.timed_out
     ready = (
-        not exec_timed_out
+        system_state_result.ok
         and system_state in {"running", "degraded"}
         and multi_user_target == "active"
     )
@@ -2934,10 +2990,16 @@ def _clear_runtime_artifacts_for_recreate(
     backend_name: str,
     *,
     clear_lock: bool,
+    preserve_failure: bool = False,
 ) -> list[str]:
     backend_dir = control_dir(settings, backend_name)
     removed: list[str] = []
-    for filename in ("spec.json", "bootstrap.json", "failure.json"):
+    filenames = (
+        ("spec.json",)
+        if preserve_failure
+        else ("spec.json", "bootstrap.json", "failure.json")
+    )
+    for filename in filenames:
         if _remove_runtime_artifact(backend_dir / filename):
             removed.append(filename)
     if clear_lock and _remove_runtime_artifact(backend_dir / "bootstrap.lock"):

@@ -1,0 +1,26 @@
+{% set cf = detail.get('cloudflare', {}) %}
+{% if cf.get('visible') %}
+<div class="input-shield-card cf-domain-card" data-cf-domain-card>
+  <div class="section-head input-shield-head"><h3>Cloudflare</h3><span class="summary-pill">{{ cf.zone or 'Reconnect required' }}</span></div>
+  {% if not cf.available %}<p class="subtle">Reconnect Cloudflare in Settings to manage this domain.</p>{% endif %}
+  <form data-cf-domain-form data-input-id="{{ item.id }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="cf-domain-fields">
+      <label>Certificate
+        <select name="provider">
+          <option value="self_signed" {% if cf.provider == 'self_signed' %}selected{% endif %}>Self-signed · Full</option>
+          <option value="cloudflare_origin" {% if cf.provider == 'cloudflare_origin' %}selected{% endif %} {% if not cf.available %}disabled{% endif %}>Cloudflare Origin CA · Full (strict)</option>
+        </select>
+      </label>
+      <label class="toggle cf-dns-toggle"><input name="manage_dns" type="checkbox" {% if cf.dns_enabled %}checked{% endif %}><span>Manage DNS</span></label>
+      <label data-cf-ipv4-field {% if not cf.dns_enabled %}hidden{% endif %}>Serving node IPv4
+        <input name="ipv4" value="{{ cf.ipv4 }}" placeholder="e.g. 192.0.2.10" autocomplete="off" spellcheck="false" {% if not cf.dns_enabled %}disabled{% endif %}>
+      </label>
+    </div>
+    <p class="subtle">DNS records are proxied through Cloudflare.</p>
+    {% if cf.error %}<p class="cf-message is-error">{{ cf.error }}</p>{% endif %}
+    <div class="editor-actions"><span class="subtle">{{ cf.status }}</span><button type="submit" class="ghost">Preview changes</button></div>
+    <p class="cf-message" data-cf-domain-message role="status"></p>
+  </form>
+</div>
+{% endif %}

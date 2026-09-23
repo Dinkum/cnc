@@ -7,6 +7,10 @@ from pathlib import Path
 from app.config import Settings
 from app.models.entities import ApplyRun, BackendBackup
 from app.schemas.apply import ApplyResponse
+from app.services.outcome_presentation import (
+    mutation_recovery_detail,
+    present_mutation_outcome,
+)
 from app.services.update_service import current_app_version
 from app.static_delivery import stylesheet_asset_version
 
@@ -301,25 +305,13 @@ def _save_job_error_meta(details: dict[str, object]) -> dict[str, str] | None:
 def _save_job_status_label(
     status: str | None, details: dict[str, object] | None = None
 ) -> str:
-    normalized = str(status or "").strip().lower()
-    if normalized == "success":
-        return "saved"
-    if normalized == "error":
-        return "failed"
-    if normalized in {"queued", "pending"}:
-        return "queued"
-    if normalized == "running":
-        return "running"
-    return normalized or "unknown"
+    return present_mutation_outcome(status, details).status_label
 
 
-def _save_job_tone(status: str | None) -> str:
-    return _tone_for_value(
-        status,
-        success_values={"success"},
-        queued_values={"queued", "pending", "running"},
-        error_values={"error", "failed"},
-    )
+def _save_job_tone(
+    status: str | None, details: dict[str, object] | None = None
+) -> str:
+    return present_mutation_outcome(status, details).tone
 
 
 def _save_job_counts(details: dict[str, object]) -> list[str]:
@@ -603,11 +595,8 @@ def _save_job_detail_dump(details: dict[str, object]) -> str | None:
     if command:
         rows.append(("command", command))
 
-    failure_mode = str(details.get("failure_mode") or "").strip()
-    if failure_mode.lower() == "partial":
-        rows.append(("host state", "partially updated before failure"))
-    elif failure_mode.lower() == "clean":
-        rows.append(("host state", "previous config still active"))
+    if details.get("failure_mode") or details.get("commit_outcome"):
+        rows.append(("recovery", mutation_recovery_detail(details)))
 
     counts = _save_job_counts(details)
     if counts:
@@ -656,12 +645,8 @@ def _save_job_failure_copy(
     if error:
         return headline, error
 
-    failure_mode = str(details.get("failure_mode") or "").strip().lower()
-    if failure_mode == "partial":
-        return headline, "Some host changes may already be active."
-    if failure_mode == "clean":
-        return headline, "Previous config is still active."
-    return headline, message or "No detailed reason was reported."
+    recovery = mutation_recovery_detail(details)
+    return headline, recovery or message or "No detailed reason was reported."
 
 
 def _save_job_summary(
@@ -696,7 +681,8 @@ def _save_job_summary(
     else:
         return None
 
-    tone = _save_job_tone(str(status or ""))
+    presentation = present_mutation_outcome(str(status or ""), details)
+    tone = presentation.tone
     status_label = _save_job_status_label(str(status or ""), details)
     phase = _save_job_primary_phase(details) or None
     if run_id is None and not status and not message and not details and not created_at:
@@ -706,21 +692,25 @@ def _save_job_summary(
     phase_rows = _save_job_phase_rows(details)
     detail_dump = _save_job_detail_dump(details) if include_detail_dump else None
 
-    if str(status or "").lower() == "success":
+    if presentation.status_label == "saved":
         headline = "Host updated."
         note = (
             ", ".join(counts)
             if counts
-            else (message or "Host state converged successfully.")
+            else (
+                presentation.recovery_detail
+                or message
+                or "Host state converged successfully."
+            )
         )
-    elif str(status or "").lower() == "error":
+    elif presentation.status_label == "failed":
         headline, note = _save_job_failure_copy(details, message=message, phase=phase)
     else:
         headline = "Save state updated."
         note = message or "Save state updated."
 
     meta = []
-    if str(status or "").strip().lower() == "error":
+    if presentation.status_label == "failed":
         error_meta = _save_job_error_meta(details)
         meta.insert(0, error_meta or _save_job_id_meta(run_id))
     if created_at:
@@ -747,9 +737,10 @@ def _save_apply_feedback(
     success_message: str,
     failure_prefix: str,
 ) -> tuple[str | None, str | None]:
-    if response.status == "success":
-        return f"{success_message} Host updated.", None
     details = response.details if isinstance(response.details, dict) else {}
+    presentation = present_mutation_outcome(response.status, details)
+    if presentation.status_label == "saved":
+        return f"{success_message} Host updated.", None
     phase = _save_job_primary_phase(details)
     backend = _save_job_backend_name(details)
     error = _save_job_root_cause(details) or str(response.message).strip()
@@ -767,14 +758,9 @@ def _save_apply_feedback(
     error_ref = ""
     if details.get("error_code") and details.get("error_inst"):
         error_ref = f" (Error {details['error_code']}-{details['error_inst']})"
-    if str(details.get("failure_mode") or "").strip().lower() == "partial":
-        return None, (
-            f"Save failed{error_ref}. Some host changes may already be active. "
-            f"Reason: {reason}"
-        )
     return (
         None,
-        f"Save failed{error_ref}. Existing config is still active. Reason: {reason}",
+        f"Save failed{error_ref}. {presentation.recovery_detail} Reason: {reason}",
     )
 
 

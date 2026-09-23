@@ -393,11 +393,25 @@ def _startup_self_audit_signature(exc: ControlPlaneSelfAuditError) -> str:
 
 
 def _startup_self_audit_failure_title(exc: ControlPlaneSelfAuditError) -> str:
-    return (
-        "CNC host safeguard violation"
-        if exc.blocks_apply
-        else "CNC host hardening drift detected"
-    )
+    findings = exc.blocking_findings if exc.blocks_apply else exc.warning_findings
+    checks = {
+        str(item.get("check") or "").strip()
+        for item in findings
+        if isinstance(item, dict)
+    }
+    components = {
+        "admin_loopback_bind": "admin listener",
+        "admin_runtime_write_paths": "admin runtime",
+        "nginx_admin_reference": "admin proxy",
+        "tailscale_admin_exposure": "admin exposure",
+        "firewall_restrictions": "firewall",
+        "app_network_isolation": "output isolation",
+        "sshd_global_policy": "SSH policy",
+    }
+    component = components.get(next(iter(checks))) if len(checks) == 1 else None
+    if exc.blocks_apply:
+        return f"CNC {component or 'host'} safeguard violation"
+    return f"CNC {component or 'host safeguards'} need attention"
 
 
 def _startup_self_audit_failure_message(exc: ControlPlaneSelfAuditError) -> str:
@@ -409,9 +423,9 @@ def _startup_self_audit_failure_message(exc: ControlPlaneSelfAuditError) -> str:
         top_finding = str(findings[0].get("message") or "").strip()
     return build_operator_message(
         (
-            "Critical host guardrail drift detected during CNC startup. CNC stayed online."
+            "A critical host safeguard failed verification during CNC startup. CNC stayed online."
             if exc.blocks_apply
-            else "Host hardening drift detected during CNC startup. CNC stayed online."
+            else "A host safeguard needs attention after startup verification. CNC stayed online."
         ),
         status="failure" if exc.blocks_apply else "warning",
         facts=[
@@ -422,10 +436,29 @@ def _startup_self_audit_failure_message(exc: ControlPlaneSelfAuditError) -> str:
     )
 
 
+def _startup_self_audit_recovered_title(previous_signature: str) -> str:
+    checks = {
+        part.split(":", 2)[1]
+        for part in previous_signature.split("|")
+        if len(part.split(":", 2)) == 3
+    }
+    components = {
+        "admin_loopback_bind": "admin listener",
+        "admin_runtime_write_paths": "admin runtime",
+        "nginx_admin_reference": "admin proxy",
+        "tailscale_admin_exposure": "admin exposure",
+        "firewall_restrictions": "firewall",
+        "app_network_isolation": "output isolation",
+        "sshd_global_policy": "SSH policy",
+    }
+    component = components.get(next(iter(checks))) if len(checks) == 1 else None
+    return f"CNC {component or 'host safeguards'} recovered"
+
+
 def _startup_self_audit_recovered_message(previous_signature: str) -> str:
     findings = [item.strip() for item in previous_signature.split("|") if item.strip()]
     return build_operator_message(
-        "Startup host drift cleared.",
+        "Startup verification confirms the previously reported safeguard issue is cleared.",
         status="success",
         facts=[
             ("cleared_findings", summarize_list(findings, limit=2) if findings else ""),
@@ -571,7 +604,7 @@ async def handle_startup_self_audit_notification(
     if should_notify_recovery:
         notified = await send_pushover_notification_async(
             settings,
-            title="CNC host drift cleared",
+            title=_startup_self_audit_recovered_title(recovery_signature),
             message=_startup_self_audit_recovered_message(recovery_signature),
             priority=0,
             event="host_drift_cleared",

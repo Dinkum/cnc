@@ -14,6 +14,7 @@ from app.logger import logging_pipeline_status
 from app.models.entities import Operation
 from app.security import get_csrf_token
 from app.services.operation_progress import read_operation_progress
+from app.services.outcome_presentation import present_mutation_outcome
 from app.services.operation_runtime import (
     CREATE_BACKEND_PROGRESS_POINTS,
     create_backend_runtime_progress,
@@ -121,18 +122,46 @@ async def operation_history(
     settings: Settings = Depends(settings_dependency),
     session: AsyncSession = Depends(db_session_dependency),
 ) -> dict[str, object]:
-    query = select(Operation).where(
+    base_query = select(Operation).where(
         Operation.status.in_(("success", "failed", "partial", "cancelled"))
     )
-    if status != "all":
-        query = query.where(Operation.status == status)
-    if before is not None:
-        query = query.where(Operation.id < before)
-    records = list(
-        (
-            await session.execute(query.order_by(Operation.id.desc()).limit(limit + 1))
-        ).scalars()
-    )
+    if status in {"success", "failed"}:
+        wanted_label = "saved" if status == "success" else "failed"
+        records: list[Operation] = []
+        cursor = before
+        batch_size = max(100, limit + 1)
+        while len(records) < limit + 1:
+            query = base_query
+            if cursor is not None:
+                query = query.where(Operation.id < cursor)
+            batch = list(
+                (
+                    await session.execute(
+                        query.order_by(Operation.id.desc()).limit(batch_size)
+                    )
+                ).scalars()
+            )
+            records.extend(
+                operation
+                for operation in batch
+                if _operation_presentation(operation).status_label == wanted_label
+            )
+            if len(batch) < batch_size:
+                break
+            cursor = batch[-1].id
+    else:
+        query = base_query
+        if status != "all":
+            query = query.where(Operation.status == status)
+        if before is not None:
+            query = query.where(Operation.id < before)
+        records = list(
+            (
+                await session.execute(
+                    query.order_by(Operation.id.desc()).limit(limit + 1)
+                )
+            ).scalars()
+        )
     page = records[:limit]
     return {
         "operations": [operation_payload(operation, settings) for operation in page],
@@ -242,9 +271,22 @@ def operation_payload(operation: Operation, settings: Settings) -> dict:
         "backend_id": operation.backend_id,
         "error": error,
         "details": details,
+        "presentation": present_mutation_outcome(
+            status, details if isinstance(details, dict) else None
+        ).as_dict(),
         "started_at": utc_isoformat(operation.started_at),
         "finished_at": utc_isoformat(operation.finished_at),
     }
+
+
+def _operation_presentation(operation: Operation):
+    try:
+        details = json.loads(operation.details_json or "{}")
+    except json.JSONDecodeError:
+        details = {}
+    return present_mutation_outcome(
+        operation.status, details if isinstance(details, dict) else None
+    )
 
 
 @router.get("/operations/{operation_id}/events")

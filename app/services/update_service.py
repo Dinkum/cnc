@@ -636,10 +636,7 @@ def _build_launch_command(
     unit_name: str,
     script_path: Path,
     log_path: Path,
-    *,
-    runtime_timeout_sec: int,
 ) -> list[str]:
-    runtime_timeout = max(1, int(runtime_timeout_sec))
     return [
         "systemd-run",
         "--no-block",
@@ -650,9 +647,7 @@ def _build_launch_command(
         "--property",
         "Type=oneshot",
         "--property",
-        f"RuntimeMaxSec={runtime_timeout}s",
-        "--property",
-        f"TimeoutStartSec={runtime_timeout}s",
+        "TimeoutStartSec=infinity",
         "--property",
         f"StandardOutput=append:{log_path}",
         "--property",
@@ -661,8 +656,8 @@ def _build_launch_command(
     ]
 
 
-def _update_launch_timeout(settings: Settings) -> int:
-    return min(settings.command_timeout_update_sec, UPDATE_LAUNCH_TIMEOUT_SEC)
+def _update_launch_timeout() -> int:
+    return UPDATE_LAUNCH_TIMEOUT_SEC
 
 
 async def _create_update_run(
@@ -1060,7 +1055,7 @@ async def run_update(session: AsyncSession, settings: Settings) -> ApplyResponse
         "update.run.requested",
         script=str(script_path),
         log_path=str(log_path),
-        timeout_sec=settings.command_timeout_update_sec,
+        launch_timeout_sec=_update_launch_timeout(),
     )
     if not script_path.exists():
         details = {
@@ -1176,7 +1171,6 @@ async def run_update(session: AsyncSession, settings: Settings) -> ApplyResponse
                 unit_name,
                 script_path,
                 log_path,
-                runtime_timeout_sec=settings.command_timeout_update_sec,
             )
             details = {
                 "script": str(script_path),
@@ -1197,7 +1191,7 @@ async def run_update(session: AsyncSession, settings: Settings) -> ApplyResponse
             )
             await run_command_checked_async(
                 launch_command,
-                timeout_sec=_update_launch_timeout(settings),
+                timeout_sec=_update_launch_timeout(),
             )
             await operation.complete(
                 "success",

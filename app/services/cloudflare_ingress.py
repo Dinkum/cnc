@@ -64,11 +64,15 @@ def build_cloudflare_ingress_policy(cidrs: Iterable[str]) -> CloudflareIngressPo
     return CloudflareIngressPolicy(cidrs=tuple(normalized))
 
 
+RULES_SECTION_HEADER = "### RULES ###\n"
+RULES_SECTION_FOOTER = "### END RULES ###\n"
+
+
 def _split_ufw_rules_section(text: str) -> tuple[str, str, str]:
-    before, separator, remainder = text.partition("### RULES ###\n")
+    before, separator, remainder = text.partition(RULES_SECTION_HEADER)
     if not separator:
         raise RuntimeError("ufw rules file is missing the RULES section header")
-    rules_body, separator_end, after = remainder.partition("### END RULES ###\n")
+    rules_body, separator_end, after = remainder.partition(RULES_SECTION_FOOTER)
     if not separator_end:
         raise RuntimeError("ufw rules file is missing the RULES section footer")
     return before, rules_body, after

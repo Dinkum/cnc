@@ -80,6 +80,10 @@ def format_logs_text(payload: dict[str, object]) -> str:
         f"sources_available: {'yes' if payload.get('sources_available') else 'no'}",
         f"requested_lines: {payload.get('requested_lines')}",
     ]
+    if payload.get("saved_only"):
+        lines.append(
+            "collection_scope: saved diagnostics; output record no longer exists"
+        )
     if sources:
         for source in sources:
             if not isinstance(source, dict):
@@ -323,11 +327,16 @@ async def logs_app_async(
     lines: int,
     settings: Settings,
 ) -> CommandResult:
-    from app.services.app_logs import collect_app_backend_logs
+    from app.services.app_logs import collect_app_backend_logs, collect_saved_app_logs
 
     backend = await load_backend_async(backend_name)
     if backend is None:
-        return 1, None, f"backend not found: {backend_name}"
+        payload = await asyncio.to_thread(
+            collect_saved_app_logs, backend_name, settings, lines=lines
+        )
+        if payload is None:
+            return 1, None, f"backend not found: {backend_name}"
+        return 0, payload, None
     payload = await asyncio.to_thread(
         collect_app_backend_logs, backend, settings, lines=lines
     )

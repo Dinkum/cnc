@@ -45,6 +45,7 @@ def render_nginx_http(
     *,
     cloudflare_only: bool = False,
     cloudflare_ips: tuple[str, ...] = (),
+    tls_certificate: str | None = None,
     shield_enabled: bool = False,
     shield_port: int = SHIELD_PORT,
     shield_target: int | str | None = None,
@@ -89,6 +90,15 @@ def render_nginx_http(
         ]
     )
     lines.extend(_cloudflare_acl_lines(cloudflare_only, cloudflare_ips))
+    if tls_certificate:
+        lines.extend(
+            [
+                "    listen 443 ssl;",
+                f'    ssl_certificate "{tls_certificate}";',
+                f'    ssl_certificate_key "{tls_certificate}";',
+                "    ssl_protocols TLSv1.2 TLSv1.3;",
+            ]
+        )
     if shield_enabled:
         lines.extend(
             [
@@ -192,6 +202,7 @@ def render_nginx_static(
     *,
     cloudflare_only: bool = False,
     cloudflare_ips: tuple[str, ...] = (),
+    tls_certificate: str | None = None,
     shield_enabled: bool = False,
     shield_port: int = SHIELD_PORT,
     shield_target: int | str | None = None,
@@ -224,6 +235,15 @@ def render_nginx_static(
         ]
     )
     lines.extend(_cloudflare_acl_lines(cloudflare_only, cloudflare_ips))
+    if tls_certificate:
+        lines.extend(
+            [
+                "    listen 443 ssl;",
+                f'    ssl_certificate "{tls_certificate}";',
+                f'    ssl_certificate_key "{tls_certificate}";',
+                "    ssl_protocols TLSv1.2 TLSv1.3;",
+            ]
+        )
     if shield_enabled:
         lines.extend(
             [
@@ -318,3 +338,18 @@ def render_follower_admin_proxy(
             "",
         ]
     )
+
+
+def render_nginx_https_default(
+    *, cloudflare_only: bool = False, cloudflare_ips: tuple[str, ...] = ()
+) -> str:
+    # Reject unknown/disabled SNI names rather than serving the first HTTPS app.
+    lines = [
+        "server {",
+        "    listen 443 ssl default_server;",
+        "    ssl_reject_handshake on;",
+        "    ssl_protocols TLSv1.2 TLSv1.3;",
+    ]
+    lines.extend(_cloudflare_acl_lines(cloudflare_only, cloudflare_ips))
+    lines.extend(["    return 404;", "}", ""])
+    return "\n".join(lines)

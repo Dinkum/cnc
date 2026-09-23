@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
+from app.services.config_change import full_reconcile
 from app.dependencies import (
     csrf_api_dependency,
     db_session_dependency,
@@ -23,7 +24,10 @@ async def apply_all(
     _csrf: None = Depends(csrf_api_dependency),
 ) -> ApplyResponse:
     logger.info("apply.api.requested")
-    response = await run_apply(session, settings)
+    # The apply endpoint is the explicit whole-host reconcile.
+    response = await run_apply(
+        session, settings, scope=full_reconcile("api.host.apply").scope()
+    )
     logger.info("apply.api.completed", status=response.status)
     if (
         response.status == "error"

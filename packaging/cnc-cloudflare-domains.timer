@@ -1,0 +1,11 @@
+[Unit]
+Description=cnc daily Cloudflare DNS and origin certificate check
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1d
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

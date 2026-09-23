@@ -200,6 +200,7 @@ def app_action_hints(
     if issue_set & {
         "bridge_dns_enabled",
         "container_missing",
+        "container_not_running",
         "legacy_loopback_proxy_present",
         "loopback_publish_missing",
         "missing_saved_spec",

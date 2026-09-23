@@ -23,7 +23,7 @@ from app.schemas.backends import (
     BackendUpdate,
 )
 from app.services import backend_commands
-from app.services.mutation_apply import commit_and_apply
+from app.services.config_change import converge_change, output_change
 from app.services.status_service import invalidate_status_cache
 from app.services.validators import ValidationError
 
@@ -65,8 +65,10 @@ async def create_backend(
     )
     try:
         backend = await backend_commands.create_backend(session, payload, commit=False)
-        result = await commit_and_apply(
-            session, settings, operation="api.backend.create"
+        result = await converge_change(
+            session,
+            settings,
+            change=output_change("api.backend.create", backend.name),
         )
         if not result.applied:
             raise_apply_failure(result.apply_response.details)
@@ -119,8 +121,10 @@ async def update_backend(
         backend = await backend_commands.update_backend(
             session, backend_id, payload, commit=False
         )
-        result = await commit_and_apply(
-            session, settings, operation="api.backend.update"
+        result = await converge_change(
+            session,
+            settings,
+            change=output_change("api.backend.update", backend.name),
         )
         if not result.applied:
             raise_apply_failure(result.apply_response.details)
@@ -183,8 +187,10 @@ async def toggle_backend(
             BackendUpdate(enabled=payload.enabled),
             commit=False,
         )
-        result = await commit_and_apply(
-            session, settings, operation="api.backend.toggle"
+        result = await converge_change(
+            session,
+            settings,
+            change=output_change("api.backend.toggle", backend.name),
         )
         if not result.applied:
             raise_apply_failure(result.apply_response.details)

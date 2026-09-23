@@ -14,6 +14,7 @@ from app.services.operation_runtime import (
     progress_plan_value,
 )
 from app.services.operations import OperationHandle, OperationHandleProxy
+from app.services.outcome_presentation import mutation_outcome_facts
 from app.ui.view_models import _save_apply_feedback
 
 ProgressStepRule = tuple[tuple[tuple[str, ...], ...], tuple[str, str]]
@@ -133,30 +134,20 @@ def _backend_input_kinds(backend: Backend) -> list[str]:
     ]
 
 
-def _apply_slice_changed(apply_plan: object | None, name: str) -> bool:
-    if apply_plan is None:
-        return True
-    slice_changed = getattr(apply_plan, "slice_changed", None)
-    if callable(slice_changed):
-        return bool(slice_changed(name))
-    changed_slices = getattr(apply_plan, "changed_slices", ())
-    return name in set(changed_slices or ())
-
-
 def _create_output_progress_plan_for_apply(
     backend: Backend,
     *,
     desired: object | None = None,
-    apply_plan: object | None = None,
 ) -> dict[str, object]:
+    """Which progress steps this save will show.
+
+    Derived from the output and the desired state, not from a prediction of
+    which apply slices will change. The slice prediction is gone: convergence
+    decides what to do by reading the host, so nothing here can know in advance
+    what will be touched, and guessing produced a card that omitted steps the
+    apply then ran.
+    """
     input_kinds = _backend_input_kinds(backend)
-    full_apply = bool(getattr(apply_plan, "full_apply_required", False))
-    changed_slices = {
-        str(item) for item in (getattr(apply_plan, "changed_slices", ()) or ())
-    }
-    runtime_slice_changed = full_apply or any(
-        item.startswith("runtime.backend.") for item in changed_slices
-    )
     known_app_backends = getattr(desired, "known_app_backends", ()) if desired else ()
     desired_tailnet_paths = getattr(desired, "tailscale_paths", {}) if desired else {}
     desired_tailnet_services = (
@@ -164,54 +155,31 @@ def _create_output_progress_plan_for_apply(
     )
     desired_cluster_nodes = getattr(desired, "cluster_nodes", ()) if desired else ()
     desired_shield_required = bool(getattr(desired, "shield_required", False))
-    ingress_changed = _apply_slice_changed(apply_plan, "nginx.managed")
-    tailscale_changed = _apply_slice_changed(apply_plan, "tailscale")
-    audit_changed = any(
-        _apply_slice_changed(apply_plan, name)
-        for name in (
-            "host_base",
-            "network_isolation",
-            "nginx.managed",
-            "cluster_followers",
-            "shield",
-            "tailscale",
-        )
-    )
     return create_output_progress_plan(
         backend_kind=backend.kind,
         input_kinds=input_kinds,
-        include_runtime=backend.kind == "app"
-        and (apply_plan is None or runtime_slice_changed),
-        include_runtime_inspection=(
-            backend.kind == "app" or bool(known_app_backends) or runtime_slice_changed
-        ),
+        include_runtime=backend.kind == "app",
+        include_runtime_inspection=(backend.kind == "app" or bool(known_app_backends)),
         include_tailnet_paths=(
-            (tailscale_changed and bool(desired_tailnet_paths))
+            bool(desired_tailnet_paths)
             if desired is not None
             else "tailnet_path" in input_kinds
         ),
         include_tailnet_services=(
-            (tailscale_changed and bool(desired_tailnet_services))
+            bool(desired_tailnet_services)
             if desired is not None
             else "tailnet_service" in input_kinds
         ),
-        include_host_assets=_apply_slice_changed(apply_plan, "host_base"),
+        include_host_assets=True,
         include_shield=(
             backend.kind == "shield"
             or bool(getattr(backend, "shield_enabled", False))
-            or (
-                desired is not None
-                and _apply_slice_changed(apply_plan, "shield")
-                and desired_shield_required
-            )
+            or (desired is not None and desired_shield_required)
         ),
-        include_cluster=(
-            _apply_slice_changed(apply_plan, "cluster_followers")
-            and bool(desired_cluster_nodes)
-        ),
-        include_ingress=ingress_changed,
-        include_admin_verify=ingress_changed or tailscale_changed,
-        include_audit=apply_plan is None or audit_changed,
+        include_cluster=bool(desired_cluster_nodes),
+        include_ingress=True,
+        include_admin_verify=True,
+        include_audit=True,
     )
 
 
@@ -438,6 +406,7 @@ async def _complete_input_operation(
             for key in ("error_code", "error_inst", "failed_backend", "failure_mode")
             if key in apply_response.details
         },
+        **mutation_outcome_facts(apply_response.details),
         **({"input_id": input_id} if input_id is not None else {}),
         **({"input_value": input_value} if input_value else {}),
         **(extra_details or {}),
@@ -703,6 +672,7 @@ async def _complete_output_save_operation(
         "apply_status": apply_response.status,
         "run_id": apply_response.run_id,
         "backend_id": backend_id,
+        **mutation_outcome_facts(apply_response.details),
         **({"backend_name": backend_name} if backend_name else {}),
         **(extra_details or {}),
     }

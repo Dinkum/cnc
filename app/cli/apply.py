@@ -5,6 +5,7 @@ import json
 
 from app.cli.common import CommandResult, bind_command
 from app.config import Settings
+from app.services.outcome_presentation import present_mutation_outcome
 
 
 def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -20,13 +21,19 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
 
 def format_apply_text(payload: dict[str, object]) -> str:
     details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+    presentation = present_mutation_outcome(payload.get("status"), details)
+    message = str(payload.get("message") or "-")
+    if presentation.status_label == "failed" and "partially failed" in message:
+        message = "apply failed"
     lines = [
         "scope: full converge (routing + publication + guests)",
-        f"status: {payload.get('status') or '-'}",
-        f"message: {payload.get('message') or '-'}",
+        f"status: {presentation.status_label}",
+        f"message: {message}",
         f"run_id: {payload.get('run_id') or '-'}",
         f"created_at: {payload.get('created_at') or '-'}",
     ]
+    if presentation.recovery_detail:
+        lines.append(f"recovery: {presentation.recovery_detail}")
     if isinstance(details, dict):
         if details.get("phase") or details.get("failed_phase"):
             lines.append(
@@ -91,9 +98,17 @@ def format_apply_text(payload: dict[str, object]) -> str:
 async def apply_async(settings: Settings) -> CommandResult:
     from app.database import SessionLocal
     from app.services.apply_service import run_apply
+    from app.services.config_change import full_reconcile
 
     async with SessionLocal() as session:
-        response = await run_apply(session, settings)
+        # The CLI apply is the explicit whole-host reconcile. It is the only
+        # entry point permitted to repair things nobody specifically asked
+        # about; every ordinary save is scoped to what it changed.
+        response = await run_apply(
+            session,
+            settings,
+            scope=full_reconcile("cli.host.reconcile").scope(),
+        )
     payload = json.loads(response.model_dump_json())
     return (0 if response.status == "success" else 2), payload, None
 

@@ -1,0 +1,36 @@
+<dialog class="cf-dialog" id="cloudflare-setup" aria-labelledby="cloudflare-setup-title">
+  <div class="cf-dialog-card">
+    <div class="section-head"><h2 id="cloudflare-setup-title">Configure Cloudflare</h2><button type="button" class="ghost modal-close-button" data-cf-close aria-label="Close Cloudflare setup">&times;</button></div>
+    <p class="subtle">Create an API token with access to the domains you want CNC to manage.</p>
+    <ol class="cf-setup-steps">
+      <li><a href="https://dash.cloudflare.com/profile/api-tokens" target="_blank" rel="noopener noreferrer">Open Cloudflare API tokens ↗</a> and choose <strong>Create Custom Token</strong>.</li>
+      <li>Add these permissions:</li>
+    </ol>
+    <div class="cf-scopes">
+      <div><span>Zone · Zone</span><strong>Read</strong></div>
+      <div><span>Zone · DNS</span><strong>Edit</strong></div>
+      <div><span>Zone · SSL and Certificates</span><strong>Edit</strong></div>
+    </div>
+    <p class="subtle">Under <strong>Zone Resources</strong>, include only the zones you want to use. Create the token, then paste it below.</p>
+    <form data-cf-connect-form>
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label>API token<input name="api_token" type="password" placeholder="Paste your API token" autocomplete="new-password" spellcheck="false" required></label>
+      <p class="cf-message" data-cf-connect-message role="status"></p>
+      <div class="editor-actions"><button type="button" class="ghost" data-cf-close>Cancel</button><button type="submit">Test and connect</button></div>
+    </form>
+  </div>
+</dialog>
+<dialog class="cf-dialog" id="cloudflare-preview" aria-labelledby="cloudflare-preview-title">
+  <div class="cf-dialog-card">
+    <div class="section-head"><h2 id="cloudflare-preview-title">Review Cloudflare changes</h2><button type="button" class="ghost modal-close-button" data-cf-close aria-label="Close Cloudflare preview">&times;</button></div>
+    <strong class="cf-preview-host" data-cf-preview-host></strong>
+    <div class="cf-preview-lines">
+      <div><span class="metric-label">certificate</span><p data-cf-preview-certificate></p></div>
+      <div><span class="metric-label">current DNS</span><p data-cf-preview-before></p></div>
+      <div><span class="metric-label">after</span><p data-cf-preview-after></p></div>
+    </div>
+    <p class="subtle" data-cf-mode-note>Cloudflare's zone-wide encryption mode will stay unchanged.</p>
+    <p class="cf-message" data-cf-preview-message role="status"></p>
+    <div class="editor-actions"><button type="button" class="ghost" data-cf-close>Cancel</button><button type="button" data-cf-apply>Apply changes</button></div>
+  </div>
+</dialog>

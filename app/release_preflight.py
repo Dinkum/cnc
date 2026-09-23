@@ -5,12 +5,16 @@ import asyncio
 import importlib
 import os
 from pathlib import Path
+import shlex
 import shutil
 import sqlite3
+import sys
 import tempfile
 
 
 SQLITE_PREFIX = "sqlite+aiosqlite:///"
+#: Releases this build supports. Mirrors `require_ubuntu` in the installer.
+SUPPORTED_UBUNTU_RELEASES = frozenset({"24.04", "26.04"})
 
 
 def _sqlite_path_from_url(database_url: str) -> Path:
@@ -47,7 +51,148 @@ async def _run_database_startup_check(database_url: str) -> None:
     await database.init_db()
 
 
-def run_release_preflight(database_url: str) -> None:
+class ReleaseIncompatibleError(RuntimeError):
+    """This release cannot run on this host, established before it is switched."""
+
+
+def _staged_installer_remedy() -> str:
+    release_root = Path(__file__).resolve().parent.parent
+    return f"cd {shlex.quote(str(release_root))} && sudo bash scripts/install_ubuntu.sh"
+
+
+def check_host_release() -> str:
+    """Refuse an OS this release does not support.
+
+    Lives here rather than only in the updater script because the updater that
+    runs the *first* upgrade is the one already installed on the host, and it
+    predates any shell-level gate. What every updater since v0.1.104 does run,
+    from the new release and before the switch, is this module. Putting the
+    check here is what makes it apply to the upgrade that installs it.
+    """
+    os_release = Path("/etc/os-release")
+    if not os_release.exists():
+        raise ReleaseIncompatibleError("cannot detect OS: missing /etc/os-release")
+    fields: dict[str, str] = {}
+    for line in os_release.read_text(encoding="utf-8").splitlines():
+        if "=" in line and not line.startswith("#"):
+            key, value = line.split("=", 1)
+            fields[key.strip()] = value.strip().strip('"').strip("'")
+    if fields.get("ID") != "ubuntu":
+        raise ReleaseIncompatibleError(
+            f"CNC targets Ubuntu only (detected: {fields.get('ID') or 'unknown'})"
+        )
+    version = fields.get("VERSION_ID", "")
+    if version not in SUPPORTED_UBUNTU_RELEASES:
+        raise ReleaseIncompatibleError(
+            "CNC supports Ubuntu "
+            + " and ".join(sorted(SUPPORTED_UBUNTU_RELEASES))
+            + f" (detected: {version or 'unknown'}). "
+            "The running release was left active."
+        )
+    return version
+
+
+def check_container_runtime() -> str:
+    """Refuse to switch onto a release whose guests this runtime cannot run.
+
+    A host below the guest isolation floor would install cleanly and then fail
+    on its first guest operation. Reported as a refusal before the switch
+    instead, so the working release stays active.
+    """
+    from app.services.guest_isolation import require_supported_podman
+
+    # This release's own installer, at the path it is staged at. An operator
+    # reading the refusal should not have to work out which copy to run: the
+    # old release's installer is exactly the one that cannot help here.
+    remedy = (
+        f"run this release's installer: {_staged_installer_remedy()}. "
+        "The installer activates the release when it succeeds."
+    )
+    try:
+        require_supported_podman()
+    except FileNotFoundError as exc:
+        raise ReleaseIncompatibleError(
+            f"podman is not installed or not on PATH. {remedy}"
+        ) from exc
+    except Exception as exc:
+        raise ReleaseIncompatibleError(f"{exc} {remedy}") from exc
+    return "ok"
+
+
+def check_installed_updater_assets(updater_script_path: Path) -> None:
+    """Ensure the updater running this hop can install the new release's units."""
+    from app.services.runtime_assets import MANAGED_SYSTEMD_ASSETS, MANAGED_TIMER_UNITS
+
+    try:
+        updater = updater_script_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ReleaseIncompatibleError(
+            f"cannot inspect installed updater at {updater_script_path}: {exc}"
+        ) from exc
+
+    # Manifest-aware updaters read the incoming release's complete asset list.
+    # Older updaters use a fixed list, which must be checked item by item.
+    if "UPDATER_ASSET_MANIFEST_V1=1" in updater:
+        return
+
+    missing = [
+        destination
+        for source, destination in MANAGED_SYSTEMD_ASSETS
+        if (
+            f'sync_systemd_asset_from_dir "${{source_dir}}" "packaging/{source}" "{destination}"'
+            not in updater
+        )
+    ]
+    missing.extend(
+        timer
+        for timer in MANAGED_TIMER_UNITS
+        if f"systemctl enable --now {timer}" not in updater
+        and timer not in missing
+    )
+    if missing:
+        raise ReleaseIncompatibleError(
+            "the installed updater cannot activate this release's systemd assets: "
+            + ", ".join(missing)
+            + f". Install this release first: {_staged_installer_remedy()}. "
+            "The installer activates the release when it succeeds."
+        )
+
+
+def check_staged_systemd_assets() -> None:
+    """Catch an incomplete release package before host runtime work begins."""
+    from app.services.runtime_assets import MANAGED_SYSTEMD_ASSETS, MANAGED_TIMER_UNITS
+
+    packaging_dir = Path(__file__).resolve().parent.parent / "packaging"
+    missing = [
+        source
+        for source, _destination in MANAGED_SYSTEMD_ASSETS
+        if not (packaging_dir / source).is_file()
+    ]
+    destinations = {destination for _source, destination in MANAGED_SYSTEMD_ASSETS}
+    missing.extend(timer for timer in MANAGED_TIMER_UNITS if timer not in destinations)
+    if missing:
+        raise ReleaseIncompatibleError(
+            "staged release is missing required systemd assets: "
+            + ", ".join(missing)
+        )
+
+
+def run_release_preflight(
+    database_url: str,
+    *,
+    skip_runtime_check: bool = False,
+    updater_script_path: Path | None = None,
+) -> None:
+    # Only the updater that repairs and rechecks the staged runtime may defer
+    # this check. Older installed updaters call the default path and fail safe.
+    # Host compatibility first: it is the cheapest check and the one whose
+    # failure means nothing else is worth doing.
+    check_host_release()
+    check_staged_systemd_assets()
+    if updater_script_path is not None:
+        check_installed_updater_assets(updater_script_path)
+    if not skip_runtime_check:
+        check_container_runtime()
     source_path = _sqlite_path_from_url(database_url)
     temp_dir = Path(tempfile.mkdtemp(prefix="cnc-release-preflight-"))
     temp_db_path = temp_dir / "preflight.db"
@@ -67,8 +212,28 @@ def run_release_preflight(database_url: str) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m app.release_preflight")
     parser.add_argument("--database-url", required=True)
+    parser.add_argument("--skip-runtime-check", action="store_true")
+    parser.add_argument("--installer-mode", action="store_true")
     args = parser.parse_args(argv)
-    run_release_preflight(args.database_url)
+    updater_script_path = (
+        None
+        if args.installer_mode
+        else Path(
+            os.environ.get(
+                "UPDATER_SCRIPT_PATH",
+                "/var/lib/cnc/current/scripts/update_from_github.sh",
+            )
+        )
+    )
+    try:
+        run_release_preflight(
+            args.database_url,
+            skip_runtime_check=args.skip_runtime_check,
+            updater_script_path=updater_script_path,
+        )
+    except ReleaseIncompatibleError as exc:
+        print(f"[preflight][error] {exc}", file=sys.stderr)
+        return 1
     return 0
 
 

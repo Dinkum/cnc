@@ -4,10 +4,6 @@ import asyncio
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import json
-import os
-from pathlib import Path
-import shutil
-import tempfile
 from typing import Any, Awaitable, Callable
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,11 +15,22 @@ from app.schemas.apply import ApplyResponse
 from app.services.app_containers import (
     inspect_container,
     inspect_network,
-    read_saved_spec,
+)
+from app.services.tools import TOOLS
+from app.services.tools.core import (
+    Plan,
+    Scope,
+    converge,
+    record_unwind_outcome,
+    unwind_plan,
+    unwind_recovery,
+)
+from app.services.tools.tailscale import (
+    tailscale_service_host_precheck_required,
+    tailscale_service_host_precheck_skip_details,
+    verify_tailscale_service_host_precheck,
 )
 from app.services.apply_core import (
-    APPLY_SLICE_SCHEMA_VERSION,
-    ApplySlice,
     ApplyFailed,
     DesiredState,
     clip_output,
@@ -31,65 +38,38 @@ from app.services.apply_core import (
     desired_state_snapshot,
     desired_state_snapshot_hash,
     desired_state_snapshot_json,
-    hash_apply_slice_payload,
-    nginx_managed_slice_payload,
-    render_apply_slices,
-    runtime_backend_slice_name,
-    tailscale_slice_payload,
 )
 from app.services.apply_state import build_desired_state
-from app.services.app_quadlet import (
-    AppQuadletWriteError,
-    quadlet_container_path,
-    quadlet_network_path,
-    verify_app_quadlet_dir_writable,
-)
 from app.services.app_runtime import (
     apply_app_backends,
-    legacy_direct_podman_migration_backend_reasons,
     preflight_app_storage,
 )
 from app.services.cluster_ingress import reconcile_cluster_followers
 from app.services.commands import (
     CommandError,
-    command_result_is_retryable,
     run_command,
     run_command_checked_async,
 )
 from app.services.control_events import emit_control_event
 from app.services.error_reporting import CNCError, ErrorCode
-from app.services.host_state import write_json_atomic
 from app.services.history_retention import prune_control_plane_history
 from app.services.notifications import (
     admin_dashboard_url,
     build_operator_message,
     send_pushover_notification_async,
 )
-from app.services.netdata_runtime import (
-    netdata_native_runtime_live_matches,
-    reconcile_netdata_native_runtime,
-)
+from app.services.outcome_presentation import present_mutation_outcome
 from app.services.operations import (
     HostMutationLockError,
     OperationHandle,
     host_mutation_operation,
 )
 from app.services.retry import retry_async_call
-from app.services.renderers import container_name
 from app.services.runtime_services import AppRuntimeServices
 from app.services.runtime_assets import reconcile_managed_systemd_assets
 from app.services.self_audit import (
     ControlPlaneSelfAuditError,
     run_control_plane_self_audit,
-)
-from app.services.shield_runtime import (
-    SHIELD_CONTAINER_SERVICE,
-    remove_shield_runtime_assets,
-    render_shield_config,
-    render_shield_env,
-    render_shield_quadlet,
-    shield_quadlet_path,
-    write_shield_runtime_assets,
 )
 from app.services.ssh_access import reconcile_backend_ssh_access
 from app.services.status_service import invalidate_status_cache
@@ -101,12 +81,8 @@ from app.services.tailscale_admin import (
 
 logger = get_logger("apply")
 MANAGED_PREFIX = "cnc-"
-TAILSCALE_SERVICE_TAG_REQUIRED_MESSAGE = (
-    "Tailscale Services require this CNC host to use a tag-based Tailscale identity "
-    "before publishing tailscale subdomain inputs."
-)
+ApplyProgressPlanCallback = Callable[[DesiredState], Awaitable[None] | None]
 ApplyProgressCallback = Callable[[str, str], Awaitable[None] | None]
-ApplyProgressPlanCallback = Callable[[DesiredState, Any], Awaitable[None] | None]
 APPLY_PHASE_ORDER = (
     "app_runtime",
     "ssh_access",
@@ -180,12 +156,20 @@ async def _emit_apply_progress(
 
 
 async def _emit_apply_progress_plan(
-    services: ApplyServices, desired: DesiredState, apply_plan: Any
+    services: ApplyServices, desired: DesiredState
 ) -> None:
+    """Rebuild the operator's progress card once desired state is known.
+
+    It used to also take a predicted apply plan and hide the steps that plan
+    said would not change. Nothing produced such a plan any more, because
+    convergence decides what to do by reading the host, so the argument was
+    always None and every step was shown. Passing desired state alone says the
+    same thing without implying a prediction exists.
+    """
     if services.progress_plan_callback is None:
         return
     try:
-        result = services.progress_plan_callback(desired, apply_plan)
+        result = services.progress_plan_callback(desired)
         if result is not None:
             await result
     except Exception as exc:
@@ -217,109 +201,28 @@ class DesiredStateRecord:
         }
 
 
-@dataclass(frozen=True)
-class ApplySlicePlan:
-    schema_version: int
-    slice_hashes: dict[str, str]
-    previous_slice_hashes: dict[str, str]
-    changed_slices: tuple[str, ...]
-    skipped_slices: tuple[str, ...]
-    full_apply_required: bool = False
-    fallback_reason: str = ""
-
-    @property
-    def changed_runtime_slice_names(self) -> set[str]:
-        return {
-            name for name in self.changed_slices if name.startswith("runtime.backend.")
-        }
-
-    @property
-    def deleted_runtime_slice_names(self) -> set[str]:
-        return {
-            name
-            for name in self.previous_slice_hashes
-            if name.startswith("runtime.backend.") and name not in self.slice_hashes
-        }
-
-    def slice_changed(self, name: str) -> bool:
-        return self.full_apply_required or name in self.changed_slices
-
-    def as_details(self) -> dict[str, object]:
-        return {
-            "slice_schema_version": self.schema_version,
-            "slice_hashes": {
-                name: self.slice_hashes[name] for name in sorted(self.slice_hashes)
-            },
-            "previous_slice_hashes_available": bool(self.previous_slice_hashes),
-            "changed_slices": list(self.changed_slices),
-            "skipped_slices": list(self.skipped_slices),
-            "full_apply_required": self.full_apply_required,
-            "fallback_reason": self.fallback_reason,
-        }
-
-
-@dataclass(frozen=True)
-class _ApplySliceDecision:
-    plan: ApplySlicePlan | None
-
-    @property
-    def full_apply(self) -> bool:
-        return self.plan is None or self.plan.full_apply_required
-
-    def changed(self, name: str) -> bool:
-        return self.full_apply or bool(self.plan and self.plan.slice_changed(name))
-
-    def any_changed(self, names: tuple[str, ...]) -> bool:
-        return self.full_apply or any(self.changed(name) for name in names)
-
-
-def _successful_apply_plan_details(
-    apply_plan: ApplySlicePlan, apply_details: dict[str, Any]
-) -> dict[str, object]:
-    details = apply_plan.as_details()
-    if not apply_details.get("cluster_followers_unavailable"):
-        return details
-
-    slice_hashes = details.get("slice_hashes")
-    if not isinstance(slice_hashes, dict):
-        return details
-
-    previous_hash = apply_plan.previous_slice_hashes.get("cluster_followers")
-    if previous_hash:
-        slice_hashes["cluster_followers"] = previous_hash
-    else:
-        slice_hashes.pop("cluster_followers", None)
-    details["unapplied_slices"] = ["cluster_followers"]
-    return details
-
-
 def _apply_output_event_details(
-    desired: DesiredState, apply_plan: ApplySlicePlan
+    desired: DesiredState, apply_details: dict[str, Any] | None = None
 ) -> dict[str, object]:
-    previous_hashes = apply_plan.previous_slice_hashes
-    current_backend_names = {
-        runtime_backend_slice_name(backend): backend.name
-        for backend in desired.known_app_backends
-    }
-    changed_runtime_slices = apply_plan.changed_runtime_slice_names
-    created_names = sorted(
-        backend_name
-        for slice_name, backend_name in current_backend_names.items()
-        if slice_name in changed_runtime_slices and slice_name not in previous_hashes
-    )
-    updated_names = sorted(
-        backend_name
-        for slice_name, backend_name in current_backend_names.items()
-        if slice_name in changed_runtime_slices and slice_name in previous_hashes
-    )
-    deleted_count = len(apply_plan.deleted_runtime_slice_names)
+    """Summarize which outputs moved, from what the podman tool actually did.
+
+    Previously derived by comparing this apply's slice hashes against the
+    previous successful apply's. It now reads the selection the tool reports,
+    so the summary describes work that happened rather than a difference
+    between two database snapshots.
+    """
+    details = apply_details or {}
+    selected = [str(name) for name in details.get("podman_selected") or []]
+    created = [str(name) for name in details.get("podman_created") or []]
+    updated = sorted(set(selected) - set(created))
+    removed = [str(name) for name in details.get("removed_backends") or []]
     return {
         "outputs_total": len(desired.known_app_backends),
-        "outputs_created": len(created_names),
-        "outputs_updated": len(updated_names),
-        "outputs_deleted": deleted_count,
-        "output_created_names": created_names,
-        "output_updated_names": updated_names,
+        "outputs_created": len(created),
+        "outputs_updated": len(updated),
+        "outputs_deleted": len(removed),
+        "output_created_names": sorted(created),
+        "output_updated_names": updated,
     }
 
 
@@ -448,7 +351,12 @@ async def _record_last_applied_state(
 
 
 async def invalidate_apply_convergence(session: AsyncSession) -> bool:
-    """Force the next apply to rebuild every slice after live state may have drifted."""
+    """Clear the convergence marker after live state may have drifted.
+
+    Durable, unlike the in-process unwind stack: a process killed mid-apply
+    leaves this cleared, so the next apply has no trusted baseline and every
+    tool re-observes the host.
+    """
     row = await session.get(HostApplyState, 1)
     if row is None:
         return False
@@ -465,141 +373,6 @@ async def invalidate_apply_convergence(session: AsyncSession) -> bool:
     return had_marker
 
 
-async def _load_previous_successful_slice_hashes(
-    session: AsyncSession,
-) -> tuple[dict[str, str], str, str]:
-    row = await session.get(HostApplyState, 1)
-    if row is None or row.last_successful_apply_run_id is None:
-        return {}, "no_previous_successful_apply", ""
-    run = await session.get(ApplyRun, row.last_successful_apply_run_id)
-    if run is None:
-        return {}, "previous_successful_apply_missing", ""
-    desired_state_hash = str(run.desired_state_hash or "")
-    try:
-        details = json.loads(run.details_json or "{}")
-    except json.JSONDecodeError:
-        return {}, "previous_successful_apply_details_invalid", desired_state_hash
-    if not isinstance(details, dict):
-        return {}, "previous_successful_apply_details_invalid", desired_state_hash
-    if details.get("slice_schema_version") != APPLY_SLICE_SCHEMA_VERSION:
-        return {}, "slice_schema_unavailable", desired_state_hash
-    raw_hashes = details.get("slice_hashes")
-    if not isinstance(raw_hashes, dict):
-        return {}, "slice_hashes_unavailable", desired_state_hash
-    hashes = {
-        str(name): str(value)
-        for name, value in raw_hashes.items()
-        if isinstance(name, str) and isinstance(value, str) and name and value
-    }
-    if not hashes:
-        return {}, "slice_hashes_unavailable", desired_state_hash
-    return hashes, "", desired_state_hash
-
-
-def _plan_apply_slices(
-    slices: dict[str, ApplySlice],
-    previous_hashes: dict[str, str],
-    *,
-    fallback_reason: str = "",
-) -> ApplySlicePlan:
-    current_hashes = {name: slices[name].hash for name in sorted(slices)}
-    if fallback_reason or not previous_hashes:
-        return ApplySlicePlan(
-            schema_version=APPLY_SLICE_SCHEMA_VERSION,
-            slice_hashes=current_hashes,
-            previous_slice_hashes=previous_hashes,
-            changed_slices=tuple(sorted(current_hashes)),
-            skipped_slices=(),
-            full_apply_required=True,
-            fallback_reason=fallback_reason or "slice_hashes_unavailable",
-        )
-    changed = sorted(
-        name
-        for name, current_hash in current_hashes.items()
-        if previous_hashes.get(name) != current_hash
-    )
-    deleted = sorted(name for name in previous_hashes if name not in current_hashes)
-    skipped = sorted(
-        name
-        for name, current_hash in current_hashes.items()
-        if previous_hashes.get(name) == current_hash
-        and _slice_can_skip_first_pass(name)
-    )
-    return ApplySlicePlan(
-        schema_version=APPLY_SLICE_SCHEMA_VERSION,
-        slice_hashes=current_hashes,
-        previous_slice_hashes=previous_hashes,
-        changed_slices=tuple(sorted(set(changed + deleted))),
-        skipped_slices=tuple(skipped),
-    )
-
-
-def _slice_can_skip_first_pass(name: str) -> bool:
-    return name in {
-        "host_base",
-        "nginx.managed",
-        "tailscale",
-        "ssh_access",
-        "shield",
-        "netdata",
-        "network_isolation",
-        "cluster_followers",
-    } or name.startswith("runtime.backend.")
-
-
-def _slice_hash_map(slices: dict[str, ApplySlice]) -> dict[str, str]:
-    return {name: slices[name].hash for name in sorted(slices)}
-
-
-def _live_first_pass_slice_hashes(
-    desired: DesiredState,
-    settings: Settings,
-    slices: dict[str, ApplySlice],
-    *,
-    services: ApplyServices,
-) -> dict[str, str]:
-    hashes: dict[str, str] = {
-        "host_base": slices["host_base"].hash,
-        "nginx.managed": _live_managed_nginx_slice_hash(settings.nginx_generated_dir),
-        "tailscale": hash_apply_slice_payload(
-            "tailscale",
-            tailscale_slice_payload(
-                _read_tailscale_state(settings.tailscale_serve_state_path),
-                _read_tailscale_service_state(settings.tailscale_serve_state_path),
-            ),
-        ),
-    }
-    if _shield_runtime_live_matches(desired, settings):
-        hashes["shield"] = slices["shield"].hash
-    if _netdata_runtime_live_matches(desired, settings):
-        hashes["netdata"] = slices["netdata"].hash
-    if not desired.cluster_nodes:
-        hashes["cluster_followers"] = slices["cluster_followers"].hash
-
-    for backend in sorted(
-        desired.known_app_backends, key=lambda item: (item.id or 0, item.name)
-    ):
-        name = runtime_backend_slice_name(backend)
-        if backend.enabled:
-            saved_spec = read_saved_spec(settings, backend.name)
-            if isinstance(saved_spec, dict):
-                # First-pass baselining trusts an existing CNC-owned runtime as live.
-                # Seed/profile upgrades belong to explicit runtime changes or repair flows,
-                # not unrelated route/input/output saves on legacy installs.
-                hashes[name] = slices[name].hash
-            continue
-
-        saved_spec = read_saved_spec(settings, backend.name)
-        _inspect_result, inspect_payload = services.runtime_services.inspect_container(
-            container_name(backend.name),
-            timeout_sec=settings.command_timeout_status_sec,
-        )
-        if saved_spec is None and inspect_payload is None:
-            hashes[name] = slices[name].hash
-
-    return {name: hashes[name] for name in sorted(hashes)}
-
-
 async def run_apply(
     session: AsyncSession,
     settings: Settings,
@@ -610,8 +383,16 @@ async def run_apply(
     actor: str = "system",
     operation_handle: OperationHandle | None = None,
     emit_success_event: bool = True,
+    scope: Scope | None = None,
+    recovery: list[Any] | None = None,
 ) -> ApplyResponse:
     services = services or default_apply_services()
+    # Owned here even when the caller did not ask for it, so a failure between
+    # convergence and the durable record can still put the host back. The
+    # caller's list, when given, is the same object so recovery survives out to
+    # the commit boundary.
+    if recovery is None:
+        recovery = []
     apply_operation = (
         operation_handle.with_deferred_db_updates()
         if operation_handle is not None
@@ -639,57 +420,19 @@ async def run_apply(
                         app_backends=len(desired.enabled_app_backends),
                     )
                     desired_record = _desired_state_record(desired)
-                    slices = render_apply_slices(desired, settings)
-                    (
-                        previous_slice_hashes,
-                        fallback_reason,
-                        previous_desired_state_hash,
-                    ) = await _load_previous_successful_slice_hashes(session)
-                    slice_hashes_bootstrapped = False
-                    live_slice_hashes_bootstrapped = False
-                    if (
-                        fallback_reason
-                        and previous_desired_state_hash
-                        and previous_desired_state_hash
-                        == desired_record.desired_state_hash
-                    ):
-                        previous_slice_hashes = _slice_hash_map(slices)
-                        fallback_reason = ""
-                        slice_hashes_bootstrapped = True
-                    elif (
-                        fallback_reason
-                        and not previous_slice_hashes
-                        and previous_desired_state_hash
-                    ):
-                        previous_slice_hashes = _live_first_pass_slice_hashes(
-                            desired,
-                            settings,
-                            slices,
-                            services=services,
-                        )
-                        fallback_reason = ""
-                        live_slice_hashes_bootstrapped = True
-                    apply_plan = _plan_apply_slices(
-                        slices,
-                        previous_slice_hashes,
-                        fallback_reason=fallback_reason,
-                    )
-                    await _emit_apply_progress_plan(services, desired, apply_plan)
+                    await _emit_apply_progress_plan(services, desired)
                     tailscale_service_host_precheck = (
-                        _tailscale_service_host_precheck_skip_details(
+                        tailscale_service_host_precheck_skip_details(
                             desired,
                             settings,
-                            apply_plan,
                         )
                     )
-                    if _tailscale_service_host_precheck_required(
-                        desired, settings, apply_plan
-                    ):
+                    if tailscale_service_host_precheck_required(desired, settings):
                         await _emit_apply_progress(
                             services, "Prepare host", "Checking tailnet service host"
                         )
                         tailscale_service_host_precheck = (
-                            await _verify_tailscale_service_host_precheck(
+                            await verify_tailscale_service_host_precheck(
                                 desired.tailscale_services,
                                 settings,
                                 services=services,
@@ -701,37 +444,28 @@ async def run_apply(
                         details={
                             "config_revision": desired_record.config_revision,
                             "desired_state_hash": desired_record.desired_state_hash,
-                            "slice_hashes_bootstrapped": slice_hashes_bootstrapped,
-                            "live_slice_hashes_bootstrapped": live_slice_hashes_bootstrapped,
-                            **apply_plan.as_details(),
                         },
                     )
-                    if apply_plan.slice_changed("host_base"):
-                        try:
-                            await _emit_apply_progress(
-                                services,
-                                "Prepare host",
-                                "Reconciling CNC runtime assets",
-                            )
-                            runtime_assets = await asyncio.to_thread(
-                                services.reconcile_managed_systemd_assets, settings
-                            )
-                        except Exception as exc:
-                            raise ApplyFailed(
-                                "managed runtime asset reconcile failed",
-                                phase="runtime_assets",
-                                details={
-                                    "error": str(exc),
-                                    "failure_mode": "partial",
-                                    "manual_review_required": True,
-                                    "operator_action": "inspect systemd unit drift and rerun apply",
-                                },
-                            ) from exc
-                    else:
-                        runtime_assets = {
-                            "skipped": True,
-                            "reason": "host_base slice unchanged",
-                        }
+                    try:
+                        await _emit_apply_progress(
+                            services,
+                            "Prepare host",
+                            "Reconciling CNC runtime assets",
+                        )
+                        runtime_assets = await asyncio.to_thread(
+                            services.reconcile_managed_systemd_assets, settings
+                        )
+                    except Exception as exc:
+                        raise ApplyFailed(
+                            "managed runtime asset reconcile failed",
+                            phase="runtime_assets",
+                            details={
+                                "error": str(exc),
+                                "failure_mode": "partial",
+                                "manual_review_required": True,
+                                "operator_action": "inspect systemd unit drift and rerun apply",
+                            },
+                        ) from exc
                     await _emit_apply_progress(
                         services, "Prepare host", "Checking admin exposure"
                     )
@@ -743,25 +477,26 @@ async def run_apply(
                         desired,
                         settings,
                         services=services,
-                        apply_plan=apply_plan,
+                        scope=scope or Scope.everything(),
+                        recovery=recovery,
                         operation_id=operation.id,
                     )
                     live_apply_completed = True
-                    apply_plan_details = _successful_apply_plan_details(
-                        apply_plan, details
-                    )
                     response_details = {
                         "runtime_assets": runtime_assets,
                         "tailscale_admin_precheck": admin_exposure_precheck,
                         "tailscale_service_host_precheck": tailscale_service_host_precheck,
                         "config_revision": desired_record.config_revision,
                         "desired_state_hash": desired_record.desired_state_hash,
-                        "slice_hashes_bootstrapped": slice_hashes_bootstrapped,
-                        "live_slice_hashes_bootstrapped": live_slice_hashes_bootstrapped,
-                        **apply_plan_details,
                         **details,
                     }
-                    output_event = _apply_output_event_details(desired, apply_plan)
+                    response_details["host_changed"] = bool(
+                        response_details.get("changed_tools")
+                        or runtime_assets.get("changed_units")
+                        or runtime_assets.get("changed_files")
+                        or runtime_assets.get("timer_reconciled")
+                    )
+                    output_event = _apply_output_event_details(desired, details)
                     degraded_health = (
                         response_details.get("app_healthcheck_status") == "degraded"
                     )
@@ -872,6 +607,7 @@ async def run_apply(
                         status="success",
                         message=success_message,
                         details=response_details,
+                        host_changed=response_details["host_changed"],
                         created_at=run.created_at,
                         run_id=run.id,
                     )
@@ -901,25 +637,30 @@ async def run_apply(
                     else:
                         details = {"error": str(exc), "phase": "unknown"}
                     if live_apply_completed:
-                        details = {
-                            **details,
-                            "failure_mode": "partial",
-                            "manual_review_required": True,
-                            "operator_action": "rerun apply to reconcile durable desired state",
-                        }
+                        # Convergence finished and something after it failed.
+                        # The change is being rejected, so the reversible host
+                        # effects come back rather than being reported as a
+                        # partial and left in place. Whether that leaves
+                        # anything for an operator is the unwind's answer, not
+                        # an assumption made here.
+                        restored = await unwind_recovery(recovery)
+                        details = {**details, **restored}
+                        if restored.get("manual_review_required"):
+                            details["operator_action"] = (
+                                "rerun apply to reconcile durable desired state"
+                            )
                     if desired_record is not None:
                         details = {
                             "config_revision": desired_record.config_revision,
                             "desired_state_hash": desired_record.desired_state_hash,
                             **details,
                         }
-                    message = (
-                        "apply partially failed"
-                        if str(details.get("failure_mode") or "").strip() == "partial"
-                        else "apply failed"
-                    )
                     partial_failure = (
                         str(details.get("failure_mode") or "").strip() == "partial"
+                    )
+                    message = "apply failed"
+                    presentation = present_mutation_outcome(
+                        "partial" if partial_failure else "failed", details
                     )
                     if partial_failure:
                         details["convergence_invalidated"] = True
@@ -963,10 +704,8 @@ async def run_apply(
                         settings,
                         kind="apply_failed",
                         source="apply",
-                        summary="Host apply partially failed"
-                        if partial_failure
-                        else "Host apply failed",
-                        severity="warn" if partial_failure else "error",
+                        summary="Host apply failed",
+                        severity="error",
                         scope="host",
                         affects_all=True,
                         subevents=[
@@ -992,12 +731,12 @@ async def run_apply(
                             ),
                             {
                                 "label": "status",
-                                "value": "partial" if partial_failure else "failed",
+                                "value": "failed",
                             },
                         ],
                         details={
                             "run_id": run.id,
-                            "status": "partial" if partial_failure else "error",
+                            "status": "error",
                             "phase": failed_phase,
                             "failure_mode": details.get("failure_mode"),
                             "operation_id": operation.id,
@@ -1019,15 +758,16 @@ async def run_apply(
                         settings,
                         title="CNC apply failed",
                         message=build_operator_message(
-                            "Apply partially failed."
-                            if partial_failure
-                            else "Apply failed.",
-                            status="warning" if partial_failure else "failure",
-                            facts=_apply_failure_notification_facts(
-                                details,
-                                run_id=run.id,
-                                manual_review_required=partial_failure,
-                            ),
+                            "Apply failed.",
+                            status="failure",
+                            facts=[
+                                ("recovery", presentation.recovery_detail),
+                                *_apply_failure_notification_facts(
+                                    details,
+                                    run_id=run.id,
+                                    manual_review_required=partial_failure,
+                                ),
+                            ],
                             action="cnc-admin logs admin --errors",
                         ),
                         priority=0,
@@ -1082,9 +822,17 @@ async def run_apply(
             settings,
             title="CNC apply failed",
             message=build_operator_message(
-                "Apply could not start cleanly.",
+                "Apply failed.",
                 status="failure",
-                facts=_apply_failure_notification_facts(failure_details),
+                facts=[
+                    (
+                        "recovery",
+                        present_mutation_outcome(
+                            "failed", failure_details
+                        ).recovery_detail,
+                    ),
+                    *_apply_failure_notification_facts(failure_details),
+                ],
                 action="cnc-admin logs admin --errors",
             ),
             priority=-1,
@@ -1129,21 +877,6 @@ def _apply_failure_notification_facts(
     ]
 
 
-def _changed_runtime_backend_names(
-    desired: DesiredState, apply_plan: ApplySlicePlan | None
-) -> set[str]:
-    if apply_plan is None:
-        return {backend.name for backend in desired.known_app_backends}
-    if apply_plan.slice_changed("apps_memory"):
-        return {backend.name for backend in desired.known_app_backends}
-    changed_slice_names = apply_plan.changed_runtime_slice_names
-    return {
-        backend.name
-        for backend in desired.known_app_backends
-        if runtime_backend_slice_name(backend) in changed_slice_names
-    }
-
-
 def _skipped_app_runtime_details(
     desired: DesiredState, settings: Settings
 ) -> dict[str, object]:
@@ -1177,157 +910,17 @@ def _skipped_app_runtime_details(
     }
 
 
-def _live_managed_nginx_files(nginx_dir: Path) -> dict[str, str] | None:
-    live_files: dict[str, str] = {}
-    if nginx_dir.exists():
-        try:
-            paths = list(nginx_dir.iterdir())
-        except OSError:
-            return None
-        for path in paths:
-            if not path.name.startswith(MANAGED_PREFIX):
-                continue
-            if not path.is_file():
-                return None
-            try:
-                live_files[path.name] = path.read_text(encoding="utf-8")
-            except OSError:
-                return None
-    return live_files
-
-
-def _live_managed_nginx_slice_hash(nginx_dir: Path) -> str:
-    live_files = _live_managed_nginx_files(nginx_dir) or {}
-    live_hash = hash_apply_slice_payload(
-        "nginx.managed", nginx_managed_slice_payload(live_files)
-    )
-    return live_hash
-
-
-def _live_managed_nginx_matches(nginx_dir: Path, desired_files: dict[str, str]) -> bool:
-    live_files = _live_managed_nginx_files(nginx_dir)
-    if live_files is None:
-        return False
-    live_hash = hash_apply_slice_payload(
-        "nginx.managed", nginx_managed_slice_payload(live_files)
-    )
-    desired_hash = hash_apply_slice_payload(
-        "nginx.managed", nginx_managed_slice_payload(desired_files)
-    )
-    return live_hash == desired_hash
-
-
-def _tailscale_state_matches_desired(desired: DesiredState, settings: Settings) -> bool:
-    state_path = settings.tailscale_serve_state_path
-    return (
-        _read_tailscale_state(state_path) == desired.tailscale_paths
-        and _read_tailscale_service_state(state_path) == desired.tailscale_services
-    )
-
-
-def _shield_runtime_live_matches(desired: DesiredState, settings: Settings) -> bool:
-    if not desired.shield_required:
-        return not _shield_runtime_assets_exist(settings)
-    expected_files = {
-        shield_quadlet_path(settings): render_shield_quadlet(settings),
-        settings.shield_env_file_path: render_shield_env(settings),
-        settings.shield_config_path: render_shield_config(
-            desired.shield_output_code_hashes
-        ),
-    }
-    for path, expected_content in expected_files.items():
-        try:
-            if path.read_text(encoding="utf-8") != expected_content:
-                return False
-        except OSError:
-            return False
-    return True
-
-
-def _netdata_runtime_live_matches(desired: DesiredState, settings: Settings) -> bool:
-    if not desired.netdata_required:
-        return True
-    return netdata_native_runtime_live_matches(settings)
-
-
-def _disabled_runtime_absent_backend_names(
-    desired: DesiredState,
-    settings: Settings,
-    backend_names: set[str],
-    *,
-    services: ApplyServices,
-) -> set[str]:
-    known_backends = {backend.name: backend for backend in desired.known_app_backends}
-    absent: set[str] = set()
-    for backend_name in sorted(backend_names):
-        backend = known_backends.get(backend_name)
-        if (
-            backend is None
-            or backend.enabled
-            or backend_name in desired.runtime_graph.enabled_app_backend_names
-        ):
-            continue
-        if read_saved_spec(settings, backend_name) is not None:
-            continue
-        if (
-            quadlet_container_path(settings, backend_name).exists()
-            or quadlet_network_path(settings, backend_name).exists()
-        ):
-            continue
-        _inspect_result, inspect_payload = services.runtime_services.inspect_container(
-            container_name(backend_name),
-            timeout_sec=settings.command_timeout_status_sec,
-        )
-        if inspect_payload is None:
-            absent.add(backend_name)
-    return absent
-
-
 async def _apply_desired_state(
     desired: DesiredState,
     settings: Settings,
     *,
     services: ApplyServices,
-    apply_plan: ApplySlicePlan | None = None,
+    scope: Scope | None = None,
     operation_id: int | None = None,
+    recovery: list[Any] | None = None,
 ) -> dict[str, Any]:
-    nginx_dir = settings.nginx_generated_dir
     settings.apply_backup_dir.mkdir(parents=True, exist_ok=True)
     progress = _ApplyProgressTracker()
-    rollback_nginx_dir: Path | None = None
-    slices = _ApplySliceDecision(apply_plan)
-    changed_runtime_backends = (
-        _changed_runtime_backend_names(desired, apply_plan)
-        if apply_plan is not None
-        else {backend.name for backend in desired.known_app_backends}
-    )
-    network_isolation_changed = slices.changed("network_isolation")
-    runtime_cleanup_required = bool(
-        apply_plan and apply_plan.deleted_runtime_slice_names
-    )
-    runtime_live_drift_reasons: dict[str, str] = {}
-    if not slices.full_apply and desired.known_app_backends:
-        runtime_live_drift_reasons = legacy_direct_podman_migration_backend_reasons(
-            desired,
-            settings,
-            services=services.runtime_services,
-            candidate_backend_names=desired.runtime_graph.enabled_app_backend_names
-            - changed_runtime_backends,
-        )
-        changed_runtime_backends.update(runtime_live_drift_reasons)
-    disabled_runtime_absent_backends = (
-        _disabled_runtime_absent_backend_names(
-            desired,
-            settings,
-            changed_runtime_backends,
-            services=services,
-        )
-        if changed_runtime_backends and not slices.full_apply
-        else set()
-    )
-    runtime_reconcile_backends = (
-        changed_runtime_backends - disabled_runtime_absent_backends
-    )
     details = {
         "nginx_files": sorted(desired.nginx_files.keys()),
         "cluster_nodes": list(desired.cluster_nodes),
@@ -1349,816 +942,82 @@ async def _apply_desired_state(
         "apply_phase_order": list(APPLY_PHASE_ORDER),
         "rollback_contract": _apply_rollback_contract(),
     }
-    if runtime_live_drift_reasons:
-        details["runtime_live_drift_backends"] = sorted(runtime_live_drift_reasons)
-        details["runtime_live_drift_reasons"] = {
-            backend: runtime_live_drift_reasons[backend]
-            for backend in sorted(runtime_live_drift_reasons)
-        }
-    if disabled_runtime_absent_backends:
-        details["runtime_absent_disabled_backends"] = sorted(
-            disabled_runtime_absent_backends
-        )
     try:
-        if desired.known_app_backends or runtime_cleanup_required:
-            await _emit_apply_progress(
-                services, "Plan runtime", "Inspecting app container"
-            )
-            if (
-                slices.full_apply
-                or runtime_reconcile_backends
-                or runtime_cleanup_required
-            ):
-                if desired.known_app_backends or runtime_cleanup_required:
-                    try:
-                        details["app_quadlet_dir_preflight"] = (
-                            verify_app_quadlet_dir_writable(settings)
-                        )
-                    except AppQuadletWriteError as exc:
-                        raise ApplyFailed(
-                            "app Quadlet directory is not writable",
-                            phase="app_runtime",
-                            details=exc.details,
-                        ) from exc
-                details.update(
-                    await asyncio.to_thread(
-                        services.preflight_app_storage,
-                        desired,
-                        runtime_reconcile_backends,
-                    )
-                )
-                progress.live_mutation("app_runtime")
-                runtime_kwargs = {
-                    "services": services.runtime_services,
-                    "selected_backend_names": None
-                    if slices.full_apply
-                    else runtime_reconcile_backends,
-                    "cleanup_deleted": slices.full_apply or runtime_cleanup_required,
-                    "reconcile_network_isolation": network_isolation_changed,
-                    "operation_id": operation_id,
-                }
-                if not services.cleanup_deleted_app_filesystem:
-                    runtime_kwargs["cleanup_deleted_filesystem"] = False
-                details.update(
-                    await services.apply_app_backends(
-                        desired,
-                        settings,
-                        **runtime_kwargs,
-                    )
-                )
-            else:
-                details.update(_skipped_app_runtime_details(desired, settings))
-            progress.completed("app_runtime")
-
-        shield_assets_exist = _shield_runtime_assets_exist(settings)
-        if shield_assets_exist or desired.shield_required:
-            progress.enter("shield_runtime")
-            shield_changed = slices.changed("shield")
-            shield_live_matches = _shield_runtime_live_matches(desired, settings)
-            if shield_changed or not shield_live_matches:
-                await _emit_apply_progress(
-                    services, "Prepare Shield", "Preparing Shield gate"
-                )
-                progress.live_mutation()
-                try:
-                    details["shield_runtime"] = await _reconcile_shield_runtime(
-                        desired, settings, services=services
-                    )
-                except Exception as exc:
-                    raise ApplyFailed(
-                        "shield runtime reconcile failed",
-                        phase="shield_runtime",
-                        details={"error": str(exc)},
-                    ) from exc
-            else:
-                details["shield_runtime"] = {
-                    "skipped": True,
-                    "reason": "shield slice unchanged and live assets match",
-                    "required": bool(desired.shield_required),
-                }
-            progress.completed()
-
-        if desired.netdata_required:
-            progress.enter("netdata_runtime")
-            netdata_changed = slices.changed("netdata")
-            netdata_live_matches = _netdata_runtime_live_matches(desired, settings)
-            if netdata_changed or not netdata_live_matches:
-                progress.live_mutation()
-                try:
-                    details["netdata_runtime"] = await _reconcile_netdata_runtime(
-                        settings, services=services
-                    )
-                except Exception as exc:
-                    raise ApplyFailed(
-                        "netdata runtime reconcile failed",
-                        phase="netdata_runtime",
-                        details={"error": str(exc)},
-                    ) from exc
-            else:
-                details["netdata_runtime"] = {
-                    "skipped": True,
-                    "reason": "netdata slice unchanged and live assets match",
-                    "required": True,
-                }
-            progress.completed()
-
-        ssh_access_changed = slices.changed("ssh_access")
-        if desired.known_app_backends and ssh_access_changed:
-            try:
-                progress.enter("ssh_access")
-                await _emit_apply_progress(
-                    services, "Apply host access", "Reconciling backend SSH"
-                )
-                progress.live_mutation()
-                ssh_details = await services.reconcile_backend_ssh_access(
-                    [
-                        {
-                            "name": backend.name,
-                            "public_key": str(backend.ssh_public_key or "").strip()
-                            or None,
-                        }
-                        for backend in desired.enabled_app_backends
-                    ],
-                    settings,
-                )
-            except Exception as exc:
-                raise ApplyFailed(
-                    "backend ssh access reconcile failed",
-                    phase="ssh_access",
-                    details={"error": str(exc)},
-                ) from exc
-            details.update(ssh_details)
-            progress.completed()
-        elif desired.known_app_backends:
-            details["ssh_access"] = {
-                "skipped": True,
-                "reason": "ssh_access slice unchanged",
-            }
-            progress.completed("ssh_access")
-
-        progress.enter("sync_files")
-        nginx_live_matches = _live_managed_nginx_matches(nginx_dir, desired.nginx_files)
-        nginx_changed = slices.changed("nginx.managed")
-        if nginx_changed or not nginx_live_matches:
-            details["nginx_live_drift_reconciled"] = (
-                not nginx_changed and not nginx_live_matches
-            )
-            await _emit_apply_progress(
-                services, "Apply host access", "Staging host proxy config"
-            )
-            try:
-                staged_nginx_dir = _write_staged_managed_dir(
-                    nginx_dir, desired.nginx_files
-                )
-                rollback_nginx_dir = _swap_managed_dir(nginx_dir, staged_nginx_dir)
-            except OSError as exc:
-                raise ApplyFailed(
-                    "failed to stage managed nginx files",
-                    phase="sync_files",
-                    details={
-                        "error": str(exc),
-                        "target_dir": str(nginx_dir),
-                    },
-                ) from exc
-            progress.completed("sync_files")
-
-            progress.enter("nginx_validate")
-            await _emit_apply_progress(
-                services, "Apply host access", "Validating host proxy config"
-            )
-            try:
-                await services.runtime_services.run_command_checked_async(
-                    ["nginx", "-t"],
-                    timeout_sec=settings.command_timeout_apply_sec,
-                )
-            except CommandError as exc:
-                raise ApplyFailed(
-                    "nginx -t failed",
-                    phase="nginx_validate",
-                    error_code=ErrorCode.APPLY_NGINX_CONFIG_INVALID,
-                    details={
-                        "command": exc.result.command,
-                        "stdout": clip_output(exc.result.stdout),
-                        "stderr": clip_output(exc.result.stderr),
-                    },
-                ) from exc
-            progress.completed("nginx_validate")
-
-            progress.enter("nginx_reload")
-            await _emit_apply_progress(
-                services, "Apply host access", "Reloading host proxy"
-            )
-            progress.live_mutation()
-            await services.runtime_services.run_command_checked_async(
-                ["systemctl", "reload", "nginx"],
-                timeout_sec=settings.command_timeout_apply_sec,
-            )
-            progress.completed()
-        else:
-            details["nginx_skipped"] = True
-            details["nginx_skip_reason"] = (
-                "nginx.managed slice unchanged and live files match"
-            )
-            progress.completed("sync_files")
-            progress.completed("nginx_validate")
-            progress.completed("nginx_reload")
-
-        progress.enter("cluster_followers")
-        cluster_followers_changed = slices.changed("cluster_followers")
-        if cluster_followers_changed:
-            await _emit_apply_progress(
-                services, "Apply cluster", "Syncing follower ingress"
-            )
-            if desired.cluster_nodes:
-                progress.live_mutation()
-            try:
-                details.update(
-                    await asyncio.to_thread(
-                        services.reconcile_cluster_followers,
-                        desired,
-                        settings,
-                    )
-                )
-            except Exception as exc:
-                raise ApplyFailed(
-                    "follower ingress reconcile failed",
-                    phase="cluster_followers",
-                    details={"error": str(exc)},
-                ) from exc
-        else:
-            details["cluster_followers"] = []
-            details["cluster_followers_skipped"] = True
-            details["cluster_followers_skip_reason"] = (
-                "cluster_followers slice unchanged"
-            )
-        progress.completed()
-
-        progress.enter("tailscale_paths")
-        tailscale_changed = slices.changed("tailscale")
-        tailscale_state_matches = _tailscale_state_matches_desired(desired, settings)
-        if tailscale_changed or not tailscale_state_matches:
-            if desired.tailscale_paths:
-                await _emit_apply_progress(
-                    services, "Apply host access", "Updating tailnet paths"
-                )
-            progress.live_mutation()
-            details.update(
-                await _apply_tailscale_paths(
-                    desired.tailscale_paths, settings, services=services
-                )
-            )
-            progress.completed()
-
-            progress.enter("tailscale_services")
-            if desired.tailscale_services:
-                await _emit_apply_progress(
-                    services, "Apply host access", "Updating tailnet services"
-                )
-            progress.live_mutation()
-            details.update(
-                await _apply_tailscale_services(
-                    desired.tailscale_services, settings, services=services
-                )
-            )
-            progress.completed()
-        else:
-            details["tailscale_paths"] = [
-                {"path": path, "target": target}
-                for path, target in sorted(desired.tailscale_paths.items())
-            ]
-            details["tailscale_services"] = [
-                {"service": service_name, "target": target}
-                for service_name, target in sorted(desired.tailscale_services.items())
-            ]
-            details["tailscale_skipped"] = True
-            details["tailscale_skip_reason"] = (
-                "tailscale slice unchanged and local state matches"
-            )
-            progress.completed("tailscale_paths")
-            progress.completed("tailscale_services")
-        admin_verify_required = slices.any_changed(("nginx.managed", "tailscale"))
-        if admin_verify_required:
-            try:
-                progress.enter("tailscale_admin_verify")
-                await _emit_apply_progress(
-                    services, "Verify output", "Verifying admin exposure"
-                )
-                details["tailscale_admin_verify"] = await asyncio.to_thread(
-                    services.verify_tailscale_admin_exposure,
-                    settings,
-                )
-            except TailscaleAdminExposureError as exc:
-                raise ApplyFailed(
-                    "tailscale admin exposure verification failed",
-                    phase="tailscale_admin_verify",
-                    details={"error": str(exc)},
-                ) from exc
-        else:
-            details["tailscale_admin_verify"] = {
-                "skipped": True,
-                "reason": "admin exposure was already checked before unchanged ingress apply",
-            }
-        progress.completed("tailscale_admin_verify")
-        self_audit_required = slices.any_changed(
-            (
-                "host_base",
-                "network_isolation",
-                "nginx.managed",
-                "cluster_followers",
-                "shield",
-                "tailscale",
-            )
+        tool_plan = Plan(
+            desired=desired,
+            settings=settings,
+            services=services,
+            details=details,
+            scope=scope or Scope.everything(),
+            extras={
+                "operation_id": operation_id,
+            },
         )
-        if self_audit_required:
-            try:
-                progress.enter("control_plane_self_audit")
-                await _emit_apply_progress(
-                    services, "Verify output", "Auditing control plane"
-                )
-                audit_payload = await _run_control_plane_self_audit_for_apply(
-                    settings, services=services
-                )
-                details["control_plane_self_audit"] = {
-                    "ok": True,
-                    **audit_payload,
-                }
-            except ControlPlaneSelfAuditError as exc:
-                details["control_plane_self_audit"] = {"ok": False, **exc.as_details()}
-                log_event = (
-                    "apply.control_plane_self_audit.failed"
-                    if exc.blocks_apply
-                    else "apply.control_plane_self_audit.warning"
-                )
-                log_fn = logger.error if exc.blocks_apply else logger.warning
-                log_fn(log_event, details=exc.as_details())
-                if exc.blocks_apply:
-                    raise ApplyFailed(
-                        "control-plane self-audit failed",
-                        phase="control_plane_self_audit",
-                        details=exc.as_details(),
-                    ) from exc
-            else:
-                progress.completed()
-        else:
-            details["control_plane_self_audit"] = {
-                "skipped": True,
-                "reason": "heavy self-audit skipped because host safety slices were unchanged",
-            }
-            progress.completed("control_plane_self_audit")
+        details.update(tool_plan.scope.as_details())
+        if recovery is not None:
+            # Published so the commit boundary can still put the host back if
+            # the database commit fails after every tool succeeded.
+            recovery.append(tool_plan)
+
+        # The whole host convergence: walk the tools in order, each one
+        # reading the box and closing its own gap. Phase bookkeeping and
+        # clean-versus-partial classification are driven from what the tools
+        # declare, not from anything written out here.
+        details["changed_tools"] = await converge(
+            TOOLS, tool_plan, progress=progress
+        )
+
+        progress.enter("tailscale_admin_verify")
+        await _emit_apply_progress(
+            services, "Verify output", "Verifying admin exposure"
+        )
+        try:
+            details["tailscale_admin_verify"] = await asyncio.to_thread(
+                services.verify_tailscale_admin_exposure,
+                settings,
+            )
+        except TailscaleAdminExposureError as exc:
+            raise ApplyFailed(
+                "tailscale admin exposure verification failed",
+                phase="tailscale_admin_verify",
+                details={"error": str(exc)},
+            ) from exc
+        progress.completed("tailscale_admin_verify")
+        progress.enter("control_plane_self_audit")
+        await _emit_apply_progress(services, "Verify output", "Auditing control plane")
+        try:
+            audit_payload = await _run_control_plane_self_audit_for_apply(
+                settings, services=services
+            )
+            details["control_plane_self_audit"] = {"ok": True, **audit_payload}
+        except ControlPlaneSelfAuditError as exc:
+            details["control_plane_self_audit"] = {"ok": False, **exc.as_details()}
+            log_event = (
+                "apply.control_plane_self_audit.failed"
+                if exc.blocks_apply
+                else "apply.control_plane_self_audit.warning"
+            )
+            log_fn = logger.error if exc.blocks_apply else logger.warning
+            log_fn(log_event, details=exc.as_details())
+            if exc.blocks_apply:
+                raise ApplyFailed(
+                    "control-plane self-audit failed",
+                    phase="control_plane_self_audit",
+                    details=exc.as_details(),
+                ) from exc
+        progress.completed("control_plane_self_audit")
         details.update(progress.as_details())
     except Exception as exc:
-        apply_failure = progress.failure(exc)
-        rollback_mode = _nginx_rollback_mode(apply_failure)
-        if rollback_nginx_dir is None:
-            rollback_status = "not_staged"
-        elif rollback_mode == "restore_previous_live_state":
-            await _restore_nginx_live_state_after_failure(
-                nginx_dir,
-                rollback_nginx_dir,
-                settings,
-                apply_failure,
-                services=services,
-            )
-            rollback_status = "restored"
-        else:
-            _rollback_swapped_managed_dir(nginx_dir, rollback_nginx_dir)
-            rollback_status = "removed_candidate"
-        apply_failure.details["nginx_rollback"] = {
-            "mode": rollback_mode,
-            "attempted": rollback_mode == "restore_previous_live_state",
-            "status": rollback_status,
-        }
-        raise apply_failure
+        # The undo stack outlives converge on purpose. Admin verification and
+        # the control-plane self-audit run after every tool has finished, and a
+        # failure there means the change is being rejected just as surely as a
+        # tool failure, so the reversible host effects have to come back.
+        failure = progress.failure(exc)
+        unwound, unwind_errors = await unwind_plan(tool_plan)
+        record_unwind_outcome(failure, unwound, unwind_errors, tool_plan.touched)
+        raise failure
 
-    _finalize_swapped_managed_dir(rollback_nginx_dir)
     return details
-
-
-async def _reconcile_shield_runtime(
-    desired: DesiredState,
-    settings: Settings,
-    *,
-    services: ApplyServices,
-) -> dict[str, Any]:
-    if not desired.shield_required:
-        had_assets = _shield_runtime_assets_exist(settings)
-        if had_assets:
-            try:
-                await services.runtime_services.run_command_checked_async(
-                    ["systemctl", "disable", "--now", SHIELD_CONTAINER_SERVICE],
-                    timeout_sec=settings.command_timeout_apply_sec,
-                )
-            except CommandError:
-                pass
-        removed = remove_shield_runtime_assets(settings)
-        if removed:
-            await services.runtime_services.run_command_checked_async(
-                ["systemctl", "daemon-reload"],
-                timeout_sec=settings.command_timeout_apply_sec,
-            )
-        return {"required": False, "removed_files": removed}
-
-    result = write_shield_runtime_assets(
-        settings,
-        output_code_hashes=desired.shield_output_code_hashes,
-    )
-    await services.runtime_services.run_command_checked_async(
-        ["systemctl", "daemon-reload"],
-        timeout_sec=settings.command_timeout_apply_sec,
-    )
-    await services.runtime_services.run_command_checked_async(
-        ["systemctl", "restart", SHIELD_CONTAINER_SERVICE],
-        timeout_sec=settings.command_timeout_apply_sec,
-    )
-    return {"required": True, **result}
-
-
-async def _reconcile_netdata_runtime(
-    settings: Settings,
-    *,
-    services: ApplyServices,
-) -> dict[str, Any]:
-    return await reconcile_netdata_native_runtime(
-        settings, services=services.runtime_services
-    )
-
-
-def _shield_runtime_assets_exist(settings: Settings) -> bool:
-    return any(
-        path.exists()
-        for path in (
-            shield_quadlet_path(settings),
-            settings.shield_env_file_path,
-            settings.shield_config_path,
-        )
-    )
-
-
-def _read_tailscale_state(path: Path) -> dict[str, str]:
-    if not path.exists():
-        return {}
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return {}
-    paths = payload.get("paths")
-    if not isinstance(paths, dict):
-        return {}
-    normalized: dict[str, str] = {}
-    for raw_path, raw_target in paths.items():
-        if not isinstance(raw_path, str) or not isinstance(raw_target, str):
-            continue
-        normalized[raw_path] = raw_target
-    return normalized
-
-
-def _read_tailscale_service_state(path: Path) -> dict[str, str]:
-    if not path.exists():
-        return {}
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return {}
-    services = payload.get("services")
-    if not isinstance(services, dict):
-        return {}
-    normalized: dict[str, str] = {}
-    for raw_service, raw_target in services.items():
-        if not isinstance(raw_service, str) or not isinstance(raw_target, str):
-            continue
-        normalized[raw_service] = raw_target
-    return normalized
-
-
-def _write_tailscale_state(
-    path: Path, *, paths: dict[str, str], services: dict[str, str]
-) -> None:
-    write_json_atomic(path, {"paths": paths, "services": services})
-
-
-def _tailscale_service_host_precheck_required(
-    desired: DesiredState,
-    settings: Settings,
-    apply_plan: ApplySlicePlan | None,
-) -> bool:
-    if not desired.tailscale_services:
-        return False
-    if apply_plan is None or apply_plan.slice_changed("tailscale"):
-        return True
-    return not _tailscale_state_matches_desired(desired, settings)
-
-
-def _tailscale_service_host_precheck_skip_details(
-    desired: DesiredState,
-    settings: Settings,
-    apply_plan: ApplySlicePlan | None,
-) -> dict[str, object]:
-    services = sorted(desired.tailscale_services)
-    if not services:
-        return {"skipped": True, "reason": "no tailscale service inputs"}
-    if not _tailscale_service_host_precheck_required(desired, settings, apply_plan):
-        return {
-            "skipped": True,
-            "reason": "tailscale service slice unchanged and local state matches",
-            "services": services,
-        }
-    return {"skipped": False, "services": services}
-
-
-async def _verify_tailscale_service_host_precheck(
-    services_map: dict[str, str],
-    settings: Settings,
-    *,
-    services: ApplyServices,
-) -> dict[str, object]:
-    service_names = sorted(services_map)
-    command = ["tailscale", "status", "--self", "--json"]
-    try:
-        result = await _run_retryable_checked_command(
-            command,
-            timeout_sec=settings.command_timeout_status_sec,
-            settings=settings,
-            services=services,
-        )
-    except CommandError as exc:
-        raise ApplyFailed(
-            "tailscale service host precheck failed",
-            phase="tailscale_services",
-            details={
-                "error": exc.result.stderr
-                or exc.result.stdout
-                or "tailscale status failed",
-                "command": exc.result.command,
-                "stdout": clip_output(exc.result.stdout),
-                "stderr": clip_output(exc.result.stderr),
-                "tailscale_service_host_precheck": {
-                    "ok": False,
-                    "services": service_names,
-                    "tagged_host": False,
-                },
-                "failure_mode": "clean",
-                "manual_review_required": False,
-            },
-        ) from exc
-
-    try:
-        payload = json.loads(result.stdout or "{}")
-    except json.JSONDecodeError as exc:
-        raise ApplyFailed(
-            "tailscale service host precheck failed",
-            phase="tailscale_services",
-            details={
-                "error": "tailscale status returned invalid JSON",
-                "command": command,
-                "stdout": clip_output(result.stdout),
-                "stderr": clip_output(result.stderr),
-                "tailscale_service_host_precheck": {
-                    "ok": False,
-                    "services": service_names,
-                    "tagged_host": False,
-                },
-                "failure_mode": "clean",
-                "manual_review_required": False,
-            },
-        ) from exc
-
-    self_payload = payload.get("Self") if isinstance(payload, dict) else None
-    if not isinstance(self_payload, dict):
-        raise ApplyFailed(
-            "tailscale service host precheck failed",
-            phase="tailscale_services",
-            details={
-                "error": "tailscale status did not include the local node identity",
-                "command": command,
-                "tailscale_service_host_precheck": {
-                    "ok": False,
-                    "services": service_names,
-                    "tagged_host": False,
-                },
-                "failure_mode": "clean",
-                "manual_review_required": False,
-            },
-        )
-
-    raw_tags = self_payload.get("Tags")
-    tags = [str(tag).strip() for tag in raw_tags] if isinstance(raw_tags, list) else []
-    tags = [tag for tag in tags if tag]
-    hostname = str(
-        self_payload.get("HostName") or self_payload.get("DNSName") or ""
-    ).strip()
-    precheck = {
-        "ok": bool(tags),
-        "services": service_names,
-        "tagged_host": bool(tags),
-        "tags": tags,
-        "hostname": hostname,
-    }
-    if not tags:
-        raise ApplyFailed(
-            "tailscale service host precheck failed",
-            phase="tailscale_services",
-            details={
-                "error": TAILSCALE_SERVICE_TAG_REQUIRED_MESSAGE,
-                "command": command,
-                "tailscale_service_host_precheck": precheck,
-                "failure_mode": "clean",
-                "manual_review_required": False,
-            },
-        )
-    return precheck
-
-
-async def _apply_tailscale_paths(
-    paths: dict[str, str],
-    settings: Settings,
-    *,
-    services: ApplyServices | None = None,
-) -> dict[str, Any]:
-    services = services or default_apply_services()
-    state_path = settings.tailscale_serve_state_path
-    previous_paths = _read_tailscale_state(state_path)
-    previous_services = _read_tailscale_service_state(state_path)
-    if not paths and not previous_paths:
-        return {"tailscale_paths": []}
-
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    await _run_retryable_checked_command(
-        ["tailscale", "ip", "-4"],
-        timeout_sec=settings.command_timeout_status_sec,
-        settings=settings,
-        services=services,
-    )
-
-    for stale_path in sorted(set(previous_paths) - set(paths)):
-        for stale_path_variant in _tailscale_path_off_variants(stale_path):
-            await _run_tailscale_serve_off_idempotent(
-                [
-                    "tailscale",
-                    "serve",
-                    "--bg",
-                    "--yes",
-                    "--https=443",
-                    f"--set-path={stale_path_variant}",
-                    "off",
-                ],
-                timeout_sec=settings.command_timeout_apply_sec,
-                settings=settings,
-                services=services,
-            )
-
-    for path, target in sorted(paths.items()):
-        await _run_retryable_checked_command(
-            [
-                "tailscale",
-                "serve",
-                "--bg",
-                "--yes",
-                "--https=443",
-                f"--set-path={path}",
-                target,
-            ],
-            timeout_sec=settings.command_timeout_apply_sec,
-            settings=settings,
-            services=services,
-        )
-
-    _write_tailscale_state(state_path, paths=paths, services=previous_services)
-    return {
-        "tailscale_paths": [
-            {"path": path, "target": target} for path, target in sorted(paths.items())
-        ]
-    }
-
-
-async def _apply_tailscale_services(
-    services_map: dict[str, str],
-    settings: Settings,
-    *,
-    services: ApplyServices | None = None,
-) -> dict[str, Any]:
-    services = services or default_apply_services()
-    state_path = settings.tailscale_serve_state_path
-    previous_paths = _read_tailscale_state(state_path)
-    previous_services = _read_tailscale_service_state(state_path)
-    if not services_map and not previous_services:
-        return {"tailscale_services": []}
-
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    await _run_retryable_checked_command(
-        ["tailscale", "ip", "-4"],
-        timeout_sec=settings.command_timeout_status_sec,
-        settings=settings,
-        services=services,
-    )
-
-    for stale_service in sorted(set(previous_services) - set(services_map)):
-        await _run_tailscale_serve_off_idempotent(
-            [
-                "tailscale",
-                "serve",
-                "--yes",
-                f"--service=svc:{stale_service}",
-                "--https=443",
-                "off",
-            ],
-            timeout_sec=settings.command_timeout_apply_sec,
-            settings=settings,
-            services=services,
-        )
-
-    for service_name, target in sorted(services_map.items()):
-        await _run_retryable_checked_command(
-            [
-                "tailscale",
-                "serve",
-                "--yes",
-                f"--service=svc:{service_name}",
-                "--https=443",
-                target,
-            ],
-            timeout_sec=settings.command_timeout_apply_sec,
-            settings=settings,
-            services=services,
-        )
-
-    _write_tailscale_state(state_path, paths=previous_paths, services=services_map)
-    return {
-        "tailscale_services": [
-            {"service": service_name, "target": target}
-            for service_name, target in sorted(services_map.items())
-        ]
-    }
-
-
-async def _run_retryable_checked_command(
-    command: list[str],
-    *,
-    timeout_sec: int,
-    settings: Settings,
-    services: ApplyServices,
-) -> Any:
-    attempts = settings.transient_command_retry_attempts + 1
-
-    def should_retry(exc: Exception) -> bool:
-        return isinstance(exc, CommandError) and command_result_is_retryable(exc.result)
-
-    def log_retry(
-        exc: Exception, attempt: int, max_attempts: int, delay_sec: float
-    ) -> None:
-        logger.warning(
-            "apply.command.retrying",
-            command=" ".join(command),
-            attempt=attempt,
-            max_attempts=max_attempts,
-            backoff_sec=delay_sec,
-            error=str(exc),
-        )
-
-    return await retry_async_call(
-        lambda: services.runtime_services.run_command_checked_async(
-            command, timeout_sec=timeout_sec
-        ),
-        attempts=attempts,
-        backoff_sec=settings.transient_command_retry_backoff_sec,
-        should_retry=should_retry,
-        on_retry=log_retry,
-    )
-
-
-async def _run_tailscale_serve_off_idempotent(
-    command: list[str],
-    *,
-    timeout_sec: int,
-    settings: Settings,
-    services: ApplyServices,
-) -> Any:
-    try:
-        return await _run_retryable_checked_command(
-            command,
-            timeout_sec=timeout_sec,
-            settings=settings,
-            services=services,
-        )
-    except CommandError as exc:
-        if _tailscale_serve_off_missing_handler(exc):
-            logger.info("tailscale.serve_off.already_absent", command=" ".join(command))
-            return exc.result
-        raise
-
-
-def _tailscale_serve_off_missing_handler(exc: CommandError) -> bool:
-    result = exc.result
-    output = f"{result.stdout}\n{result.stderr}".lower()
-    return "handler does not exist" in output or "failed to remove web serve" in output
-
-
-def _tailscale_path_off_variants(path: str) -> list[str]:
-    variants = [path]
-    if path != "/" and path.endswith("/"):
-        variants.append(path.rstrip("/"))
-    elif path != "/":
-        variants.append(f"{path}/")
-    return list(dict.fromkeys(variants))
 
 
 async def _run_control_plane_self_audit_for_apply(
@@ -2240,92 +1099,6 @@ class _ApplyProgressTracker:
 def _append_unique(values: list[str], value: str) -> None:
     if value not in values:
         values.append(value)
-
-
-def _write_staged_managed_dir(
-    target_dir: Path,
-    desired_files: dict[str, str],
-    *,
-    prefix: str = MANAGED_PREFIX,
-) -> Path:
-    target_dir.mkdir(parents=True, exist_ok=True)
-    staged_dir = Path(
-        tempfile.mkdtemp(prefix=f".{target_dir.name}.stage.", dir=str(target_dir))
-    )
-
-    for filename, content in desired_files.items():
-        if not filename.startswith(prefix):
-            raise ApplyFailed(
-                f"managed filename must start with {prefix}: {filename}",
-                phase="sync_files",
-            )
-        _write_file_atomic(staged_dir / filename, content)
-
-    return staged_dir
-
-
-def _swap_managed_dir(target_dir: Path, staged_dir: Path) -> Path | None:
-    rollback_dir = Path(
-        tempfile.mkdtemp(prefix=f".{target_dir.name}.rollback.", dir=str(target_dir))
-    )
-    for path in list(target_dir.iterdir()):
-        if path == staged_dir or path == rollback_dir:
-            continue
-        if not path.name.startswith(MANAGED_PREFIX):
-            continue
-        os.replace(path, rollback_dir / path.name)
-    for path in list(staged_dir.iterdir()):
-        os.replace(path, target_dir / path.name)
-    staged_dir.rmdir()
-    return rollback_dir
-
-
-def _rollback_swapped_managed_dir(target_dir: Path, rollback_dir: Path | None) -> None:
-    if target_dir.exists():
-        for path in list(target_dir.iterdir()):
-            if rollback_dir is not None and path == rollback_dir:
-                continue
-            if path.name.startswith(MANAGED_PREFIX):
-                if path.is_dir():
-                    shutil.rmtree(path)
-                else:
-                    path.unlink()
-    if rollback_dir is not None and rollback_dir.exists():
-        for path in list(rollback_dir.iterdir()):
-            os.replace(path, target_dir / path.name)
-        rollback_dir.rmdir()
-
-
-def _finalize_swapped_managed_dir(rollback_dir: Path | None) -> None:
-    if rollback_dir is not None and rollback_dir.exists():
-        shutil.rmtree(rollback_dir)
-
-
-async def _restore_nginx_live_state_after_failure(
-    target_dir: Path,
-    rollback_dir: Path | None,
-    settings: Settings,
-    original_error: Exception,
-    *,
-    services: ApplyServices,
-) -> None:
-    _rollback_swapped_managed_dir(target_dir, rollback_dir)
-    try:
-        await services.runtime_services.run_command_checked_async(
-            ["systemctl", "reload", "nginx"],
-            timeout_sec=settings.command_timeout_apply_sec,
-        )
-    except CommandError as rollback_exc:
-        raise ApplyFailed(
-            "apply failed and nginx rollback reload failed",
-            phase="nginx_rollback",
-            details={
-                "rollback_command": rollback_exc.result.command,
-                "rollback_stdout": clip_output(rollback_exc.result.stdout),
-                "rollback_stderr": clip_output(rollback_exc.result.stderr),
-                "apply_error": _format_apply_error_details(original_error),
-            },
-        ) from original_error
 
 
 def _format_apply_error_details(error: Exception) -> dict[str, Any]:
@@ -2429,27 +1202,3 @@ def _enrich_apply_failure(
             details={**details, **context},
         )
     return ApplyFailed(str(error), phase=failed_phase or "unknown", details=context)
-
-
-def _nginx_rollback_mode(error: ApplyFailed) -> str:
-    completed_phases = error.details.get("completed_phases")
-    completed = completed_phases if isinstance(completed_phases, list) else []
-    return (
-        "restore_previous_live_state"
-        if "nginx_reload" in completed
-        else "remove_unloaded_candidate"
-    )
-
-
-def _write_file_atomic(target: Path, content: str) -> None:
-    target.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=f"{target.name}.tmp.", dir=str(target.parent)
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(content)
-        os.replace(tmp_name, target)
-    finally:
-        if os.path.exists(tmp_name):
-            os.unlink(tmp_name)

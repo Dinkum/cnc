@@ -54,6 +54,7 @@ def format_doctor_text(payload: dict[str, object]) -> str:
         "backend_observation_deferred": "guest observation deferred by another CNC command",
         "backend_observation_unavailable": "guest observation guard unavailable",
         "sandbox_observation_unavailable": "sandbox observation unavailable",
+        "sandbox_stopped": "sandbox exists but is stopped",
         "backend_exec_unavailable": "backend exec unavailable",
         "sandbox_missing": "sandbox missing",
         "guest_init_broken": "guest init broken",

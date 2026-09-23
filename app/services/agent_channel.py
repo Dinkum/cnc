@@ -29,6 +29,7 @@ from app.access import (
 from app.config import Settings
 from app.logger import get_logger
 from app.models.entities import Backend
+from app.services.commands import guest_timeout_args
 from app.services.guest_exec import (
     BackendGuestExecGuardState,
     backend_guest_exec_guard,
@@ -879,31 +880,15 @@ async def _run_exec_frame(
                 )
                 return
             await _finish_exec_process(process, stream_tasks)
-            if code == 124:
-                logger.warning(
-                    "agent_channel.exec_timeout",
-                    backend_id=backend.id,
-                    backend=backend.name,
-                    container=backend.container,
-                    frame_id=frame_id,
-                    process_pid=process.pid,
-                    timeout_kind="guest",
-                    timeout_sec=timeout_sec,
-                    duration_ms=_duration_ms(started_at),
-                )
-                open_guest_exec_circuit(
-                    settings,
-                    backend.name,
-                    timeout_sec=timeout_sec,
-                    error="guest command timeout exceeded",
-                    source="agent_exec",
-                )
+            # A returned 124 may mean GNU timeout reached the guest deadline or
+            # that the application itself exited 124. Podman completed either
+            # way; only the host wait timeout above proves an uncertain exec.
             _log_exec_finished(
                 backend,
                 frame_id,
                 process,
                 started_at,
-                outcome="timeout" if code == 124 else "exited",
+                outcome="exited",
                 exit_code=code,
             )
             exec_finished_logged = True
@@ -1095,16 +1080,12 @@ def _exec_command(
             raise AgentChannelFrameError(
                 "invalid_shell", "shell command cannot be blank"
             )
-        guest_timeout = max(1, timeout_sec - 1)
         return [
             "podman",
             "exec",
             "-i",
             container,
-            "timeout",
-            "--signal=TERM",
-            "--kill-after=1s",
-            f"{guest_timeout}s",
+            *guest_timeout_args(timeout_sec),
             "bash",
             "-lc",
             shell,
@@ -1117,16 +1098,12 @@ def _exec_command(
         raise AgentChannelFrameError(
             "invalid_argv", "argv values must be non-empty strings"
         )
-    guest_timeout = max(1, timeout_sec - 1)
     return [
         "podman",
         "exec",
         "-i",
         container,
-        "timeout",
-        "--signal=TERM",
-        "--kill-after=1s",
-        f"{guest_timeout}s",
+        *guest_timeout_args(timeout_sec),
         *values,
     ]
 

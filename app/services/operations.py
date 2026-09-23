@@ -39,10 +39,18 @@ HOST_MUTATION_OPERATION_KINDS = (
     "cli.route.connect",
     "cli.route.disconnect",
     "apply_host",
+    "api.backend.create",
+    "api.backend.toggle",
+    "api.backend.update",
+    "api.input.create",
+    "api.input.delete",
+    "api.input.update",
     "auto_size",
     "backup_backend",
     "clone_backend",
     "cloudflare_sync",
+    "cloudflare_domain",
+    "cloudflare_domains_sync",
     "create_backend",
     "delete_backend",
     "delete_backend_backup",
@@ -700,6 +708,38 @@ def try_acquire_host_mutation_lock(settings: Settings) -> FileLock | None:
     except BlockingIOError:
         return None
     return lock
+
+
+@asynccontextmanager
+async def host_mutation_lock(settings: Settings):
+    """Hold the host mutation lock without opening an operation.
+
+    The commit boundary needs the lock for longer than convergence does. Apply
+    releases it when its own operation ends, which left a window between
+    convergence and the database commit where a competing mutation could
+    change the host underneath a recovery that was about to restore it.
+
+    Reentrant through the same depth counter as ``host_mutation_operation``, so
+    wrapping an apply that acquires it internally is safe and acquires nothing
+    twice.
+    """
+    if _LOCK_DEPTH.get() > 0:
+        yield
+        return
+    lock_path = _host_lock_path(settings)
+    lock = FileLock(lock_path, blocking=False, lock_path=lock_path)
+    try:
+        lock.__enter__()
+    except BlockingIOError as exc:
+        raise HostMutationLockError(
+            "another host mutation is already running"
+        ) from exc
+    token = _LOCK_DEPTH.set(_LOCK_DEPTH.get() + 1)
+    try:
+        yield
+    finally:
+        _LOCK_DEPTH.reset(token)
+        lock.__exit__(None, None, None)
 
 
 @asynccontextmanager

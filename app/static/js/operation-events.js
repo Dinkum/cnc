@@ -13,7 +13,12 @@
     return `${url.pathname}${url.search}`;
   };
 
-  const normalizeStatus = (payload) => String(payload?.status || "").toLowerCase();
+  const normalizeStatus = (payload) => {
+    const presented = String(payload?.presentation?.status_label || "").toLowerCase();
+    if (presented === "saved") return "success";
+    if (presented === "failed") return "failed";
+    return String(payload?.status || "").toLowerCase();
+  };
 
   const responseError = async (response) => {
     const payload = await response.json().catch(() => ({}));

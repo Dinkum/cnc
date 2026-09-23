@@ -41,7 +41,7 @@ from app.services.inter_app_interfaces import (
     clean_interface_direction,
     clean_interface_status,
 )
-from app.services.mutation_apply import commit_and_apply
+from app.services.config_change import converge_change, output_change
 from app.services.operation_runtime import (
     create_output_progress_plan,
     delete_output_progress_plan,
@@ -52,7 +52,7 @@ from app.services.operations import (
     create_operation,
 )
 from app.services.shield_service import make_code_hash
-from app.services.ssh_access import remove_backend_ssh_access
+from app.services.ssh_access import deferred_backend_ssh_reconcile, remove_backend_ssh_access
 from app.services.validators import ValidationError
 from app.ui.dashboard.context import cached_dashboard_context
 from app.ui.errors import operator_action_error as _operator_action_error
@@ -92,6 +92,7 @@ from app.ui.operations.output_save import (
     _run_update_backend_state_operation,
 )
 from app.ui.outputs.context import output_page_context
+from app.ui.outputs.settings import backend_section_payload
 from app.ui.progress import (
     _output_save_progress_details,
     _planned_operation_progress_details,
@@ -238,10 +239,12 @@ async def create_backend_form(
             return _operation_response(operation, message="Creating output.")
         backend = await backend_commands.create_backend(session, payload, commit=False)
         attached_input_ids = [item.id for item in backend.inputs]
-        mutation = await commit_and_apply(
+        mutation = await converge_change(
             session,
             settings,
-            operation="ui.backend.create",
+            change=output_change(
+                "ui.backend.create", str(backend.name or "")
+            ),
             apply_runner=run_apply,
         )
         apply_response = mutation.apply_response
@@ -484,10 +487,12 @@ async def update_backend_form(
         backend = await backend_commands.update_backend(
             session, backend_id, payload, commit=False
         )
-        mutation = await commit_and_apply(
+        mutation = await converge_change(
             session,
             settings,
-            operation="ui.backend.update",
+            change=output_change(
+                "ui.backend.update", str(backend.name or "")
+            ),
             apply_runner=run_apply,
         )
         apply_response = mutation.apply_response
@@ -527,6 +532,69 @@ async def update_backend_form(
         context["request"] = request
         context["flash_error"] = f"failed to update output: {exc}"
         return render_output_template(request, settings, context, status_code=400)
+
+
+@router.post("/ui/backends/{backend_id}/settings/{section}")
+async def update_backend_section_form(
+    backend_id: int,
+    section: str,
+    request: Request,
+    csrf_token: str = Form(...),
+    settings: Settings = Depends(settings_dependency),
+    session: AsyncSession = Depends(db_session_dependency),
+) -> Response:
+    enforce_csrf(request, settings, csrf_token)
+    backend = await session.get(Backend, backend_id)
+    if backend is None:
+        return _operator_error_json(
+            "Output not found.",
+            ErrorCode.UI_RESOURCE_NOT_FOUND,
+            key="flash_error",
+            status_code=404,
+        )
+    form = await request.form()
+    values = {key: value for key, value in form.items() if key != "csrf_token"}
+    try:
+        backend_section_payload(backend, settings, section, values)
+    except ValidationError as exc:
+        return _operator_error_json(
+            str(exc),
+            ErrorCode.UI_ACTION_UNAVAILABLE,
+            key="flash_error",
+            status_code=400,
+        )
+    blocked = await _output_host_mutation_preflight(
+        request, session, settings, backend_id=backend_id, action="Output save"
+    )
+    if blocked is not None:
+        return blocked
+    operation = await create_operation(
+        settings,
+        kind="ui.backend.update",
+        actor="ui",
+        backend_id=backend_id,
+        phase="Validate output",
+        details=_output_save_progress_details(
+            0,
+            "Reading output form.",
+            phase="Validate output",
+            substate="Reading output form",
+            backend_id=backend_id,
+            backend_name=backend.name,
+            section=section,
+        ),
+    )
+    tasks = BackgroundTasks()
+    tasks.add_task(
+        _run_update_backend_operation,
+        settings,
+        operation.id,
+        backend_id,
+        {"section": section, "values": values},
+    )
+    response = _operation_response(operation, message="Output save started.")
+    response.background = tasks
+    return response
 
 
 @router.post("/ui/backends/{backend_id}/inputs")
@@ -607,10 +675,12 @@ async def update_backend_inputs_form(
             commit=False,
         )
         attached_input_ids = [item.id for item in backend.inputs]
-        mutation = await commit_and_apply(
+        mutation = await converge_change(
             session,
             settings,
-            operation="ui.backend.inputs",
+            change=output_change(
+                "ui.backend.inputs", str(backend.name or "")
+            ),
             apply_runner=run_apply,
         )
         logger.info(
@@ -861,10 +931,10 @@ async def update_backend_state_form(
             session, backend_id, target_enabled, commit=False
         )
         backend_name = str(backend.name or "")
-        mutation = await commit_and_apply(
+        mutation = await converge_change(
             session,
             settings,
-            operation="ui.backend.state",
+            change=output_change("ui.backend.state", backend_name),
             apply_runner=run_apply,
         )
         logger.info(
@@ -1006,23 +1076,14 @@ async def delete_backend_form(
     try:
         await session.delete(backend)
         services = default_apply_services()
-
-        async def _skip_backend_ssh_reconcile(
-            backends: list[str], _settings: Settings
-        ) -> dict[str, object]:
-            desired = sorted(set(backends))
-            return {
-                "ssh_backends": desired,
-                "ssh_aliases_enabled": bool(desired),
-                "ssh_reconcile_deferred": True,
-            }
-
-        services.reconcile_backend_ssh_access = _skip_backend_ssh_reconcile
+        services.reconcile_backend_ssh_access = deferred_backend_ssh_reconcile
         services.cleanup_deleted_app_filesystem = False
-        mutation = await commit_and_apply(
+        mutation = await converge_change(
             session,
             settings,
-            operation="ui.backend.delete",
+            change=output_change(
+                "ui.backend.delete", deleted_backend_name
+            ),
             apply_runner=run_apply,
             apply_services=services,
         )

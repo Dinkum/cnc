@@ -188,6 +188,42 @@ def _coerce_backend_access(
     )
 
 
+def backend_ssh_names(
+    backends: list[str]
+    | list[Backend]
+    | list[BackendSshAccess]
+    | list[Mapping[str, object]],
+) -> list[str]:
+    return [entry.name for entry in _coerce_backend_access(backends)]
+
+
+async def deferred_backend_ssh_reconcile(
+    backends: list[str]
+    | list[Backend]
+    | list[BackendSshAccess]
+    | list[Mapping[str, object]],
+    _settings: Settings,
+    *,
+    scoped_to: set[str] | None = None,
+) -> dict[str, object]:
+    """Report the desired accounts without touching the host.
+
+    Deletion defers its SSH work until after the durable commit, so this
+    stands in for the real reconciler during convergence. It takes the same
+    ``scoped_to`` the tool passes every reconciler and records it, rather
+    than applying it: ``scoped_to`` narrows which accounts a reconciler may
+    change, and this one changes none. Refusing the argument instead failed
+    the whole delete, which is what happened before it was accepted here.
+    """
+    desired = backend_ssh_names(backends)
+    return {
+        "ssh_backends": desired,
+        "ssh_aliases_enabled": bool(desired),
+        "ssh_reconcile_deferred": True,
+        "ssh_scope": sorted(scoped_to) if scoped_to is not None else "all",
+    }
+
+
 def _backend_authorized_keys_path(settings: Settings, backend: str) -> Path:
     return settings.ssh_backend_home_root / backend / ".ssh" / "authorized_keys"
 
@@ -270,11 +306,12 @@ def _sshd_config(settings: Settings) -> str:
 def _sudoers_config(settings: Settings) -> str:
     wrapper = settings.ssh_backend_root_wrapper_path
     group = settings.ssh_backend_group
+    # Ubuntu does not require a TTY by default. Avoid the legacy requiretty
+    # option, which sudo-rs rejects instead of ignoring.
     return (
         "# Managed by CNC\n"
         f"%{group} ALL=(root) NOPASSWD: {wrapper}\n"
         f'Defaults!{wrapper} env_keep += "SSH_ORIGINAL_COMMAND SSH_CONNECTION"\n'
-        f"Defaults!{wrapper} !requiretty\n"
     )
 
 
@@ -459,7 +496,21 @@ async def reconcile_backend_ssh_access(
     | list[BackendSshAccess]
     | list[Mapping[str, object]],
     settings: Settings,
+    *,
+    scoped_to: set[str] | None = None,
 ) -> dict[str, object]:
+    """Converge host accounts to the enabled app outputs.
+
+    ``scoped_to`` limits which accounts this call may create, re-key or delete.
+    A scoped save passes the outputs it concerns, so editing one output cannot
+    also create, rewrite or remove another output's account. ``None`` means
+    every account, which is what an explicit full reconcile wants.
+
+    The shared files stay whole either way. ``authorized_keys``, the sshd
+    drop-in and the sudoers file are single artifacts rendered from every
+    enabled output, exactly like nginx's generated tree, so they are always
+    written in full. What scope limits is per-account mutation.
+    """
     async with _host_account_mutation_lock(settings):
         desired_access = _coerce_backend_access(backends)
         desired = [entry.name for entry in desired_access]
@@ -498,7 +549,14 @@ async def reconcile_backend_ssh_access(
             settings.ssh_backend_home_root.mkdir(parents=True, exist_ok=True)
 
             existing = _existing_backend_ssh_users(settings)
+            out_of_scope: list[str] = []
             for access in desired_access:
+                if scoped_to is not None and access.name not in scoped_to:
+                    # Another output's account. If it needs work that is a real
+                    # problem, but it is not this change's to fix.
+                    if not _backend_user_exists(access.name):
+                        out_of_scope.append(access.name)
+                    continue
                 existed_before = _backend_user_exists(access.name)
                 await _ensure_backend_user(access.name, settings)
                 if not existed_before and _backend_user_exists(access.name):
@@ -512,7 +570,10 @@ async def reconcile_backend_ssh_access(
             if changed:
                 await _reload_sshd()
 
-            for backend in sorted(existing - set(desired)):
+            stale = existing - set(desired)
+            if scoped_to is not None:
+                stale &= scoped_to
+            for backend in sorted(stale):
                 try:
                     await _remove_backend_user(backend)
                     changed = True
@@ -554,7 +615,13 @@ async def reconcile_backend_ssh_access(
         result: dict[str, object] = {
             "ssh_backends": desired,
             "ssh_aliases_enabled": bool(desired),
+            # Whether anything on the host actually moved. Callers use this to
+            # decide clean versus partial, so it has to be reported rather
+            # than inferred from the fact that this ran.
+            "ssh_changed": changed,
         }
+        if out_of_scope:
+            result["ssh_accounts_out_of_scope"] = sorted(out_of_scope)
         if stale_user_remove_errors:
             result["stale_user_remove_errors"] = stale_user_remove_errors
         return result

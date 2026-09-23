@@ -38,7 +38,7 @@ _APP_SANDBOX_PROFILES: dict[str, SandboxProfile] = {
         label="Ubuntu 24.04 + systemd",
         seed_image="docker.io/library/ubuntu:24.04",
         init_command=("/sbin/init",),
-        seed_revision=4,
+        seed_revision=5,
         provision_steps=(
             SandboxProvisionStep(
                 step_id="provision_package_catalog",

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Annotated
+
 from fastapi import (
     APIRouter,
     BackgroundTasks,
@@ -30,7 +32,7 @@ from app.services.error_reporting import (
     ErrorCode,
     error_context,
 )
-from app.services.mutation_apply import commit_and_apply
+from app.services.config_change import converge_change, route_change
 from app.services.operation_runtime import delete_input_progress_plan
 from app.services.operations import (
     active_host_mutation_blocker,
@@ -112,6 +114,7 @@ async def create_input_form(
     kind: str = Form("domain"),
     value: str = Form(...),
     enabled: bool = Form(False),
+    https_enabled: Annotated[bool, Form()] = False,
     session: AsyncSession = Depends(db_session_dependency),
 ) -> HTMLResponse:
     enforce_csrf(request, settings, csrf_token)
@@ -151,6 +154,7 @@ async def create_input_form(
             value=value,
             backend_ids=form.getlist("backend_ids"),
             enabled=enabled,
+            https_enabled=https_enabled if kind == "domain" else False,
         )
         if async_dashboard:
             operation = await create_operation(
@@ -177,6 +181,7 @@ async def create_input_form(
                     "value": value,
                     "backend_ids": [str(item) for item in form.getlist("backend_ids")],
                     "enabled": enabled,
+                    "https_enabled": https_enabled if kind == "domain" else False,
                 },
             )
             response = _operation_response(operation, message="Input create started.")
@@ -184,10 +189,12 @@ async def create_input_form(
             return response
         item = await input_commands.create_input(session, payload, commit=False)
         attached_backend_ids = [backend.id for backend in item.backends]
-        mutation = await commit_and_apply(
+        mutation = await converge_change(
             session,
             settings,
-            operation="ui.input.create",
+            change=route_change(
+                "ui.input.create", {str(b.name) for b in item.backends}
+            ),
             apply_runner=run_apply,
         )
         apply_response = mutation.apply_response
@@ -330,11 +337,16 @@ async def _delete_input_and_redirect(
     snapshot = {
         "hostname": item.hostname,
     }
+    # Captured before the delete: these are the outputs whose ingress this
+    # change affects, and the only ones it may touch.
+    detached_output_names = {str(backend.name) for backend in item.backends}
     await input_commands.delete_input(session, input_id)
-    mutation = await commit_and_apply(
+    mutation = await converge_change(
         session,
         settings,
-        operation="ui.input.delete",
+        change=route_change(
+                "ui.input.delete", detached_output_names
+            ),
         apply_runner=run_apply,
     )
     apply_response = mutation.apply_response
@@ -396,6 +408,7 @@ async def update_input_form(
     kind: str | None = Form(None),
     value: str | None = Form(None),
     enabled: bool = Form(False),
+    https_enabled: Annotated[bool, Form()] = False,
     shield_enabled: bool = Form(False),
     shield_access_code: str = Form(""),
     action: str = Form("save"),
@@ -467,6 +480,7 @@ async def update_input_form(
             value=item.hostname,
             backend_ids=form.getlist("backend_ids"),
             enabled=next_enabled,
+            https_enabled=https_enabled if item.kind == "domain" else False,
             shield_enabled=shield_enabled if item.kind == "domain" else False,
             shield_code_hash=shield_code_hash,
             shield_access_code=shield_access_code_display,
@@ -498,6 +512,7 @@ async def update_input_form(
                         str(value) for value in form.getlist("backend_ids")
                     ],
                     "enabled": next_enabled,
+                    "https_enabled": https_enabled if item.kind == "domain" else False,
                     "shield_enabled": shield_enabled,
                     "shield_access_code": shield_access_code,
                 },
@@ -509,10 +524,12 @@ async def update_input_form(
             session, input_id, payload, commit=False
         )
         attached_backend_ids = [backend.id for backend in item.backends]
-        mutation = await commit_and_apply(
+        mutation = await converge_change(
             session,
             settings,
-            operation="ui.input.update",
+            change=route_change(
+                "ui.input.update", {str(b.name) for b in item.backends}
+            ),
             apply_runner=run_apply,
         )
         logger.info(

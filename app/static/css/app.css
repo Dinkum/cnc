@@ -2403,31 +2403,11 @@ a.tab {
   justify-content: flex-end;
 }
 
-.delete-progress-state {
+.progress-state {
   display: grid;
   gap: 14px;
 }
 
-.delete-progress-fill {
-  background: linear-gradient(90deg, rgba(96, 193, 255, 0.82), rgba(126, 226, 255, 0.98));
-  animation: delete-progress-pulse 1.4s ease-in-out infinite;
-}
-
-.delete-progress-fill.is-complete {
-  width: 100% !important;
-  animation: none;
-  opacity: 1;
-}
-
-@keyframes delete-progress-pulse {
-  0%,
-  100% {
-    opacity: 0.68;
-  }
-  50% {
-    opacity: 1;
-  }
-}
 
 .clone-modal-card {
   width: min(560px, calc(100vw - 32px));
@@ -2708,81 +2688,13 @@ a.tab {
   border-left: 1px solid rgba(146, 174, 226, 0.18);
 }
 
-.clone-progress-head {
+.progress-head {
   display: flex;
   justify-content: space-between;
   gap: 12px;
   align-items: center;
 }
 
-.clone-progress-track {
-  height: 12px;
-  border-radius: 999px;
-  border: 1px solid rgba(146, 174, 226, 0.18);
-  background: rgba(6, 9, 15, 0.96);
-  overflow: hidden;
-}
-
-.clone-progress-fill {
-  display: block;
-  height: 100%;
-  width: 0;
-  border-radius: inherit;
-  background: linear-gradient(90deg, rgba(81, 203, 255, 0.95), rgba(174, 240, 255, 0.98));
-  box-shadow: 0 0 24px rgba(81, 203, 255, 0.28);
-  transition: width 260ms ease;
-}
-
-.output-save-progress-banner {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-}
-
-.output-save-progress-copy {
-  display: grid;
-  gap: 4px;
-  min-width: 0;
-}
-
-.output-save-progress-copy strong,
-.output-save-progress-copy span {
-  overflow-wrap: anywhere;
-}
-
-.output-save-progress-track {
-  grid-column: 1 / -1;
-  height: 8px;
-}
-
-.clone-progress-log {
-  display: grid;
-  gap: 8px;
-  min-height: 108px;
-  max-height: 160px;
-  padding: 14px 16px;
-  border-radius: 16px;
-  border: 1px solid rgba(146, 174, 226, 0.12);
-  background: rgba(8, 11, 18, 0.96);
-  overflow: auto;
-}
-
-.clone-progress-line {
-  color: #dbe7ff;
-  font-size: 0.82rem;
-  line-height: 1.5;
-}
-
-.clone-progress-line::before {
-  content: "";
-  display: inline-block;
-  width: 7px;
-  height: 7px;
-  margin-right: 10px;
-  border-radius: 999px;
-  background: rgba(242, 193, 107, 0.9);
-  box-shadow: 0 0 12px rgba(242, 193, 107, 0.42);
-}
 
 .clone-success-copy,
 .clone-error-copy {
@@ -2790,42 +2702,6 @@ a.tab {
   gap: 8px;
 }
 
-.transfer-mini-card {
-  position: fixed;
-  left: max(16px, env(safe-area-inset-left));
-  right: max(16px, env(safe-area-inset-right));
-  bottom: max(16px, env(safe-area-inset-bottom));
-  z-index: 30;
-  display: grid;
-  grid-template-columns: minmax(180px, 1fr) minmax(180px, 320px) auto;
-  align-items: center;
-  gap: 14px;
-  width: min(780px, calc(100vw - 32px));
-  margin-inline: auto;
-  padding: 14px;
-  border: 1px solid rgba(126, 226, 255, 0.24);
-  border-radius: 16px;
-  background: rgba(13, 27, 46, 0.96);
-  box-shadow: var(--shadow);
-}
-
-.transfer-mini-card[hidden] {
-  display: none;
-}
-
-.transfer-mini-card > div:first-child {
-  display: grid;
-  gap: 3px;
-}
-
-.transfer-mini-card strong {
-  color: var(--text);
-}
-
-.transfer-mini-card span {
-  color: var(--muted);
-  font-size: 0.84rem;
-}
 
 .button-link {
   display: inline-flex;
@@ -3146,51 +3022,6 @@ label {
   margin-top: 16px;
 }
 
-.output-inline-save-progress {
-  display: grid;
-  gap: 8px;
-  margin-top: 12px;
-  max-width: 420px;
-}
-
-.output-settings-save-progress {
-  grid-column: 1 / -1;
-  max-width: none;
-}
-
-.output-inline-save-progress[hidden] {
-  display: none;
-}
-
-.output-inline-save-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  color: #dce8ff;
-  font-family: var(--mono);
-  font-size: 0.72rem;
-  font-weight: 800;
-  letter-spacing: 0;
-  text-transform: uppercase;
-}
-
-.output-inline-save-head span:first-child {
-  min-width: 0;
-  overflow-wrap: anywhere;
-}
-
-.output-inline-save-track {
-  height: 8px;
-}
-
-.output-inline-save-progress[data-state="success"] .clone-progress-fill {
-  background: linear-gradient(90deg, rgba(112, 231, 173, 0.92), rgba(174, 240, 255, 0.98));
-}
-
-.output-inline-save-progress[data-state="error"] .clone-progress-fill {
-  background: linear-gradient(90deg, rgba(255, 108, 127, 0.92), rgba(255, 190, 164, 0.96));
-}
 
 .backup-action-buttons {
   display: flex;
@@ -4470,19 +4301,32 @@ td {
   background: rgba(255, 255, 255, 0.022);
 }
 
-.click-row.is-pending {
-  --pending-spot-x: 12%;
+/* ── busy row: one halo around the whole thing ──
+   A row and its expanded detail are one object, so they get one boundary and
+   one sweep. The summary row carries the ring; when the detail is open it
+   carries the bottom edge instead, and the detail row closes the shape. */
+.click-row.is-busy {
+  --busy-spot-x: 12%;
   background:
-    radial-gradient(circle at var(--pending-spot-x) 50%, rgba(255, 237, 184, 0.24), rgba(242, 193, 107, 0.09) 24%, transparent 48%),
+    radial-gradient(circle at var(--busy-spot-x) 50%, rgba(255, 237, 184, 0.24), rgba(242, 193, 107, 0.09) 24%, transparent 48%),
     linear-gradient(90deg, rgba(242, 193, 107, 0.08), rgba(147, 227, 255, 0.04)),
     rgba(10, 14, 22, 0.86);
   box-shadow:
-    inset 0 0 0 1px rgba(242, 193, 107, 0.22),
+    inset 0 0 0 1px rgba(242, 193, 107, 0.34),
     0 0 28px rgba(242, 193, 107, 0.11);
-  animation: pending-glow 2.8s ease-in-out infinite;
+  animation: busy-sweep 2.8s ease-in-out infinite;
 }
 
-.click-row.is-pending td {
+/* Detail open: drop the summary row's bottom edge so the two read as one box. */
+.click-row.is-busy:has(+ .detail-row.is-busy:not([hidden])) {
+  box-shadow:
+    inset 1px 0 0 rgba(242, 193, 107, 0.34),
+    inset -1px 0 0 rgba(242, 193, 107, 0.34),
+    inset 0 1px 0 rgba(242, 193, 107, 0.34),
+    0 0 28px rgba(242, 193, 107, 0.11);
+}
+
+.click-row.is-busy td {
   position: relative;
   z-index: 1;
   background: transparent !important;
@@ -4508,56 +4352,45 @@ td {
   padding: 20px;
 }
 
-.click-row.is-pending + .detail-row td,
-.detail-row.is-pending td {
-  background: rgba(242, 193, 107, 0.055);
+/* The detail row closes the shape: sides and bottom, no top edge, no second
+   sweep of its own. The card inside stays plain. */
+.detail-row.is-busy {
+  --busy-spot-x: 12%;
+  background:
+    radial-gradient(circle at var(--busy-spot-x) 50%, rgba(255, 237, 184, 0.14), rgba(242, 193, 107, 0.06) 24%, transparent 48%),
+    rgba(242, 193, 107, 0.055);
+  box-shadow:
+    inset 1px 0 0 rgba(242, 193, 107, 0.34),
+    inset -1px 0 0 rgba(242, 193, 107, 0.34),
+    inset 0 -1px 0 rgba(242, 193, 107, 0.34),
+    0 0 28px rgba(242, 193, 107, 0.11);
+  animation: busy-sweep 2.8s ease-in-out infinite;
+}
+
+.detail-row.is-busy td {
+  background: transparent;
   border-bottom-color: rgba(242, 193, 107, 0.18);
 }
 
-.detail-card.is-pending {
-  --pending-spot-x: 12%;
-  overflow: hidden;
-  background:
-    radial-gradient(circle at var(--pending-spot-x) 50%, rgba(255, 237, 184, 0.24), rgba(242, 193, 107, 0.09) 24%, transparent 48%),
-    linear-gradient(90deg, rgba(242, 193, 107, 0.08), rgba(147, 227, 255, 0.04)),
-    rgba(10, 14, 22, 0.86);
-  box-shadow:
-    inset 0 0 0 1px rgba(242, 193, 107, 0.22),
-    0 0 28px rgba(242, 193, 107, 0.11);
-  animation: pending-glow 2.8s ease-in-out infinite;
-}
-
-@property --pending-spot-x {
+@property --busy-spot-x {
   syntax: "<percentage>";
   inherits: false;
   initial-value: 12%;
 }
 
-@keyframes pending-glow {
+@keyframes busy-sweep {
   0%, 100% {
-    --pending-spot-x: 12%;
-    box-shadow:
-      inset 0 0 0 1px rgba(242, 193, 107, 0.2),
-      0 0 22px rgba(242, 193, 107, 0.08);
+    --busy-spot-x: 12%;
   }
   50% {
-    --pending-spot-x: 86%;
-    box-shadow:
-      inset 0 0 0 1px rgba(242, 193, 107, 0.3),
-      0 0 34px rgba(242, 193, 107, 0.14);
+    --busy-spot-x: 86%;
   }
 }
 
-@keyframes pending-breathe {
-  0%, 100% {
-    box-shadow:
-      inset 0 0 0 1px rgba(242, 193, 107, 0.08),
-      0 0 0 rgba(242, 193, 107, 0);
-  }
-  50% {
-    box-shadow:
-      inset 0 0 0 1px rgba(242, 193, 107, 0.16),
-      0 0 28px rgba(242, 193, 107, 0.12);
+@media (prefers-reduced-motion: reduce) {
+  .click-row.is-busy,
+  .detail-row.is-busy {
+    animation: none;
   }
 }
 
@@ -5362,8 +5195,7 @@ pre {
     justify-content: flex-start;
   }
 
-  .node-details-actions,
-  .transfer-mini-card {
+  .node-details-actions {
     grid-template-columns: 1fr;
   }
 
@@ -5571,7 +5403,6 @@ pre {
 .operation-history-result { font-size: 0.7rem; border-radius: 5px; padding: 3px 6px; background: rgba(148, 163, 184, 0.12); }
 .operation-history-result[data-status="success"] { color: #8ad7b1; }
 .operation-history-result[data-status="failed"] { color: #f4a4a4; }
-.operation-history-result[data-status="partial"] { color: #edcc85; }
 .operation-history-detail { padding: 0 0 10px; font-size: 0.78rem; overflow-wrap: anywhere; }
 .operation-history-detail p { margin: 0 0 6px; white-space: pre-wrap; }
 .operation-history-pagination { font-size: 0.75rem; flex-shrink: 0; white-space: nowrap; }
@@ -5648,3 +5479,259 @@ pre {
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
 }
 .metric-export-options button { width: 100%; text-align: left; white-space: nowrap; }
+
+/* ---------------------------------------------------------------------------
+   Progress component
+   One track and two surfaces for every operation pipeline. The card is for work
+   the user can walk away from; the dialog is for work that blocks.
+   --------------------------------------------------------------------------- */
+
+.progress-track {
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  border: 1px solid rgba(146, 174, 226, 0.18);
+  background: rgba(6, 9, 15, 0.96);
+}
+
+.progress-track--sm {
+  height: 4px;
+  border: 0;
+  background: rgba(146, 174, 226, 0.14);
+}
+
+.progress-fill {
+  display: block;
+  position: relative;
+  overflow: hidden;
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, rgba(81, 203, 255, 0.95), rgba(174, 240, 255, 0.98));
+  box-shadow: 0 0 24px rgba(81, 203, 255, 0.28);
+  transition: width 260ms ease;
+}
+
+.progress-fill[data-tone="success"] {
+  background: linear-gradient(90deg, rgba(112, 231, 173, 0.92), rgba(174, 240, 255, 0.98));
+  box-shadow: 0 0 24px rgba(112, 231, 173, 0.26);
+}
+
+.progress-fill[data-tone="error"] {
+  background: linear-gradient(90deg, rgba(255, 108, 127, 0.92), rgba(255, 190, 164, 0.96));
+  box-shadow: 0 0 24px rgba(255, 108, 127, 0.24);
+}
+
+/* A moving highlight reads as "still working" even when the bar is between
+   reported steps. Only ever shown while running. */
+.progress-fill[data-tone="running"]::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  width: 48%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.46), transparent);
+  transform: translateX(-130%);
+  animation: progress-sweep 1500ms ease-in-out infinite;
+}
+
+@keyframes progress-sweep {
+  0% { transform: translateX(-130%); }
+  100% { transform: translateX(230%); }
+}
+
+.progress-log {
+  display: grid;
+  gap: 8px;
+  min-height: 108px;
+  max-height: 160px;
+  padding: 14px 16px;
+  border-radius: 16px;
+  border: 1px solid rgba(146, 174, 226, 0.12);
+  background: rgba(8, 11, 18, 0.96);
+  overflow: auto;
+}
+
+.progress-log-line {
+  color: #dbe7ff;
+  font-size: 0.82rem;
+  line-height: 1.5;
+}
+
+.progress-log-line::before {
+  content: "";
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 10px;
+  border-radius: 999px;
+  background: rgba(242, 193, 107, 0.9);
+  box-shadow: 0 0 12px rgba(242, 193, 107, 0.42);
+}
+
+/* --- card surface --------------------------------------------------------- */
+
+.progress-card-shell {
+  position: fixed;
+  left: 28px;
+  right: 28px;
+  bottom: 24px;
+  z-index: 30;
+  display: flex;
+  flex-direction: column-reverse;
+  gap: 12px;
+  pointer-events: none;
+  /* A toast stack, not a full-bleed footer: cap the width on wide screens and
+     let it sit against the right edge. */
+  width: auto;
+  max-width: 520px;
+  margin-left: auto;
+}
+
+.progress-card-shell[hidden] {
+  display: none;
+}
+
+.progress-card {
+  pointer-events: auto;
+  position: relative;
+  display: grid;
+  gap: 9px;
+  min-height: 86px;
+  padding: 14px 54px 12px 16px;
+  border-radius: 16px;
+  border: 1px solid var(--line);
+  background: rgba(14, 20, 33, 0.82);
+  box-shadow: 0 28px 80px rgba(0, 0, 0, 0.45);
+}
+
+.progress-card[data-tone="running"] {
+  border-color: rgba(242, 193, 107, 0.26);
+}
+
+.progress-card[data-tone="success"] {
+  border-color: rgba(135, 242, 184, 0.42);
+  background:
+    linear-gradient(180deg, rgba(61, 188, 116, 0.12), rgba(61, 188, 116, 0.04)),
+    rgba(14, 24, 28, 0.9);
+  box-shadow:
+    0 28px 80px rgba(0, 0, 0, 0.45),
+    0 0 0 1px rgba(135, 242, 184, 0.08),
+    0 0 36px rgba(87, 214, 140, 0.13);
+}
+
+.progress-card[data-tone="error"] {
+  border-color: rgba(231, 112, 112, 0.28);
+}
+
+.progress-card-body {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.progress-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.progress-card-head strong {
+  font-size: 1rem;
+  letter-spacing: -0.02em;
+  color: #f4f8ff;
+}
+
+.progress-card-meta {
+  display: flex;
+  min-width: 0;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  align-self: center;
+  gap: 8px;
+}
+
+.progress-card-stage {
+  color: #dce8ff;
+  font-size: 0.9rem;
+}
+
+.progress-card[data-tone="success"] .progress-card-stage {
+  color: #9bf0c7;
+}
+
+.progress-card-note {
+  min-width: 0;
+  margin: 0;
+  color: var(--muted);
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-height: 1.35;
+}
+
+.progress-card-close {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  width: 30px;
+  min-width: 0;
+  max-width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  line-height: 1;
+  z-index: 2;
+  border-radius: 999px;
+  border: 1px solid rgba(147, 174, 226, 0.14);
+  background: rgba(7, 11, 19, 0.52);
+  color: var(--muted);
+  font-size: 1rem;
+  box-shadow: none;
+}
+
+.progress-card-close:hover {
+  border-color: rgba(147, 227, 255, 0.36);
+  background: rgba(14, 21, 34, 0.86);
+  color: var(--text);
+}
+
+.progress-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.progress-card-actions button,
+.progress-card-actions a {
+  width: auto;
+  min-height: 36px;
+  padding-inline: 14px;
+}
+
+@media (max-width: 820px) {
+  .progress-card-shell {
+    left: 10px;
+    right: 10px;
+    bottom: max(12px, env(safe-area-inset-bottom));
+  }
+
+  .progress-card {
+    padding-right: 44px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .progress-fill[data-tone="running"]::after {
+    animation: none;
+    opacity: 0;
+  }
+
+  .progress-fill {
+    transition: none;
+  }
+}

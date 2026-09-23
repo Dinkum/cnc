@@ -8,6 +8,7 @@ from app.models.entities import Backend
 from app.services.bootstrap_state import read_bootstrap_state, read_failure_artifact
 from app.services.commands import run_command
 from app.services.renderers import container_name
+from app.services.validators import ValidationError, ensure_backend_name
 
 
 def _clip_text(value: str, max_chars: int = 240) -> str:
@@ -37,30 +38,59 @@ def collect_app_backend_logs(
     *,
     lines: int = 200,
 ) -> dict[str, Any]:
+    return _collect_app_logs(
+        backend.name, settings, lines=lines, include_container=True
+    )
+
+
+def collect_saved_app_logs(
+    backend_name: str, settings: Settings, *, lines: int = 200
+) -> dict[str, Any] | None:
+    """Read retained failure evidence after a create transaction rolls back."""
+    try:
+        backend_name = ensure_backend_name(backend_name)
+    except ValidationError:
+        return None
+    if not read_failure_artifact(settings, backend_name) and not read_bootstrap_state(
+        settings, backend_name
+    ):
+        return None
+    payload = _collect_app_logs(
+        backend_name, settings, lines=lines, include_container=False
+    )
+    payload["saved_only"] = True
+    payload["issues"].append("backend_record_missing")
+    return payload
+
+
+def _collect_app_logs(
+    backend_name: str, settings: Settings, *, lines: int, include_container: bool
+) -> dict[str, Any]:
     sources: list[dict[str, str]] = []
     source_errors: list[dict[str, object]] = []
     tail_lines = max(1, min(int(lines), 1000))
-    container = container_name(backend.name)
+    container = container_name(backend_name)
 
-    result = run_command(
-        ["podman", "logs", "--tail", str(tail_lines), container],
-        timeout_sec=settings.command_timeout_status_sec,
-    )
-    if result.stdout:
-        sources.append({"source": "container-stdout", "output": result.stdout})
-    if result.ok and result.stderr:
-        sources.append({"source": "container-stderr", "output": result.stderr})
-    if not result.ok:
-        source_errors.append(
-            {
-                "source": "container",
-                "returncode": result.returncode,
-                "stderr": _clip_text(result.stderr, 2000),
-                "stdout": _clip_text(result.stdout, 2000),
-            }
+    if include_container:
+        result = run_command(
+            ["podman", "logs", "--tail", str(tail_lines), container],
+            timeout_sec=settings.command_timeout_status_sec,
         )
+        if result.stdout:
+            sources.append({"source": "container-stdout", "output": result.stdout})
+        if result.ok and result.stderr:
+            sources.append({"source": "container-stderr", "output": result.stderr})
+        if not result.ok:
+            source_errors.append(
+                {
+                    "source": "container",
+                    "returncode": result.returncode,
+                    "stderr": _clip_text(result.stderr, 2000),
+                    "stdout": _clip_text(result.stdout, 2000),
+                }
+            )
 
-    state = read_bootstrap_state(settings, backend.name) or {}
+    state = read_bootstrap_state(settings, backend_name) or {}
     excerpt = state.get("last_log_excerpt") if isinstance(state, dict) else None
     events = (
         state.get("events")
@@ -79,7 +109,7 @@ def collect_app_backend_logs(
                 }
             )
 
-    failure_artifact = read_failure_artifact(settings, backend.name) or {}
+    failure_artifact = read_failure_artifact(settings, backend_name) or {}
     if isinstance(failure_artifact, dict) and failure_artifact:
         details = failure_artifact.get("details")
         runtime_diagnostics = failure_artifact.get("runtime_diagnostics")
@@ -117,7 +147,7 @@ def collect_app_backend_logs(
         issues.append("container_logs_unavailable")
 
     return {
-        "backend": backend.name,
+        "backend": backend_name,
         "container": container,
         "issues": list(dict.fromkeys(issues)),
         "bootstrap_status": state.get("status"),

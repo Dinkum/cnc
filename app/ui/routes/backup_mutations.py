@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import Settings
+from app.services.config_change import converge_change, output_change
 from app.dependencies import (
     db_session_dependency,
     settings_dependency,
@@ -53,7 +54,6 @@ from app.services.inter_app_interfaces import (
     reconcile_inter_app_interface_statuses,
     validate_inter_app_interfaces,
 )
-from app.services.mutation_apply import commit_and_apply
 from app.services.operations import (
     active_host_mutation_blocker,
     create_operation,
@@ -880,10 +880,12 @@ async def update_backend_placement_form(
                 names=inbound_interface_names,
                 statuses=inbound_interface_statuses,
             )
-        mutation = await commit_and_apply(
+        mutation = await converge_change(
             session,
             settings,
-            operation="ui.backend.placement",
+            change=output_change(
+                "ui.backend.placement", str(backend.name or "")
+            ),
             apply_runner=run_apply,
         )
         apply_response = mutation.apply_response

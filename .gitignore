@@ -8,6 +8,7 @@ node_modules/
 *.pyc
 .env
 ignore/
+output/
 data/*
 !data/.gitkeep
 AGENTS.md

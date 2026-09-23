@@ -22,6 +22,7 @@ from app.access import (
     set_access_cookie,
 )
 from app.config import Settings
+from app.services.config_change import full_reconcile
 from app.dependencies import (
     db_session_dependency,
     settings_dependency,
@@ -437,6 +438,8 @@ async def update_beta_settings_form(
                 next_settings,
                 operation_kind="ui.settings.netdata",
                 actor="ui",
+                # Settings are host-wide, so this really does cover everything.
+                scope=full_reconcile("ui.settings.netdata").scope(),
             )
             if apply_response.status != "success":
                 flash_success = None

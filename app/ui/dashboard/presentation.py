@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from app.config import Settings
+from app.services.cloudflare_connection import connection_summary
 from app.models.entities import Backend, Input
 from app.security import get_csrf_token
 from app.services.app_containers import configured_app_dns_servers
@@ -690,6 +691,7 @@ def build_dashboard_context(
         "settings_sections": settings_context["settings_sections"],
         "resource_size_matrix": settings_context["resource_size_matrix"],
         "settings_help": settings_context["settings_help"],
+        "cloudflare_connection": connection_summary(settings),
         "notification_settings": settings_context["notification_settings"],
         "access_key_settings": settings_context["access_key_settings"],
         "netdata_settings": settings_context["netdata_settings"],

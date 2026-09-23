@@ -9,7 +9,6 @@ from app.cli.common import (
     CommandResult,
     bind_command,
     load_backend_async,
-    load_shield_status_payload,
 )
 from app.config import Settings
 
@@ -67,28 +66,6 @@ def format_fix_text(payload: dict[str, object]) -> str:
             ]
         )
 
-    shield_status = (
-        payload.get("shield_status")
-        if isinstance(payload.get("shield_status"), dict)
-        else {}
-    )
-    if shield_status:
-        lines.append("shield_status:")
-        lines.append(
-            f"  server_enabled: {'yes' if shield_status.get('server_enabled') else 'no'}"
-        )
-        lines.append(
-            f"  backend_exists: {'yes' if shield_status.get('backend_exists') else 'no'}"
-        )
-        lines.append(
-            f"  backend_enabled: {'yes' if shield_status.get('backend_enabled') else 'no'}"
-        )
-        lines.append(
-            f"  service_active: {'yes' if shield_status.get('service_active') else 'no'}"
-        )
-        lines.append(f"  output_state: {shield_status.get('output_state') or '-'}")
-        lines.append(f"  ready: {'yes' if shield_status.get('ready') else 'no'}")
-
     return "\n".join(lines)
 
 
@@ -129,7 +106,6 @@ async def fix_app_async(
         settings,
         enabled_app_backends=enabled_app_backends,
     )
-    payload["shield_status"] = await load_shield_status_payload(settings)
     return 0 if payload.get("ok") else 2, payload, None
 
 

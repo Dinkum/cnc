@@ -295,10 +295,26 @@ def container_state_payload(
     state = inspect_payload.get("State") if isinstance(inspect_payload, dict) else {}
     if not isinstance(state, dict):
         state = {}
-    running = bool(state.get("Running"))
-    status = str(state.get("Status") or ("running" if running else "unknown"))
+    running_value = state.get("Running")
+    running = running_value if isinstance(running_value, bool) else None
+    status = str(
+        state.get("Status")
+        or (
+            "running"
+            if running is True
+            else "stopped"
+            if running is False
+            else "unknown"
+        )
+    )
     return {
-        "ActiveState": "active" if running else "inactive",
+        "ActiveState": (
+            "active"
+            if running is True
+            else "inactive"
+            if running is False
+            else "unknown"
+        ),
         "SubState": status,
         "ActiveEnterTimestamp": str(state.get("StartedAt") or ""),
         "ContainerName": container,

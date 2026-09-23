@@ -461,9 +461,16 @@ def _settings_with_cloudflare_cidrs(
 async def _run_apply_for_sync(settings: Settings) -> tuple[dict[str, Any], bool]:
     from app.database import SessionLocal
     from app.services.apply_service import run_apply
+    from app.services.config_change import full_reconcile
 
     async with SessionLocal() as session:
-        response = await run_apply(session, settings)
+        response = await run_apply(
+            session,
+            settings,
+            # The CIDR list is host-wide ingress policy, so its convergence
+            # legitimately covers every output.
+            scope=full_reconcile("timer.cloudflare.sync").scope(),
+        )
     return json.loads(response.model_dump_json()), response.status == "success"
 
 

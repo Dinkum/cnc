@@ -38,6 +38,10 @@ class CommandResult:
     returncode: int
     stdout: str
     stderr: str
+    # An exit status of 124 can also come from the command itself or GNU timeout.
+    # This flag records that the host supervisor actually hit its deadline.
+    timed_out: bool = False
+    deadline_before_start: bool = False
 
     @property
     def ok(self) -> bool:
@@ -56,8 +60,12 @@ class CommandError(Exception):
 
 
 def command_result_is_retryable(result: CommandResult) -> bool:
-    if result.returncode == 124:
+    if result.timed_out:
         return True
+    if result.returncode == 124:
+        # A command can choose this exit code; never replay it solely because
+        # it resembles GNU timeout's status or mentions a timeout in stderr.
+        return False
     combined_output = "\n".join(
         part for part in (result.stderr, result.stdout) if part
     ).lower()
@@ -101,6 +109,7 @@ def run_command(command: list[str], timeout_sec: float = 30) -> CommandResult:
             stderr="\n".join(
                 part for part in (stderr.strip(), timeout_message) if part
             ),
+            timed_out=True,
         )
     except OSError as exc:
         return CommandResult(
@@ -118,6 +127,15 @@ def _signal_process_group(proc: subprocess.Popen[str], sig: signal.Signals) -> N
         return
 
 
+def guest_timeout_args(timeout_sec: float) -> list[str]:
+    # Leave time for the guest command to stop and for Podman to report its
+    # result before the host deadline. GNU timeout accepts fractional seconds.
+    cleanup_margin = min(1.0, timeout_sec / 5)
+    guest_timeout = max(0.1, timeout_sec - cleanup_margin)
+    guest_timeout_arg = f"{guest_timeout:.3f}".rstrip("0").rstrip(".") + "s"
+    return ["timeout", "--signal=TERM", "--kill-after=0.1s", guest_timeout_arg]
+
+
 def run_podman_exec(
     container: str,
     guest_command: list[str],
@@ -126,24 +144,22 @@ def run_podman_exec(
     command_runner: Callable[[list[str], float], CommandResult] = run_command,
 ) -> CommandResult:
     """Run one bounded command in a guest without letting exec outlive its caller."""
-    if timeout_sec <= 0:
+    # The caller may have spent nearly all its deadline waiting for the guest
+    # guard. Do not start Podman with too little time to reach its guest limit:
+    # that would manufacture a host timeout and open a healthy runtime's circuit.
+    if timeout_sec <= 0.5:
         return CommandResult(
             command=["podman", "exec", container, *guest_command],
             returncode=124,
             stdout="",
-            stderr="timed out before podman exec started",
+            stderr="deadline exhausted before podman exec started",
+            deadline_before_start=True,
         )
-    cleanup_margin = min(1.0, timeout_sec / 5)
-    guest_timeout = max(0.1, timeout_sec - cleanup_margin)
-    guest_timeout_arg = f"{guest_timeout:.3f}".rstrip("0").rstrip(".") + "s"
     command = [
         "podman",
         "exec",
         container,
-        "timeout",
-        "--signal=TERM",
-        "--kill-after=0.1s",
-        guest_timeout_arg,
+        *guest_timeout_args(timeout_sec),
         *guest_command,
     ]
     return command_runner(command, timeout_sec)

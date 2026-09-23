@@ -6,6 +6,7 @@
   <title>cnc</title>
   <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
   <link rel="stylesheet" href="/static/css/app.css?v={{ asset_version }}">
+  <link rel="stylesheet" href="/static/css/cloudflare.css?v={{ asset_version }}">
 </head>
 {% set initial_tab = active_tab if (active_tab in ["home", "inputs", "outputs", "settings"] or (active_tab == "routing" and beta_routing)) else "home" %}
 <body data-update-status="{{ status.last_update.status if status.last_update else '' }}" data-initial-tab="{{ initial_tab }}">
@@ -37,22 +38,6 @@
       </section>
     {% endif %}
 
-    <aside class="floating-save-shell" id="input-save-shell" hidden aria-live="polite">
-      <article class="save-job-card queued floating-save-card" id="input-save-card" data-save-card>
-        <button type="button" class="save-card-close save-card-close-floating" data-save-card-close aria-label="Dismiss save status">&times;</button>
-        <div class="save-narrative">
-          <div class="save-card-top">
-            <strong class="save-action-line" id="input-save-action">Saving input</strong>
-            <div class="save-job-meta" id="input-save-meta"></div>
-          </div>
-          <span class="save-stage-line" id="input-save-stage">Validate input</span>
-          <p id="input-save-note">Checking form and graph rules</p>
-        </div>
-        <div class="save-progress" aria-hidden="true">
-          <span id="input-save-progress-fill"></span>
-        </div>
-      </article>
-    </aside>
 
     <section class="panel" data-panel="home" data-loaded="{{ '1' if initial_tab == 'home' else '0' }}"{% if initial_tab != "home" %} hidden{% endif %}>
       <article class="card">
@@ -191,6 +176,10 @@
                 <div class="picker-empty">No outputs yet &#x2014; add one first.</div>
               {% endif %}
             </div>
+            <label class="toggle field-span-2" data-input-https-control>
+              <input name="https_enabled" type="checkbox">
+              <span>Enable HTTPS</span>
+            </label>
             <div class="toggle-group input-enabled-row">
               <label class="toggle">
                 <input name="enabled" type="checkbox" checked>
@@ -275,6 +264,13 @@
                           </div>
                         </div>
                         {% if detail.get("kind") == "domain" %}
+                        <div class="field-span-2 input-shield-card">
+                          <label class="toggle">
+                            <input name="https_enabled" type="checkbox" {% if detail.get("https_enabled") %}checked{% endif %}>
+                            <span>Enable HTTPS</span>
+                          </label>
+                          <p class="muted">{% if detail.get("cloudflare", {}).get("provider") == "cloudflare_origin" %}Uses a Cloudflare Origin CA certificate. Supports Full (strict).{% else %}Supports Cloudflare Full. Uses an automatically maintained self-signed certificate.{% endif %}</p>
+                        </div>
                           <div
                             class="field-span-2 input-shield-card"
                             data-shield-code-configured="{{ 'true' if detail.get('shield_code_configured') else 'false' }}"
@@ -336,6 +332,7 @@
                           >Delete</button>
                         </div>
                       </form>
+                      {% include "input_cloudflare.html" %}
                     </div>
                   </td>
                 </tr>
@@ -631,6 +628,8 @@
             </div>
           </form>
         </article>
+
+        {% include "cloudflare_settings.html" %}
 
         <article class="card span-2 beta-settings-card">
           <div class="section-head">
@@ -1203,10 +1202,8 @@
         <label>Status
           <select data-history-status>
             <option value="all">All completed</option>
-            <option value="success">Successful</option>
+            <option value="success">Saved</option>
             <option value="failed">Failed</option>
-            <option value="partial">Partial</option>
-            <option value="cancelled">Cancelled</option>
           </select>
         </label>
         <button type="button" class="ghost" data-history-refresh>Refresh</button>
@@ -1221,6 +1218,8 @@
     </div>
   </dialog>
 
+  {% include "cloudflare_dialogs.html" %}
+
   <script type="application/json" id="dashboard-config">
     {{ {
       "createOutputProgressSteps": create_output_progress_steps | default([], true),
@@ -1231,7 +1230,9 @@
   </script>
   <script src="/static/js/cnc-ui.js?v={{ asset_version }}"></script>
   <script src="/static/js/operation-events.js?v={{ asset_version }}"></script>
+  <script src="/static/js/progress-ui.js?v={{ asset_version }}"></script>
   <script src="/static/js/dashboard.js?v={{ asset_version }}"></script>
   <script src="/static/js/operation-history.js?v={{ asset_version }}"></script>
+  <script src="/static/js/cloudflare.js?v={{ asset_version }}"></script>
 </body>
 </html>

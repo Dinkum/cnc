@@ -12,18 +12,21 @@ from app.models.entities import Backend
 from app.schemas.apply import ApplyResponse
 from app.services import backend_commands
 from app.services.apply_service import default_apply_services, run_apply
-from app.services.error_reporting import ErrorCode, error_context
+from app.services.error_reporting import ErrorCode
+from app.services.config_change import output_change
+from app.ui.operations.action import Action
+from app.ui.operations.save import Reporter, SaveResult, Subject, run_save
 from app.services.inter_app_interfaces import apply_inbound_inter_app_interface_statuses
-from app.services.mutation_apply import commit_and_apply
+from app.services.config_change import converge_change
 from app.services.operations import OperationHandle
 from app.services.shield_service import make_code_hash
 from app.services.validators import ValidationError
-from app.ui.errors import operator_action_error
 from app.ui.forms import (
     _backend_inputs_payload_from_form,
     _backend_update_payload_from_form,
 )
 from app.ui.operations.common import background_db_session, operation_backend
+from app.ui.outputs.settings import backend_section_payload
 from app.ui.progress import (
     _complete_output_save_operation,
     _output_save_apply_progress_reporter,
@@ -97,10 +100,11 @@ async def _commit_output_save_apply(
             backend_name=backend_name,
         ),
     )
-    mutation = await commit_and_apply(
+    # Editing one output is not a reason to reconcile every other one.
+    mutation = await converge_change(
         session,
         settings,
-        operation=operation_name,
+        output_change(operation_name, backend_name),
         apply_runner=run_apply,
         apply_services=services,
         operation_handle=operation,
@@ -113,95 +117,59 @@ async def _run_output_save_operation(
     operation_id: int | None,
     backend_id: int,
     *,
-    operation_kind: str,
-    success_message: str,
-    failure_prefix: str,
-    failure_action: str,
-    failure_detail: str,
-    failure_message: str,
-    failure_error_code: ErrorCode,
-    log_event: str,
+    action: Action,
     save: Callable[
         [AsyncSession, OperationHandle, Backend, str], Awaitable[_OutputSaveResult]
     ],
     progress_extra: dict[str, object],
     failure_extra: dict[str, object],
 ) -> None:
-    operation = OperationHandle(id=operation_id, kind=operation_kind, settings=settings)
-    try:
-        await _update_output_save_operation_progress(
+    """Every output edit: change rows, converge, report.
+
+    A thin shim over the shared save path. It exists only to keep the four
+    output wrappers reading the way they always have while the vocabulary and
+    the flow come from one place.
+    """
+
+    async def mutate(session, operation, backend, report):
+        name = str(backend.name or "")
+        await report.with_name(name).step(
             operation,
-            message="Validating output.",
-            phase="Validate output",
-            substate="Validating output",
+            "Saving desired state.",
+            phase="Save desired state",
+            substate="Saving desired state",
+        )
+        result = await save(session, operation, backend, name)
+        return SaveResult(
+            apply_response=result.apply_response,
+            name=result.backend_name,
+            extra_details=result.extra_details,
+        )
+
+    async def complete(operation, result):
+        await _complete_output_save_operation(
+            operation,
+            result.apply_response,
+            success_message=action.success,
+            failure_prefix=action.failure_prefix,
             backend_id=backend_id,
-            **progress_extra,
+            backend_name=result.name,
+            extra_details=result.extra_details,
         )
-        async with background_db_session(settings) as session:
-            backend = await operation_backend(session, backend_id)
-            backend_name = str(backend.name or "")
-            await _update_output_save_operation_progress(
-                operation,
-                message="Saving desired state.",
-                phase="Save desired state",
-                substate="Saving desired state",
-                backend_id=backend_id,
-                backend_name=backend_name,
-                **progress_extra,
-            )
-            result = await save(session, operation, backend, backend_name)
-            await _complete_output_save_operation(
-                operation,
-                result.apply_response,
-                success_message=success_message,
-                failure_prefix=failure_prefix,
-                backend_id=backend_id,
-                backend_name=result.backend_name,
-                extra_details=result.extra_details,
-            )
-    except ValidationError as exc:
-        flash_error = operator_validation_error(exc)
-        await operation.complete(
-            "failed",
-            phase="Validate output",
-            error=flash_error,
-            details={
-                "progress": 100,
-                "message": flash_error,
-                "substate": "Validating output",
-                "flash_error": flash_error,
-                "backend_id": backend_id,
-                **failure_extra,
-            },
-        )
-    except Exception as exc:
-        error_fields = error_context(failure_error_code)
-        flash_error = operator_action_error(
-            failure_action,
-            failure_detail,
-            error_fields,
-        )
-        logger.exception(
-            log_event,
-            backend_id=backend_id,
-            operation_id=operation_id,
-            **error_fields,
-            error=str(exc),
-        )
-        await operation.complete(
-            "failed",
-            phase="Save output",
-            error=flash_error,
-            details={
-                "progress": 100,
-                "message": failure_message,
-                "substate": "Refreshing output",
-                "flash_error": flash_error,
-                "backend_id": backend_id,
-                **error_fields,
-                **failure_extra,
-            },
-        )
+
+    await run_save(
+        settings,
+        operation_id,
+        action=action,
+        subject=Subject(
+            id=backend_id,
+            load=lambda session: operation_backend(session, backend_id),
+        ),
+        reporter=Reporter(action, Subject(id=backend_id), extra=progress_extra),
+        mutate=mutate,
+        complete=complete,
+        session_factory=background_db_session,
+    )
 
 
 async def _run_update_backend_operation(
@@ -216,53 +184,59 @@ async def _run_update_backend_operation(
         backend: Backend,
         backend_name: str,
     ) -> _OutputSaveResult:
-        shield_code_hash = backend.shield_code_hash
-        shield_access_code_display = str(
-            getattr(backend, "shield_access_code", "") or ""
-        ).strip()
-        normalized_shield_access_code = str(
-            form_values.get("shield_access_code") or ""
-        ).strip()
-        if normalized_shield_access_code:
-            shield_code_hash = make_code_hash(
-                settings.shield_secret_key, normalized_shield_access_code
+        section = str(form_values.get("section") or "")
+        if section:
+            payload = backend_section_payload(
+                backend, settings, section, form_values["values"]
             )
-            shield_access_code_display = normalized_shield_access_code
-        if (
-            backend.kind == "app"
-            and bool(form_values.get("shield_enabled"))
-            and not shield_code_hash
-        ):
-            raise ValidationError(
-                "shield requires an access code before it can be enabled"
+        else:
+            shield_code_hash = backend.shield_code_hash
+            shield_access_code_display = str(
+                getattr(backend, "shield_access_code", "") or ""
+            ).strip()
+            normalized_shield_access_code = str(
+                form_values.get("shield_access_code") or ""
+            ).strip()
+            if normalized_shield_access_code:
+                shield_code_hash = make_code_hash(
+                    settings.shield_secret_key, normalized_shield_access_code
+                )
+                shield_access_code_display = normalized_shield_access_code
+            if (
+                backend.kind == "app"
+                and bool(form_values.get("shield_enabled"))
+                and not shield_code_hash
+            ):
+                raise ValidationError(
+                    "shield requires an access code before it can be enabled"
+                )
+            payload = _backend_update_payload_from_form(
+                name=str(form_values.get("name") or ""),
+                kind=backend.kind,
+                port=str(form_values.get("port") or ""),
+                static_root=str(form_values.get("static_root") or ""),
+                sandbox_profile=str(form_values.get("sandbox_profile") or ""),
+                sandbox_image=str(form_values.get("sandbox_image") or ""),
+                handoff_port=int(form_values.get("handoff_port") or 8000),
+                healthcheck_mode=str(form_values.get("healthcheck_mode") or "none"),
+                healthcheck_path=str(form_values.get("healthcheck_path") or "/"),
+                healthcheck_host_header=str(
+                    form_values.get("healthcheck_host_header") or ""
+                ),
+                resource_mode=str(form_values.get("resource_mode") or "auto"),
+                resource_size=str(form_values.get("resource_size") or "auto"),
+                current_resource_size=backend.resource_size,
+                memory_high_override=str(form_values.get("memory_high_override") or ""),
+                memory_max_override=str(form_values.get("memory_max_override") or ""),
+                cpu_quota_override=str(form_values.get("cpu_quota_override") or ""),
+                volumes_json=str(form_values.get("volumes_json") or "[]"),
+                notes=str(form_values.get("notes") or ""),
+                shield_enabled=bool(form_values.get("shield_enabled"))
+                if backend.kind == "app"
+                else False,
+                shield_code_hash=shield_code_hash,
+                shield_access_code=shield_access_code_display,
             )
-        payload = _backend_update_payload_from_form(
-            name=str(form_values.get("name") or ""),
-            kind=backend.kind,
-            port=str(form_values.get("port") or ""),
-            static_root=str(form_values.get("static_root") or ""),
-            sandbox_profile=str(form_values.get("sandbox_profile") or ""),
-            sandbox_image=str(form_values.get("sandbox_image") or ""),
-            handoff_port=int(form_values.get("handoff_port") or 8000),
-            healthcheck_mode=str(form_values.get("healthcheck_mode") or "none"),
-            healthcheck_path=str(form_values.get("healthcheck_path") or "/"),
-            healthcheck_host_header=str(
-                form_values.get("healthcheck_host_header") or ""
-            ),
-            resource_mode=str(form_values.get("resource_mode") or "auto"),
-            resource_size=str(form_values.get("resource_size") or "auto"),
-            current_resource_size=backend.resource_size,
-            memory_high_override=str(form_values.get("memory_high_override") or ""),
-            memory_max_override=str(form_values.get("memory_max_override") or ""),
-            cpu_quota_override=str(form_values.get("cpu_quota_override") or ""),
-            volumes_json=str(form_values.get("volumes_json") or "[]"),
-            notes=str(form_values.get("notes") or ""),
-            shield_enabled=bool(form_values.get("shield_enabled"))
-            if backend.kind == "app"
-            else False,
-            shield_code_hash=shield_code_hash,
-            shield_access_code=shield_access_code_display,
-        )
         changed_keys = _backend_update_changed_keys(backend, payload)
         backend = await backend_commands.update_backend(
             session, backend_id, payload, commit=False
@@ -277,6 +251,20 @@ async def _run_update_backend_operation(
             backend_name=backend_name,
             changed_keys=sorted(changed_keys),
         )
+        saved_values = {}
+        if section:
+            saved_values = {
+                key: getattr(backend, key, None)
+                for key in form_values["values"]
+                if key != "shield_access_code"
+            }
+            if section == "shield":
+                saved_values["shield_enabled"] = bool(backend.shield_enabled)
+            if section == "resources":
+                saved_values["resource_size"] = form_values["values"]["resource_size"]
+            if section == "health" and backend.healthcheck_mode != "http":
+                saved_values.pop("healthcheck_path", None)
+                saved_values.pop("healthcheck_host_header", None)
         apply_response = await _commit_output_save_apply(
             session,
             settings,
@@ -288,24 +276,27 @@ async def _run_update_backend_operation(
         return _OutputSaveResult(
             apply_response=apply_response,
             backend_name=backend_name,
-            extra_details={"changed_keys": sorted(changed_keys)},
+            extra_details={
+                "changed_keys": sorted(changed_keys),
+                "section": section,
+                "saved_values": saved_values,
+            },
         )
 
     await _run_output_save_operation(
         settings,
         operation_id,
         backend_id,
-        operation_kind="ui.backend.update",
-        success_message="Output saved.",
-        failure_prefix="Output saved",
-        failure_action="Output save",
-        failure_detail="Unexpected error while saving the output. Check server logs with this instance.",
-        failure_message="Output save failed.",
-        failure_error_code=ErrorCode.UI_BACKEND_UPDATE_FAILED,
-        log_event="ui.backend.update.worker_failed",
+        action=Action(
+            kind="ui.backend.update",
+            success="Output saved.",
+            label="Output save",
+            error_code=ErrorCode.UI_BACKEND_UPDATE_FAILED,
+            detail="Unexpected error while saving the output. Check server logs with this instance.",
+        ),
         save=save,
-        progress_extra={},
-        failure_extra={},
+        progress_extra={"section": str(form_values.get("section") or "")},
+        failure_extra={"section": str(form_values.get("section") or "")},
     )
 
 
@@ -347,14 +338,13 @@ async def _run_update_backend_inputs_operation(
         settings,
         operation_id,
         backend_id,
-        operation_kind="ui.backend.inputs",
-        success_message="Attached inputs saved.",
-        failure_prefix="Attached inputs saved",
-        failure_action="Attached inputs save",
-        failure_detail="Unexpected error while saving attached inputs. Check server logs with this instance.",
-        failure_message="Attached inputs save failed.",
-        failure_error_code=ErrorCode.UI_BACKEND_INPUTS_FAILED,
-        log_event="ui.backend.inputs.worker_failed",
+        action=Action(
+            kind="ui.backend.inputs",
+            success="Attached inputs saved.",
+            label="Attached inputs save",
+            error_code=ErrorCode.UI_BACKEND_INPUTS_FAILED,
+            detail="Unexpected error while saving attached inputs. Check server logs with this instance.",
+        ),
         save=save,
         progress_extra={},
         failure_extra={},
@@ -394,14 +384,13 @@ async def _run_update_backend_state_operation(
         settings,
         operation_id,
         backend_id,
-        operation_kind="ui.backend.state",
-        success_message="Output enabled." if target_enabled else "Output disabled.",
-        failure_prefix="Output enabled" if target_enabled else "Output disabled",
-        failure_action="Output state save",
-        failure_detail="Unexpected error while updating output state. Check server logs with this instance.",
-        failure_message="Output state save failed.",
-        failure_error_code=ErrorCode.UI_BACKEND_STATE_FAILED,
-        log_event="ui.backend.state.worker_failed",
+        action=Action(
+            kind="ui.backend.state",
+            success="Output enabled." if target_enabled else "Output disabled.",
+            label="Output state save",
+            error_code=ErrorCode.UI_BACKEND_STATE_FAILED,
+            detail="Unexpected error while updating output state. Check server logs with this instance.",
+        ),
         save=save,
         progress_extra={"enabled": target_enabled},
         failure_extra={"enabled": target_enabled},
@@ -456,14 +445,14 @@ async def _run_update_backend_interface_operation(
         settings,
         operation_id,
         backend_id,
-        operation_kind="ui.backend.interface",
-        success_message="Interface confirmed." if accepted else "Interface rejected.",
-        failure_prefix="Interface saved",
-        failure_action="Interface action",
-        failure_detail="Unexpected error while updating the interface. Check server logs with this instance.",
-        failure_message="Interface action failed.",
-        failure_error_code=ErrorCode.UI_BACKEND_INTERFACE_FAILED,
-        log_event="ui.backend.interface.worker_failed",
+        action=Action(
+            kind="ui.backend.interface",
+            success="Interface confirmed." if accepted else "Interface rejected.",
+            label="Interface action",
+            error_code=ErrorCode.UI_BACKEND_INTERFACE_FAILED,
+            detail="Unexpected error while updating the interface. Check server logs with this instance.",
+            failure_prefix_override="Interface saved",
+        ),
         save=save,
         progress_extra={
             "source_backend_id": source_backend_id,

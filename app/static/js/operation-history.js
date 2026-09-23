@@ -15,15 +15,19 @@
   let controller = null;
 
   const operationRow = (operation) => {
-    const status = ["success", "failed", "partial", "cancelled"].includes(operation.status) ? operation.status : "unknown";
+    const statusLabel = String(operation.presentation?.status_label || "unknown");
+    const status = statusLabel === "saved" ? "success" : (statusLabel === "failed" ? "failed" : "unknown");
     const details = operation.details && typeof operation.details === "object" ? operation.details : {};
     const label = String(operation.kind || "operation").replace(/^ui\./, "").replaceAll(/[._]/g, " ").replaceAll(/\bbackend\b/g, "output");
     const target = details.backend_name || details.input_name || (operation.backend_id ? `Output ${operation.backend_id}` : "");
-    const note = operation.error || details.message || operation.phase || "No further details.";
+    const recovery = String(operation.presentation?.recovery_detail || "").trim();
+    const cause = String(operation.error || details.flash_error || "").trim();
+    const note = [cause, recovery].filter((value, index, values) => value && values.indexOf(value) === index).join(" ")
+      || details.message || operation.phase || "No further details.";
     return `<details class="operation-history-row">
       <summary>
         <span class="operation-history-name"><strong>${escapeHtml(label)}</strong><span class="subtle">#${escapeHtml(operation.id)}${target ? ` · ${escapeHtml(target)}` : ""}</span></span>
-        <span class="operation-history-result" data-status="${status}">${escapeHtml(status === "success" ? "successful" : status)}</span>
+        <span class="operation-history-result" data-status="${status}">${escapeHtml(statusLabel)}</span>
         <time datetime="${escapeHtml(operation.finished_at || operation.started_at)}">${escapeHtml(formatLocalTimestamp(operation.finished_at || operation.started_at))}</time>
       </summary>
       <div class="operation-history-detail"><p>${escapeHtml(note)}</p>

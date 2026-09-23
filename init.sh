@@ -266,7 +266,7 @@ render_final_summary() {
       box_line "Then visit: http://127.0.0.1:9090"
     fi
     blank_line
-    box_line "Create your admin access key on first visit."
+    box_line "Use the admin access key printed during this install."
     box_line "Then create an Output, create an Input, attach, and Save."
     print_rule
     printf '| USEFUL COMMANDS                                                        |\n'

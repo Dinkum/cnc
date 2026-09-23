@@ -15,4 +15,4 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=full
-ReadWritePaths=/etc /etc/containers/systemd /usr/local/bin /var/lib/cnc /var/log/cnc
+ReadWritePaths=/etc /etc/containers/networks /etc/containers/systemd /usr/local/bin /var/lib/cnc /var/log/cnc

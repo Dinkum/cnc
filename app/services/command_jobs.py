@@ -296,7 +296,7 @@ async def submit_job(
             purge_jobs,
             execution_token,
         )
-        if result.returncode == 124:
+        if result.timed_out:
             open_guest_exec_circuit(
                 settings,
                 output,

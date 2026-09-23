@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import Settings
+from app.services.config_change import output_change
 from app.logger import get_logger
 from app.models.entities import Backend, ClusterNode
 from app.services.app_quadlet import (
@@ -252,6 +253,10 @@ async def transfer_backend(
                     settings,
                     operation_kind="transfer_backend",
                     actor="ui",
+                    # A transfer moves one output between machines.
+                    scope=output_change(
+                        "transfer_backend", str(backend.name or "")
+                    ).scope(),
                 )
             if apply_response.status != "success":
                 raise RuntimeError(

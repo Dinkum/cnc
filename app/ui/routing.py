@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from app.config import Settings
+from app.services.cloudflare_domains import domain_status
 from app.models.entities import Backend, Input
 from app.services.status_service import dashboard_overview_counts
 from app.services.tailscale_urls import tailscale_service_url
@@ -426,6 +427,10 @@ def build_input_details(
             "target": target,
             "route_state": route_state,
             "input_state": "enabled" if item.enabled else "disabled",
+            "https_enabled": bool(getattr(item, "https_enabled", False)),
+            "cloudflare": domain_status(settings, item)
+            if input_kind == "domain"
+            else {},
             "shield_enabled": bool(getattr(item, "shield_enabled", False)),
             "shield_code_configured": bool(
                 str(getattr(item, "shield_code_hash", "") or "").strip()

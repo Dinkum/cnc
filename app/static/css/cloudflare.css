@@ -1,0 +1,31 @@
+.cf-dialog { width: min(580px, calc(100vw - 32px)); max-height: calc(100vh - 40px); padding: 0; border: 1px solid var(--line, #d6d3cb); border-radius: 12px; color: var(--text); background: var(--panel-elevated); }
+.cf-dialog::backdrop { background: rgba(20, 23, 23, .4); }
+.cf-dialog-card { padding: 24px; display: grid; gap: 16px; }
+.cf-dialog-card .section-head, .cf-dialog-card p { margin: 0; }
+.cf-dialog form { display: grid; gap: 14px; }
+.cf-dialog label, .cf-domain-fields > label { display: grid; gap: 6px; }
+.cf-dialog input, .cf-domain-fields input, .cf-domain-fields select { width: 100%; min-width: 0; }
+.cf-setup-steps { padding-left: 20px; margin: 0; display: grid; gap: 12px; font-size: 13px; line-height: 1.6; }
+.cf-scopes { border: 1px solid var(--line, #d6d3cb); border-radius: 7px; padding: 0 12px; font-size: 12px; }
+.cf-scopes > div { display: flex; justify-content: space-between; gap: 16px; padding: 10px 0; }
+.cf-scopes > div + div { border-top: 1px solid var(--line, #d6d3cb); }
+.cf-message:empty { display: none; }
+.cf-message { font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.cf-message.is-error { color: var(--red); }
+.cf-zone-list { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0; }
+.cf-domain-card { margin-top: 16px; }
+.cf-domain-fields { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: end; gap: 14px; }
+.cf-domain-fields .cf-dns-toggle { display: flex; padding-bottom: 10px; }
+.cf-domain-fields .cf-dns-toggle input { width: auto; }
+.cf-domain-fields [data-cf-ipv4-field] { grid-column: 1 / -1; }
+.cf-preview-host { font-size: 15px; overflow-wrap: anywhere; }
+.cf-preview-lines { display: grid; gap: 16px; font-size: 13px; }
+.cf-preview-lines > div { display: grid; gap: 5px; }
+.cf-preview-lines p { overflow-wrap: anywhere; }
+.cf-domain-card .editor-actions { align-items: center; }
+.cf-domain-card .editor-actions > .subtle { margin-right: auto; }
+@media (max-width: 600px) { .cf-dialog-card { padding: 18px; } .cf-domain-fields { grid-template-columns: 1fr; } }
+
+.cf-domain-fields [hidden] { display: none; }
+
+.cf-dialog a { color: var(--accent, #7cd8ff); text-underline-offset: 3px; }

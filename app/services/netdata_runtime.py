@@ -40,7 +40,7 @@ async def reconcile_netdata_native_runtime(
     }
 
 
-def netdata_native_runtime_live_matches(settings: Settings) -> bool:
+def netdata_native_runtime_converged(settings: Settings) -> bool:
     return _netdata_binary_exists() and _netdata_config_has_loopback(settings)
 
 

@@ -80,13 +80,6 @@
     if (tabIsAvailable(nextTab)) handleTabRequest(nextTab);
   });
 
-  const floatingSaveShell = document.getElementById("input-save-shell");
-  const floatingSaveCard = document.getElementById("input-save-card");
-  const floatingSaveAction = document.getElementById("input-save-action");
-  const floatingSaveStage = document.getElementById("input-save-stage");
-  const floatingSaveNote = document.getElementById("input-save-note");
-  const floatingSaveMeta = document.getElementById("input-save-meta");
-  const floatingSaveProgressFill = document.getElementById("input-save-progress-fill");
   const confirmModal = document.getElementById("confirm-modal");
   const confirmModalTitle = document.getElementById("confirm-modal-title");
   const confirmModalMessage = document.getElementById("confirm-modal-message");
@@ -1531,49 +1524,25 @@
     return Math.max(4, Math.min(96, numericProgress));
   };
 
-  const showFloatingSave = ({ tone = "queued", title, headline, substep = "", note, meta = [], progress = 8, steps = [], activeIndex = 0 }) => {
-    if (!floatingSaveShell || !floatingSaveCard) return;
+  const SAVE_CARD_KEY = "dashboard-save";
+
+  const showFloatingSave = ({ tone = "queued", title, headline, substep = "", note, meta = [], progress = 8, steps = [], activeIndex = 0, actions = [] }) => {
     if (tone === "success") clearBanners({ successOnly: true });
-    floatingSaveShell.hidden = false;
-    floatingSaveCard.hidden = false;
-    floatingSaveCard.className = `save-job-card floating-save-card ${tone}`;
     const activeStep = steps[Math.min(activeIndex, Math.max(steps.length - 1, 0))] || {};
     const actionLabel = title || headline || activeStep.headline || "Saving";
     const mainStage = headline || activeStep.headline || actionLabel;
     const subStage = tone === "success" || tone === "error"
       ? (note || substep || "")
       : (substep || activeStep.substep || note || "");
-    if (floatingSaveAction) {
-      floatingSaveAction.textContent = actionLabel;
-      floatingSaveAction.hidden = !actionLabel;
-    }
-    if (floatingSaveStage) {
-      floatingSaveStage.textContent = mainStage;
-      floatingSaveStage.hidden = !mainStage;
-    }
-    if (floatingSaveNote) {
-      const statusText = subStage || "";
-      floatingSaveNote.textContent = statusText;
-      floatingSaveNote.hidden = !statusText;
-    }
-    if (floatingSaveProgressFill) {
-      const boundedProgress = saveVisualProgress(progress, steps, activeIndex, tone);
-      floatingSaveProgressFill.style.setProperty("--save-progress", `${boundedProgress}%`);
-    }
-    if (floatingSaveMeta) {
-      floatingSaveMeta.replaceChildren();
-      meta.forEach((item) => {
-        if (!item || !item.label || !item.value) return;
-        const pill = document.createElement("span");
-        pill.className = "summary-pill";
-        const label = document.createElement("span");
-        label.className = "metric-label";
-        label.textContent = item.label;
-        pill.appendChild(label);
-        pill.append(` ${item.value}`);
-        floatingSaveMeta.appendChild(pill);
-      });
-    }
+    window.CNCProgress.card.show(SAVE_CARD_KEY, {
+      // "queued" is a running state as far as the surface is concerned.
+      tone: tone === "success" || tone === "error" ? tone : "running",
+      title: actionLabel,
+      headline: mainStage,
+      note: subStage,
+      progress: saveVisualProgress(progress, steps, activeIndex, tone),
+      meta,
+    }, { actions });
   };
 
   const showInitialFloatingSaveProgress = ({ title, pipeline = "saveInput" }) => {
@@ -1589,11 +1558,6 @@
       steps,
       activeIndex: 0,
     });
-  };
-
-  const hideFloatingSave = () => {
-    if (!floatingSaveShell) return;
-    floatingSaveShell.hidden = true;
   };
 
   const beginHostMutationUi = () => {
@@ -2042,21 +2006,6 @@
     return message.toLowerCase().startsWith(prefix.toLowerCase()) ? message : `${prefix}: ${message}`;
   };
 
-  const bindSaveCardCloses = (root = document) => {
-    root.querySelectorAll("[data-save-card-close]").forEach((button) => {
-      if (button.dataset.boundSaveCardClose === "1") return;
-      button.dataset.boundSaveCardClose = "1";
-      button.addEventListener("click", () => {
-        const shell = button.closest(".floating-save-shell");
-        const card = button.closest("[data-save-card]");
-        if (card) card.hidden = true;
-        if (shell) {
-          const visibleCards = Array.from(shell.querySelectorAll("[data-save-card]")).filter((item) => !item.hidden);
-          shell.hidden = visibleCards.length === 0;
-        }
-      });
-    });
-  };
 
   const clearBanners = ({ successOnly = false } = {}) => {
     document.querySelectorAll(".banner").forEach((banner) => {
@@ -2065,9 +2014,17 @@
     });
   };
 
+  // The card stack is created on demand, so look it up each time rather than
+  // holding a reference that may predate the first card.
+  const floatingSaveShellNow = () => {
+    const shell = document.querySelector("[data-progress-shell]");
+    return shell && !shell.hidden ? shell : null;
+  };
+
   const floatingSaveClearance = () => {
-    if (!floatingSaveShell || floatingSaveShell.hidden) return 24;
-    const shellBox = floatingSaveShell.getBoundingClientRect();
+    const shell = floatingSaveShellNow();
+    if (!shell) return 24;
+    const shellBox = shell.getBoundingClientRect();
     return Math.max(24, Math.ceil(shellBox.height + 48));
   };
 
@@ -2088,9 +2045,8 @@
     row.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "smooth" });
     window.requestAnimationFrame(() => {
       const rowBox = row.getBoundingClientRect();
-      const shellTop = floatingSaveShell && !floatingSaveShell.hidden
-        ? floatingSaveShell.getBoundingClientRect().top
-        : window.innerHeight;
+      const shell = floatingSaveShellNow();
+      const shellTop = shell ? shell.getBoundingClientRect().top : window.innerHeight;
       if (rowBox.bottom > shellTop - 18) {
         window.scrollBy({
           top: rowBox.bottom - shellTop + 28,
@@ -2163,7 +2119,6 @@
     const nextOutputsPanel = replaceFromDocument('.panel[data-panel="outputs"]', nextDocument);
     syncBannersFromDocument(nextDocument);
     selectTab(activeTab);
-    bindSaveCardCloses(document);
     if (nextInputsPanel) {
       bindEditorToggles(nextInputsPanel);
       bindEditorCloses(nextInputsPanel);
@@ -2255,15 +2210,21 @@
     }
   };
 
-  const markInputPending = (inputId, pending) => {
-    if (!inputId) return;
-    const row = document.querySelector(`[data-input-row="${inputId}"]`);
-    const detailRow = document.querySelector(`[data-input-detail-row="${inputId}"]`);
-    const card = document.querySelector(`[data-input-card="${inputId}"]`);
-    row?.classList.toggle("is-pending", pending);
-    detailRow?.classList.toggle("is-pending", pending);
-    card?.classList.toggle("is-pending", pending);
+  // A row and its expanded detail are one object, so they take one halo between
+  // them. The card inside the detail row is deliberately left alone: haloing it
+  // too drew a second box inside the first.
+  //
+  // "is-busy" rather than "is-pending" because .node-join-panel.is-pending
+  // already means something else entirely (a step that is not unlocked yet).
+  const markRowBusy = (kind, id, busy) => {
+    if (!id) return;
+    const row = document.querySelector(`[data-${kind}-row="${id}"]`);
+    const detailRow = document.querySelector(`[data-${kind}-detail-row="${id}"]`);
+    row?.classList.toggle("is-busy", busy);
+    detailRow?.classList.toggle("is-busy", busy);
   };
+
+  const markInputPending = (inputId, pending) => markRowBusy("input", inputId, pending);
 
   const openConfirmModal = ({ title = "Confirm action", message = "Are you sure?", acceptLabel = "OK" }) => {
     if (!confirmModal) {
@@ -2398,7 +2359,14 @@
       const kindSelect = form.querySelector("select[name='kind']");
       if (!kindSelect) return;
       syncInputValueField(form);
-      kindSelect.addEventListener("change", () => syncInputValueField(form));
+      const syncHttps = () => {
+        const control = form.querySelector("[data-input-https-control]");
+        if (!control) return;
+        control.hidden = kindSelect.value !== "domain";
+        control.querySelector("input").disabled = control.hidden;
+      };
+      syncHttps();
+      kindSelect.addEventListener("change", () => { syncInputValueField(form); syncHttps(); });
     });
   };
 
@@ -3215,7 +3183,6 @@
   bindDashboardPanel = (root = document) => {
     bindEditorToggles(root);
     bindEditorCloses(root);
-    bindSaveCardCloses(root);
     bindConfirmButtons(root);
     bindInputKindForms(root);
     bindBackendKindForms(root);

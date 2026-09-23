@@ -47,6 +47,7 @@ class Settings(BaseSettings):
         "2606:4700::/32,2803:f800::/32,2405:b500::/32,2405:8100::/32,"
         "2a06:98c0::/29,2c0f:f248::/32"
     )
+    cloudflare_api_token: str = Field(default="", repr=False)
     cloudflare_ips_v4_url: str = "https://www.cloudflare.com/ips-v4"
     cloudflare_ips_v6_url: str = "https://www.cloudflare.com/ips-v6"
     cloudflare_sync_timeout_sec: int = Field(default=15, ge=3, le=300)
@@ -137,7 +138,6 @@ class Settings(BaseSettings):
 
     command_timeout_apply_sec: int = 300
     command_timeout_status_sec: int = 5
-    command_timeout_update_sec: int = 600
     transient_command_retry_attempts: int = Field(default=1, ge=0, le=10)
     transient_command_retry_backoff_sec: float = Field(default=1.0, ge=0.0, le=60.0)
     status_cache_ttl_sec: int = 60

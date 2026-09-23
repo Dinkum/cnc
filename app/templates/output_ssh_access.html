@@ -1,5 +1,5 @@
 <article class="card span-2 ssh-access">
-  <div class="section-head"><h2>Access</h2></div>
+  <div class="section-head"><h3>SSH</h3></div>
   {% for item in operator_commands if item.label == "ssh shell" %}
   <div class="ssh-connect code-block compact-block"><div class="code-head code-head-actions"><span>SSH connection</span><button type="button" class="copy-button" data-copy-target="operator-command-{{ loop.index }}">Copy</button></div><pre id="operator-command-{{ loop.index }}">{{ item.command }}</pre></div>
   {% endfor %}

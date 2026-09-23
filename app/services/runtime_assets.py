@@ -20,6 +20,10 @@ MANAGED_SYSTEMD_ASSETS = (
     ("cnc-auto-size.timer", "cnc-auto-size.timer"),
     ("cnc-backend-alerts.service", "cnc-backend-alerts.service"),
     ("cnc-backend-alerts.timer", "cnc-backend-alerts.timer"),
+    ("cnc-cloudflare-domains.service", "cnc-cloudflare-domains.service"),
+    ("cnc-cloudflare-domains.timer", "cnc-cloudflare-domains.timer"),
+    ("cnc-origin-tls.service", "cnc-origin-tls.service"),
+    ("cnc-origin-tls.timer", "cnc-origin-tls.timer"),
     ("cnc-cloudflare-sync.service", "cnc-cloudflare-sync.service"),
     ("cnc-cloudflare-sync.timer", "cnc-cloudflare-sync.timer"),
     ("cnc-update-check.service", "cnc-update-check.service"),
@@ -35,6 +39,8 @@ MANAGED_SYSTEMD_UNITS = tuple(
 MANAGED_TIMER_UNITS = (
     "cnc-auto-size.timer",
     "cnc-backend-alerts.timer",
+    "cnc-cloudflare-domains.timer",
+    "cnc-origin-tls.timer",
     "cnc-cloudflare-sync.timer",
     "cnc-update-check.timer",
 )

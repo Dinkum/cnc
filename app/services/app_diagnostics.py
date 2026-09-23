@@ -159,6 +159,18 @@ def _container_is_quadlet_managed(inspect_payload: dict[str, Any] | None) -> boo
     return bool(labels.get("PODMAN_SYSTEMD_UNIT"))
 
 
+def _container_running_state(
+    inspect_payload: dict[str, Any] | None,
+) -> bool | None:
+    if not isinstance(inspect_payload, dict):
+        return None
+    state = inspect_payload.get("State")
+    if not isinstance(state, dict):
+        return None
+    running = state.get("Running")
+    return running if isinstance(running, bool) else None
+
+
 def _runtime_ownership(
     *,
     backend: Backend,
@@ -181,6 +193,7 @@ def _classify_runtime_diagnosis(
     *,
     runtime_observation_available: bool = True,
     container_exists: bool,
+    container_running: bool | None = True,
     backend_exec_available: bool,
     backend_exec_status: str,
     guest_ready: bool,
@@ -205,6 +218,14 @@ def _classify_runtime_diagnosis(
             "missing",
             "unknown",
             "sandbox_missing",
+        )
+
+    if container_running is not True:
+        return (
+            "stopped",
+            "stopped",
+            "unknown",
+            "sandbox_stopped",
         )
 
     if not backend_exec_available and backend_exec_status == "busy":
@@ -297,6 +318,13 @@ def collect_app_backend_diagnostics(
     )
     container_missing = container_observation_available and inspect_payload is None
     network_missing = network_observation_available and network_payload is None
+    container_running = _container_running_state(inspect_payload)
+    container_state_observation_available = (
+        inspect_payload is None or container_running is not None
+    )
+    runtime_observation_available = (
+        runtime_observation_available and container_state_observation_available
+    )
     saved_spec = read_saved_spec(settings, backend.name)
     bootstrap_state = read_bootstrap_state(settings, backend.name)
     failure_artifact = read_failure_artifact(settings, backend.name)
@@ -332,7 +360,11 @@ def collect_app_backend_diagnostics(
             else False
         )
     )
-    target_ip = container_ipv4_address(backend, inspect_payload)
+    target_ip = (
+        container_ipv4_address(backend, inspect_payload)
+        if container_running is True
+        else None
+    )
     dns_servers = []
     if isinstance(saved_spec, dict):
         raw_dns_servers = saved_spec.get("dns_servers")
@@ -348,7 +380,7 @@ def collect_app_backend_diagnostics(
     backend_exec_available = False
     backend_exec_status = "not_checked"
     backend_exec_error = ""
-    if inspect_payload is not None:
+    if container_running is True:
         guest_state_result = run_backend_guest_command(
             backend.name,
             settings,
@@ -370,11 +402,15 @@ def collect_app_backend_diagnostics(
             EXEC_CIRCUIT_OPEN_RETURN_CODE: "circuit_open",
             EXEC_GUARD_BUSY_RETURN_CODE: "busy",
             EXEC_GUARD_UNAVAILABLE_RETURN_CODE: "guard_unavailable",
-            124: "timeout",
+            124: "guest_deadline_or_exit_124",
         }.get(
             guest_state_result.returncode,
             "available" if backend_exec_available else "failed",
         )
+        if guest_state_result.timed_out:
+            backend_exec_status = "timeout"
+        elif guest_state_result.deadline_before_start:
+            backend_exec_status = "deadline_before_exec"
         if not backend_exec_available:
             backend_exec_error = (
                 guest_state_result.stderr
@@ -406,13 +442,13 @@ def collect_app_backend_diagnostics(
         bootstrap_state.get("status"), str
     ):
         bootstrap_status = str(bootstrap_state.get("status"))
-    elif inspect_payload is not None:
+    elif container_running is True:
         bootstrap_status = "pending"
 
     bootstrap_age_seconds = bootstrap_state_age_seconds(bootstrap_state)
     bootstrap_stale = (
         bootstrap_status == "running"
-        and inspect_payload is not None
+        and container_running is True
         and not guest_ready
         and bootstrap_age_seconds is not None
         and bootstrap_age_seconds >= settings.app_bootstrap_stale_after_sec
@@ -428,7 +464,7 @@ def collect_app_backend_diagnostics(
         "not_checked" if healthcheck_enabled else HEALTHCHECK_STATUS_UNMONITORED
     )
     private_error = ""
-    if target_ip:
+    if container_running is True and target_ip:
         private_probe = probe_backend_health(
             backend,
             host=target_ip,
@@ -447,7 +483,7 @@ def collect_app_backend_diagnostics(
         "not_checked" if healthcheck_enabled else HEALTHCHECK_STATUS_UNMONITORED
     )
     loopback_error = ""
-    if backend.port is not None:
+    if container_running is True and backend.port is not None:
         loopback_probe = probe_backend_health(
             backend,
             host="127.0.0.1",
@@ -475,6 +511,8 @@ def collect_app_backend_diagnostics(
     maintenance_issues: list[str] = []
     if not container_observation_available:
         observation_issues.append("container_inspect_unavailable")
+    elif inspect_payload is not None and not container_state_observation_available:
+        observation_issues.append("container_state_unavailable")
     if not network_observation_available:
         observation_issues.append("network_inspect_unavailable")
     if container_missing and saved_spec is not None:
@@ -487,6 +525,8 @@ def collect_app_backend_diagnostics(
         issues.append("stale_name_registration")
     if container_missing and network_payload is not None:
         issues.append("network_orphan")
+    if container_running is False:
+        issues.append("container_not_running")
     if network_uses_bridge_dns(network_payload):
         issues.append("bridge_dns_enabled")
     if inspect_payload is not None and saved_spec is None:
@@ -497,37 +537,37 @@ def collect_app_backend_diagnostics(
         issues.append("bootstrap_failed")
     if bootstrap_status == "stuck":
         issues.append("bootstrap_stuck")
-    if inspect_payload is not None and backend_exec_status == "busy":
+    if container_running is True and backend_exec_status == "busy":
         observation_issues.append("podman_exec_busy")
-    elif inspect_payload is not None and backend_exec_status == "guard_unavailable":
+    elif container_running is True and backend_exec_status == "guard_unavailable":
         observation_issues.append("podman_exec_guard_unavailable")
-    elif inspect_payload is not None and not backend_exec_available:
+    elif container_running is True and not backend_exec_available:
         issues.append("podman_exec_unavailable")
-    if inspect_payload is not None and backend_exec_available and not guest_ready:
+    if container_running is True and backend_exec_available and not guest_ready:
         issues.append("guest_system_unready")
-    if inspect_payload is not None and target_ip is None:
+    if container_running is True and target_ip is None:
         issues.append("private_ip_missing")
     if (
-        inspect_payload is not None
+        container_running is True
         and target_ip is not None
         and private_reachable is False
     ):
         issues.append("private_unreachable")
     if (
-        inspect_payload is not None
+        container_running is True
         and backend.port is not None
         and not loopback_publish_present
     ):
         issues.append("loopback_publish_missing")
     if (
-        inspect_payload is not None
+        container_running is True
         and backend.port is not None
         and not loopback_publish_present
         and legacy_loopback_proxy_present
     ):
         issues.append("legacy_loopback_proxy_present")
     if (
-        inspect_payload is not None
+        container_running is True
         and backend.port is not None
         and loopback_reachable is False
     ):
@@ -539,6 +579,7 @@ def collect_app_backend_diagnostics(
         _classify_runtime_diagnosis(
             runtime_observation_available=runtime_observation_available,
             container_exists=inspect_payload is not None,
+            container_running=container_running,
             backend_exec_available=backend_exec_available,
             backend_exec_status=backend_exec_status,
             guest_ready=guest_ready,
@@ -564,6 +605,8 @@ def collect_app_backend_diagnostics(
         "kind": backend.kind,
         "container": container,
         "container_exists": inspect_payload is not None,
+        "container_running": container_running,
+        "container_state_observation_available": container_state_observation_available,
         "container_observation_available": container_observation_available,
         "container_id": inspect_payload.get("Id")
         if isinstance(inspect_payload, dict)
@@ -632,6 +675,7 @@ def collect_app_backend_diagnostics(
         "maintenance_issues": maintenance_issues,
         "ok": not issues
         and inspect_payload is not None
+        and container_running is True
         and backend_exec_available
         and network_payload is not None
         and bootstrap_status == "succeeded"

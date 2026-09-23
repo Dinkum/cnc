@@ -157,6 +157,18 @@ class Input(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     kind: Mapped[str] = mapped_column(String(32), nullable=False, default="domain")
     hostname: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    https_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0"
+    )
+    https_provider: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="self_signed", server_default="self_signed"
+    )
+    cloudflare_dns_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0"
+    )
+    cloudflare_dns_ipv4: Mapped[Optional[str]] = mapped_column(
+        String(15), nullable=True
+    )
     shield_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="0"
     )

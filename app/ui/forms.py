@@ -257,6 +257,7 @@ def _input_create_payload_from_form(
     value: str,
     backend_ids: list[str],
     enabled: bool,
+    https_enabled: bool = False,
     shield_enabled: bool = False,
     shield_code_hash: str | None = None,
     shield_access_code: str | None = None,
@@ -267,6 +268,7 @@ def _input_create_payload_from_form(
             value=value,
             backend_ids=_nonblank_form_values(backend_ids),
             enabled=enabled,
+            https_enabled=https_enabled,
             shield_enabled=shield_enabled,
             shield_code_hash=_blank_form_value(shield_code_hash),
             shield_access_code=_blank_form_value(shield_access_code),
@@ -281,6 +283,7 @@ def _input_update_payload_from_form(
     value: str,
     backend_ids: list[str],
     enabled: bool,
+    https_enabled: bool = False,
     shield_enabled: bool = False,
     shield_code_hash: str | None = None,
     shield_access_code: str | None = None,
@@ -291,13 +294,13 @@ def _input_update_payload_from_form(
             value=value,
             backend_ids=_nonblank_form_values(backend_ids),
             enabled=enabled,
+            https_enabled=https_enabled,
             shield_enabled=shield_enabled,
             shield_code_hash=_blank_form_value(shield_code_hash),
             shield_access_code=_blank_form_value(shield_access_code),
         )
     except PydanticValidationError as exc:
         raise ValidationError(_schema_validation_message(exc)) from exc
-
 
 
 def operator_validation_error(exc: ValidationError) -> str:
