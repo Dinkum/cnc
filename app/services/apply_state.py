@@ -10,6 +10,8 @@ from sqlalchemy.orm import selectinload
 
 from app.services.hardening_policy import read_hardening_policy
 from app.config import Settings
+from app.services.cloudflare_connection import section
+from app.services.cloudflare_tunnel import TUNNEL_METRICS_PORT, TUNNEL_ORIGIN_PORT
 from app.logger import get_logger
 from app.models.entities import Backend, ClusterNode, Input
 from app.services.app_containers import runtime_spec
@@ -258,8 +260,6 @@ def _backend_cluster_upstream_target_for_node(
             phase="validate",
             details={"backend": backend.name, "node_uid": node_uid},
         )
-    # Remote app containers bind their published port to the node Tailscale IP,
-    # so follower nginx should use that address even when it runs on the owner.
     return f"{node_ip}:{backend.port}"
 
 
@@ -496,6 +496,7 @@ def _route_contracts(
                 "input_value": input_value,
                 "enabled": bool(item.enabled),
                 "https_enabled": bool(item.https_enabled),
+                "connection": item.connection or "public_ip",
                 "https_provider": item.https_provider or "self_signed",
                 "backend_names": [backend.name for backend in attached_backends],
                 "target": _render_route_target(
@@ -533,7 +534,6 @@ def _backend_contracts(backends: list[Backend]) -> list[dict[str, object]]:
                         "name": item.name,
                         "target_backend_id": item.target_backend_id,
                         "status": item.status,
-                        "direction": item.direction,
                     }
                     for item in read_inter_app_interfaces(backend)
                 ],
@@ -552,7 +552,6 @@ def _runtime_interface_source_contract(
         "env_key": item.env_key,
         "url": item.url,
         "network": item.network,
-        "direction": item.direction,
     }
 
 
@@ -567,7 +566,6 @@ def _runtime_interface_network_contract(
         "target_backend": item.target_backend,
         "alias": item.name if item.target_backend == backend_name else "",
         "role": "source" if item.source_backend == backend_name else "target",
-        "direction": item.direction,
     }
 
 
@@ -694,6 +692,22 @@ def _build_cluster_follower_ingress(
                 ),
             )
         for hostname, attached_backends in hostname_to_backends.items():
+            route_input = hostname_to_input.get(hostname)
+            if (
+                route_input is not None
+                and route_input.connection == "cloudflare_tunnel"
+            ):
+                transition = section(settings, "cloudflare_domains").get(
+                    str(route_input.id), {}
+                )
+                retain_public = (
+                    transition.get("hostname") == hostname
+                    and transition.get("pending_dns")
+                    and transition.get("keep_previous_connection")
+                    and transition.get("previous_connection") == "public_ip"
+                )
+                if not retain_public:
+                    continue
             filename = nginx_filename(hostname)
             primary_backend = attached_backends[0]
             if primary_backend.kind == "app":
@@ -721,7 +735,9 @@ def _build_cluster_follower_ingress(
                     ],
                     cloudflare_only=settings.nginx_cloudflare_only,
                     cloudflare_ips=settings.cloudflare_ip_list,
-                    tls_certificate=input_certificate_path(route_input),
+                    tls_certificate=input_certificate_path(
+                        route_input, connection="public_ip"
+                    ),
                     shield_enabled=shield_enabled,
                     shield_port=SHIELD_PORT,
                     shield_target=shield_target,
@@ -767,7 +783,9 @@ def _build_cluster_follower_ingress(
                     replica_root,
                     cloudflare_only=settings.nginx_cloudflare_only,
                     cloudflare_ips=settings.cloudflare_ip_list,
-                    tls_certificate=input_certificate_path(route_input),
+                    tls_certificate=input_certificate_path(
+                        route_input, connection="public_ip"
+                    ),
                     shield_enabled=shield_enabled,
                     shield_port=SHIELD_PORT,
                     shield_target=shield_target,
@@ -851,6 +869,15 @@ async def build_desired_state(
     except ValidationError as exc:
         raise ApplyFailed(str(exc), phase="validate") from exc
     for backend in backends:
+        if (
+            settings.cloudflare_tunnel_token
+            and backend.kind == "app"
+            and backend.port in {TUNNEL_ORIGIN_PORT, TUNNEL_METRICS_PORT}
+        ):
+            raise ApplyFailed(
+                "An output uses a port needed by Cloudflare Tunnel. Change its host port before connecting the Tunnel.",
+                phase="validate",
+            )
         logger.info(
             "apply.backend.validated",
             backend_id=backend.id,
@@ -915,7 +942,17 @@ async def build_desired_state(
     shield_ready = _shield_prerequisites_ready(inputs)
     shield_output_code_hashes: dict[str, str] = {}
     nginx_files: dict[str, str] = {}
+    domain_states = section(settings, "cloudflare_domains")
     for hostname, attached_backends in hostname_to_backends.items():
+        route_input = hostname_to_input.get(hostname)
+        is_tunnel = (
+            route_input is not None and route_input.connection == "cloudflare_tunnel"
+        )
+        if is_tunnel and not settings.cloudflare_tunnel_token:
+            raise ApplyFailed(
+                "Configure Cloudflare Tunnel in Settings before using this connection.",
+                phase="validate",
+            )
         filename = nginx_filename(hostname)
         primary_backend = attached_backends[0]
         if primary_backend.kind == "app":
@@ -942,6 +979,7 @@ async def build_desired_state(
                 ],
                 cloudflare_only=settings.nginx_cloudflare_only,
                 cloudflare_ips=ingress_allow_ips,
+                tunnel=is_tunnel,
                 tls_certificate=input_certificate_path(
                     route_input, settings.app_control_dir
                 ),
@@ -982,6 +1020,7 @@ async def build_desired_state(
                 primary_backend.static_root,
                 cloudflare_only=settings.nginx_cloudflare_only,
                 cloudflare_ips=ingress_allow_ips,
+                tunnel=is_tunnel,
                 tls_certificate=input_certificate_path(
                     route_input, settings.app_control_dir
                 ),
@@ -990,6 +1029,62 @@ async def build_desired_state(
                 shield_output_key=shield_route_key,
             )
 
+        transition = (
+            domain_states.get(str(route_input.id), {})
+            if route_input is not None
+            else {}
+        )
+        previous = transition.get("previous_connection")
+        if (
+            transition.get("hostname") == hostname
+            and transition.get("pending_dns")
+            and transition.get("keep_previous_connection")
+            and previous in {"public_ip", "cloudflare_tunnel"}
+            and previous != route_input.connection
+            and primary_backend.kind in {"app", "static"}
+        ):
+            previous_tunnel = previous == "cloudflare_tunnel"
+            options = dict(
+                cloudflare_only=settings.nginx_cloudflare_only,
+                cloudflare_ips=ingress_allow_ips,
+                tunnel=previous_tunnel,
+                upstream_suffix="_previous",
+                tls_certificate=input_certificate_path(
+                    route_input, settings.app_control_dir, connection=previous
+                ),
+                shield_enabled=shield_enabled,
+                shield_port=SHIELD_PORT,
+                shield_output_key=shield_route_key,
+            )
+            nginx_files["cnc-transition-" + filename] = (
+                render_nginx_http(
+                    hostname,
+                    [
+                        target
+                        for backend in attached_backends
+                        for target in _backend_upstream_targets(
+                            backend,
+                            nodes_by_uid,
+                            multi_node_enabled=settings.multi_node_enabled,
+                        )
+                        if backend.port is not None
+                    ],
+                    **options,
+                )
+                if primary_backend.kind == "app"
+                else render_nginx_static(
+                    hostname, primary_backend.static_root, **options
+                )
+            )
+
+    if any(
+        f"listen 127.0.0.1:{TUNNEL_ORIGIN_PORT};" in config
+        for config in nginx_files.values()
+    ):
+        nginx_files["cnc-tunnel-default.conf"] = (
+            f"server {{\n    listen 127.0.0.1:{TUNNEL_ORIGIN_PORT} default_server;\n"
+            "    server_name _;\n    return 404;\n}\n"
+        )
     if any("listen 443 ssl;" in content for content in nginx_files.values()):
         nginx_files["cnc-origin-https-default.conf"] = render_nginx_https_default(
             cloudflare_only=settings.nginx_cloudflare_only,

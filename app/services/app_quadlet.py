@@ -286,12 +286,9 @@ def render_quadlet_container(
 
 
 def quadlet_container_policy_content(content: str) -> str:
-    """Return the restart-requiring portion of a generated container Quadlet."""
     policy_lines: list[str] = []
     for line in content.splitlines():
         if line.startswith(("MemoryHigh=", "MemoryMax=")):
-            # systemd applies these service properties live; the same values stay
-            # in Quadlet so restarts and boots retain CNC's desired policy.
             continue
         if not line.startswith("PodmanArgs="):
             policy_lines.append(line)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import re
 
@@ -22,14 +22,6 @@ INTERFACE_STATUSES = {
     INTERFACE_STATUS_ACCEPTED,
     INTERFACE_STATUS_REJECTED,
 }
-INTERFACE_DIRECTION_OUT = "out"
-INTERFACE_DIRECTION_IN = "in"
-INTERFACE_DIRECTION_BIDIRECTIONAL = "bidirectional"
-INTERFACE_DIRECTIONS = {
-    INTERFACE_DIRECTION_OUT,
-    INTERFACE_DIRECTION_IN,
-    INTERFACE_DIRECTION_BIDIRECTIONAL,
-}
 
 
 class ConcurrentInterfaceUpdateError(ValidationError):
@@ -41,7 +33,6 @@ class InterAppInterface:
     name: str
     target_backend_id: int
     status: str = INTERFACE_STATUS_PENDING
-    direction: str = INTERFACE_DIRECTION_OUT
 
 
 @dataclass(frozen=True)
@@ -50,7 +41,6 @@ class InboundInterAppInterface:
     source_backend_id: int
     source_backend_name: str
     status: str
-    direction: str
 
 
 @dataclass(frozen=True)
@@ -64,7 +54,6 @@ class RuntimeInterAppInterface:
     network: str
     env_key: str
     url: str
-    direction: str = INTERFACE_DIRECTION_OUT
 
 
 def clean_interface_name(value: object) -> str:
@@ -81,23 +70,6 @@ def clean_interface_status(value: object) -> str:
     }
     status = aliases.get(raw_value, raw_value)
     return status if status in INTERFACE_STATUSES else INTERFACE_STATUS_PENDING
-
-
-def clean_interface_direction(value: object) -> str:
-    raw_value = str(value or "").strip().lower()
-    aliases = {
-        "from": INTERFACE_DIRECTION_IN,
-        "inbound": INTERFACE_DIRECTION_IN,
-        "incoming": INTERFACE_DIRECTION_IN,
-        "to": INTERFACE_DIRECTION_OUT,
-        "outbound": INTERFACE_DIRECTION_OUT,
-        "outgoing": INTERFACE_DIRECTION_OUT,
-        "both": INTERFACE_DIRECTION_BIDIRECTIONAL,
-        "bi": INTERFACE_DIRECTION_BIDIRECTIONAL,
-        "two-way": INTERFACE_DIRECTION_BIDIRECTIONAL,
-    }
-    direction = aliases.get(raw_value, raw_value)
-    return direction if direction in INTERFACE_DIRECTIONS else INTERFACE_DIRECTION_OUT
 
 
 def interface_network_name(source_backend: str, interface_name: str) -> str:
@@ -119,7 +91,13 @@ def _safe_slug(raw: str) -> str:
 
 
 def read_inter_app_interfaces(backend: Backend) -> tuple[InterAppInterface, ...]:
-    raw = str(getattr(backend, "inter_app_interfaces_json", "") or "[]").strip()
+    return parse_inter_app_interfaces(
+        str(getattr(backend, "inter_app_interfaces_json", "") or "[]")
+    )
+
+
+def parse_inter_app_interfaces(raw: str) -> tuple[InterAppInterface, ...]:
+    raw = raw.strip() or "[]"
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError:
@@ -146,7 +124,6 @@ def read_inter_app_interfaces(backend: Backend) -> tuple[InterAppInterface, ...]
                 name=name,
                 target_backend_id=target_backend_id,
                 status=clean_interface_status(item.get("status")),
-                direction=clean_interface_direction(item.get("direction")),
             )
         )
         seen_names.add(name)
@@ -156,7 +133,6 @@ def read_inter_app_interfaces(backend: Backend) -> tuple[InterAppInterface, ...]
 def inter_app_interfaces_from_form(
     names: list[str],
     target_backend_ids: list[str],
-    directions: list[str] | None = None,
 ) -> tuple[InterAppInterface, ...]:
     interfaces: list[InterAppInterface] = []
     seen_names: set[str] = set()
@@ -177,15 +153,8 @@ def inter_app_interfaces_from_form(
             raise ValidationError(
                 "interface names must start with a lowercase letter and use lowercase letters, numbers, or hyphens"
             )
-        direction = clean_interface_direction(
-            directions[index] if directions and index < len(directions) else ""
-        )
         interfaces.append(
-            InterAppInterface(
-                name=name,
-                target_backend_id=target_backend_id,
-                direction=direction,
-            )
+            InterAppInterface(name=name, target_backend_id=target_backend_id)
         )
         seen_names.add(name)
     return tuple(interfaces)
@@ -195,7 +164,6 @@ def reconcile_inter_app_interface_statuses(
     existing: tuple[InterAppInterface, ...],
     submitted: tuple[InterAppInterface, ...],
 ) -> tuple[InterAppInterface, ...]:
-    """Keep approval state server-side; source output forms cannot self-confirm."""
 
     existing_by_name = {item.name: item for item in existing}
     reconciled: list[InterAppInterface] = []
@@ -203,9 +171,7 @@ def reconcile_inter_app_interface_statuses(
         previous = existing_by_name.get(item.name)
         status = (
             previous.status
-            if previous
-            and previous.target_backend_id == item.target_backend_id
-            and previous.direction == item.direction
+            if previous and previous.target_backend_id == item.target_backend_id
             else INTERFACE_STATUS_PENDING
         )
         reconciled.append(
@@ -213,7 +179,6 @@ def reconcile_inter_app_interface_statuses(
                 name=item.name,
                 target_backend_id=item.target_backend_id,
                 status=status,
-                direction=item.direction,
             )
         )
     return tuple(reconciled)
@@ -225,6 +190,20 @@ def apply_inter_app_interfaces(
     backend.inter_app_interfaces_json = serialize_inter_app_interfaces(interfaces)
 
 
+def pending_inter_app_interfaces_json(raw: str) -> str:
+    """Keep declared interfaces but withdraw every approval.
+
+    A target accepts a particular source. A copy of that source, such as a
+    clone, is a new source and must be accepted again on its own.
+    """
+    return serialize_inter_app_interfaces(
+        tuple(
+            replace(item, status=INTERFACE_STATUS_PENDING)
+            for item in parse_inter_app_interfaces(raw)
+        )
+    )
+
+
 def serialize_inter_app_interfaces(
     interfaces: tuple[InterAppInterface, ...],
 ) -> str:
@@ -234,7 +213,6 @@ def serialize_inter_app_interfaces(
                 "name": item.name,
                 "target_backend_id": item.target_backend_id,
                 "status": clean_interface_status(item.status),
-                "direction": clean_interface_direction(item.direction),
             }
             for item in interfaces
         ],
@@ -291,10 +269,31 @@ def inbound_inter_app_interfaces(
                     source_backend_id=int(source.id),
                     source_backend_name=source.name,
                     status=clean_interface_status(item.status),
-                    direction=clean_interface_direction(item.direction),
                 )
             )
     return tuple(inbound)
+
+
+async def inter_app_interface_peer_names(
+    session: AsyncSession, backend_id: int
+) -> set[str]:
+    """Name every output linked to ``backend_id`` by an interface, either way.
+
+    An interface is rendered into both endpoints' runtimes, so a change to one
+    must converge its peers too. Callers read this before and after an edit,
+    so a removed link still reconciles the side it was removed from.
+    """
+    backends = (await session.execute(select(Backend))).scalars().all()
+    names_by_id = {backend.id: str(backend.name) for backend in backends}
+    peers: set[str] = set()
+    for backend in backends:
+        for item in read_inter_app_interfaces(backend):
+            if backend.id == backend_id and item.target_backend_id in names_by_id:
+                peers.add(names_by_id[item.target_backend_id])
+            elif item.target_backend_id == backend_id:
+                peers.add(str(backend.name))
+    peers.discard(names_by_id.get(backend_id, ""))
+    return peers
 
 
 async def apply_inbound_inter_app_interface_statuses(
@@ -304,9 +303,8 @@ async def apply_inbound_inter_app_interface_statuses(
     source_backend_ids: list[str],
     names: list[str],
     statuses: list[str],
-    directions: list[str] | None = None,
 ) -> None:
-    updates: dict[tuple[int, str], tuple[str, str | None]] = {}
+    updates: dict[tuple[int, str], str] = {}
     for index, raw_source_id in enumerate(source_backend_ids):
         name = clean_interface_name(names[index] if index < len(names) else "")
         if not name:
@@ -315,15 +313,9 @@ async def apply_inbound_inter_app_interface_statuses(
             source_backend_id = int(raw_source_id)
         except (TypeError, ValueError) as exc:
             raise ValidationError("interface source output is invalid") from exc
-        status = clean_interface_status(
+        updates[(source_backend_id, name)] = clean_interface_status(
             statuses[index] if index < len(statuses) else ""
         )
-        direction = (
-            clean_interface_direction(directions[index])
-            if directions and index < len(directions)
-            else None
-        )
-        updates[(source_backend_id, name)] = (status, direction)
 
     if not updates:
         return
@@ -350,13 +342,7 @@ async def apply_inbound_inter_app_interface_statuses(
             next_item = item
             key = (source_id, item.name)
             if item.target_backend_id == target_backend_id and key in updates:
-                status, direction = updates[key]
-                next_item = InterAppInterface(
-                    name=item.name,
-                    target_backend_id=item.target_backend_id,
-                    status=status,
-                    direction=direction or item.direction,
-                )
+                next_item = replace(item, status=updates[key])
                 found_names.add(item.name)
             updated.append(next_item)
         requested_names = {
@@ -426,7 +412,6 @@ def build_runtime_inter_app_interfaces(
                     network=network,
                     env_key=env_key,
                     url=f"http://{item.name}:{int(target.handoff_port)}",
-                    direction=clean_interface_direction(item.direction),
                 )
             )
     return tuple(sorted(links, key=lambda item: (item.source_backend, item.name)))

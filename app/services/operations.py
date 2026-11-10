@@ -50,6 +50,7 @@ HOST_MUTATION_OPERATION_KINDS = (
     "clone_backend",
     "cloudflare_sync",
     "cloudflare_domain",
+    "cloudflare_tunnel",
     "cloudflare_domains_sync",
     "create_backend",
     "delete_backend",
@@ -129,8 +130,6 @@ async def operation_session_scope(database_url: str) -> AsyncIterator[None]:
 
     @event.listens_for(engine.sync_engine, "checkout")
     def restore_busy_timeout(connection, _record, _proxy) -> None:
-        # Progress may leave a pooled connection in nonblocking mode. Reset on
-        # checkout without forcing normally lazy sessions to open the database.
         cursor = connection.cursor()
         cursor.execute("PRAGMA busy_timeout=5000")
         cursor.close()
@@ -142,8 +141,6 @@ async def operation_session_scope(database_url: str) -> AsyncIterator[None]:
     try:
         yield
     finally:
-        # Child tasks may inherit the context, but must never reuse an owner
-        # after the operation that created it has finished.
         owner.closed = True
         _SESSION_OWNER.reset(token)
         await engine.dispose()
@@ -232,8 +229,6 @@ class OperationHandle:
         for attempt in range(1, attempts + 1):
             try:
                 async with _operation_session(self.settings.database_url) as session:
-                    # Progress already has a file snapshot. Never wait on the
-                    # caller's write transaction; terminal records still wait.
                     await session.execute(
                         text(f"PRAGMA busy_timeout={5000 if finished else 0}")
                     )
@@ -548,6 +543,19 @@ async def _active_update_run_blocker(settings: Settings) -> HostMutationBlocker 
         return None
 
 
+QUEUED_JOB_KEY = "queued_job"
+
+
+def queued_job(details: dict[str, Any]) -> dict[str, Any] | None:
+    job = details.get(QUEUED_JOB_KEY) if isinstance(details, dict) else None
+    return job if isinstance(job, dict) and job.get("runner") else None
+
+
+def job_awaiting_dispatch(details: dict[str, Any]) -> bool:
+    job = queued_job(details)
+    return job is not None and not job.get("dispatched_at")
+
+
 async def fail_interrupted_operations(settings: Settings) -> int:
     database_url = getattr(settings, "database_url", None)
     if not database_url:
@@ -558,8 +566,6 @@ async def fail_interrupted_operations(settings: Settings) -> int:
                 await session.execute(
                     select(Operation)
                     .where(Operation.status.in_(("queued", "running")))
-                    # Guest-supervised commands outlive the control-plane process.
-                    # Their result/guest incarnation is reconciled by command_jobs.
                     .where(Operation.kind != "output_exec")
                     .order_by(Operation.id.asc())
                 )
@@ -572,11 +578,15 @@ async def fail_interrupted_operations(settings: Settings) -> int:
             await session.commit()
             return 0
         finished_at = datetime.now(UTC)
+        interrupted = 0
         for operation in operations:
             try:
                 details = json.loads(operation.details_json or "{}")
             except json.JSONDecodeError:
                 details = {"raw": operation.details_json}
+            if operation.status == "queued" and job_awaiting_dispatch(details):
+                continue
+            interrupted += 1
             if (
                 operation.kind == "auto_size"
                 and operation.status == "running"
@@ -622,8 +632,9 @@ async def fail_interrupted_operations(settings: Settings) -> int:
                 operation.details_json = _json_dumps(details)
         await prune_control_plane_history(session)
         await session.commit()
-        logger.warning("operations.interrupted_marked_failed", count=len(operations))
-        return len(operations)
+        if interrupted:
+            logger.warning("operations.interrupted_marked_failed", count=interrupted)
+        return interrupted
 
 
 async def _operation_has_successful_apply_run(
@@ -712,17 +723,6 @@ def try_acquire_host_mutation_lock(settings: Settings) -> FileLock | None:
 
 @asynccontextmanager
 async def host_mutation_lock(settings: Settings):
-    """Hold the host mutation lock without opening an operation.
-
-    The commit boundary needs the lock for longer than convergence does. Apply
-    releases it when its own operation ends, which left a window between
-    convergence and the database commit where a competing mutation could
-    change the host underneath a recovery that was about to restore it.
-
-    Reentrant through the same depth counter as ``host_mutation_operation``, so
-    wrapping an apply that acquires it internally is safe and acquires nothing
-    twice.
-    """
     if _LOCK_DEPTH.get() > 0:
         yield
         return

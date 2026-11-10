@@ -179,7 +179,6 @@ def metric_history_query_key(
 
 def _field(row: object, key: str) -> object:
     if isinstance(row, RowMapping):
-        # RowMapping.get performs ABC checks for every field on every sample.
         try:
             return row[key]
         except KeyError:
@@ -653,10 +652,8 @@ def _network_direction_rates(
 
 
 def _nice_axis_min(min_val: float, max_val: float, unit_kind: str) -> float:
-    """Return a nice lower bound for the Y axis, auto-scaling for bytes."""
     if unit_kind != "bytes" or min_val <= 0 or max_val <= 0:
         return 0.0
-    # Only lift the baseline when data lives well above zero.
     if min_val / max_val < 0.35:
         return 0.0
     baseline = min_val * 0.75
@@ -951,8 +948,6 @@ def _memory_limit_changes_in_range(
 
 @dataclass(frozen=True)
 class MetricHistoryData:
-    """Detached inputs: no session or ORM instance crosses into the worker."""
-
     metric: MetricSpec
     timeframe: TimeframeSpec
     target_points: int
@@ -970,7 +965,6 @@ _history_workers = BoundedThreadWorker(2)
 async def render_metric_history(
     data: MetricHistoryData, *, host: bool = False
 ) -> dict[str, object]:
-    """Keep chart math off the event loop and retain ownership on cancellation."""
     renderer = _render_host_metric_history if host else _render_backend_metric_history
     return await _history_workers.run(renderer, data)
 

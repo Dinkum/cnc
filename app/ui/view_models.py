@@ -223,6 +223,11 @@ def _backup_summary(
         "rows": [
             ("covered paths", covered_paths_summary or "-"),
             ("integrity", str(coverage.get("verification_status") or "checking")),
+            *(
+                [("consistency", str(coverage["capture_consistency_label"]))]
+                if coverage.get("capture_consistency_label")
+                else []
+            ),
             ("restore", str(coverage.get("restore_readiness_label") or "checking")),
             *(
                 [("note", str(coverage["risk_summary"]))]
@@ -300,18 +305,6 @@ def _save_job_error_meta(details: dict[str, object]) -> dict[str, str] | None:
     if not error_code or not error_inst:
         return None
     return {"label": "error", "value": f"{error_code}-{error_inst}"}
-
-
-def _save_job_status_label(
-    status: str | None, details: dict[str, object] | None = None
-) -> str:
-    return present_mutation_outcome(status, details).status_label
-
-
-def _save_job_tone(
-    status: str | None, details: dict[str, object] | None = None
-) -> str:
-    return present_mutation_outcome(status, details).tone
 
 
 def _save_job_counts(details: dict[str, object]) -> list[str]:
@@ -683,7 +676,7 @@ def _save_job_summary(
 
     presentation = present_mutation_outcome(str(status or ""), details)
     tone = presentation.tone
-    status_label = _save_job_status_label(str(status or ""), details)
+    status_label = presentation.status_label
     phase = _save_job_primary_phase(details) or None
     if run_id is None and not status and not message and not details and not created_at:
         return None

@@ -207,7 +207,6 @@ class JSONLFormatter(UTCIsoFormatter):
 
 
 class PrivateRotatingFileHandler(RotatingFileHandler):
-    """One serialized check/rotate/write transaction across local CNC processes."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         kwargs["delay"] = True
@@ -273,7 +272,6 @@ class PrivateRotatingFileHandler(RotatingFileHandler):
             self.handleError(record)
 
     def handleError(self, record: logging.LogRecord) -> None:  # noqa: N802
-        # StreamHandler swallows I/O failures here; never echo raw records to stderr.
         self.write_failures += 1
         error_type = sys.exc_info()[0]
         self.last_write_error = error_type.__name__ if error_type else "WriteError"
@@ -288,7 +286,6 @@ class PrivateRotatingFileHandler(RotatingFileHandler):
 
 
 class GZipRotatingFileHandler(PrivateRotatingFileHandler):
-    """Size-based rotating handler that compresses rolled files as .gz."""
 
     def _reopen_current_file(self) -> None:
         self._finish_pending_compression()
@@ -302,8 +299,6 @@ class GZipRotatingFileHandler(PrivateRotatingFileHandler):
             return
         destination = f"{plain}.gz"
         temporary = f"{destination}.tmp"
-        # Keep the source until the complete gzip is published; a killed writer
-        # leaves a recoverable segment for the next lock owner.
         with open(plain, "rb") as source:
             descriptor = os.open(
                 temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600
@@ -335,7 +330,6 @@ class GZipRotatingFileHandler(PrivateRotatingFileHandler):
 
 
 class SafeStreamHandler(logging.StreamHandler):
-    """Stream handler that stays quiet when a captured stderr stream closes."""
 
     def emit(self, record: logging.LogRecord) -> None:
         stream = self.stream
@@ -379,8 +373,6 @@ class FlushableQueueHandler(QueueHandler):
         self.addFilter(ContextSnapshotFilter())
 
     def prepare(self, record: logging.LogRecord) -> logging.LogRecord:
-        # Ignore arbitrary third-party extras: only bounded canonical fields cross
-        # the queue boundary, so unrelated objects cannot retain application state.
         fields = {}
         for key in (
             "name",
@@ -422,7 +414,6 @@ class FlushableQueueHandler(QueueHandler):
         prepared.message_text = prepared.msg
         prepared.exception_text = _exception_text(record)
         prepared.exc_text = None
-        # Tracebacks retain frames and mutable application state; queue only safe text.
         prepared.exc_info = None
         prepared.args = None
         prepared.stack_info = None
@@ -467,7 +458,6 @@ class _RecordQueueListener:
         return self._started and self._thread.is_alive()
 
     def enqueue(self, record: logging.LogRecord) -> None:
-        # Linearize acceptance with shutdown so no accepted record arrives after drain.
         with self._state_lock:
             if self._stopping.is_set():
                 self._record_drop(record)
@@ -556,7 +546,6 @@ class _RecordQueueListener:
                     except Exception:
                         self._failure(handler, flushing=True)
         self._flush_handlers()
-        # The writer owns closure, even when a caller's bounded stop times out.
         for handler in self._handlers:
             try:
                 handler.close()
@@ -934,7 +923,6 @@ def _in_async_context() -> bool:
 
 
 def flush_logging_pipeline() -> bool:
-    """Synchronous CLI durability boundary; async callers use the awaited variant."""
     if _logging_pipeline is not None:
         return _logging_pipeline.listener.flush()
     return False
@@ -1090,7 +1078,6 @@ def _ascii_text(value: str) -> str:
 
 
 def _json_safe_context(value: Any) -> Any:
-    # A shared budget bounds cycles, depth, width and text across the entire snapshot.
     nodes = MAX_CONTEXT_NODES
     characters = MAX_RECORD_TEXT
 

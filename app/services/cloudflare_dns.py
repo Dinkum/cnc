@@ -1,11 +1,10 @@
-"""DNS previews and ownership-aware changes. Existing unrelated records are never replaced."""
-
 from __future__ import annotations
 
 import hashlib
 import ipaddress
 import json
 from typing import Any
+from uuid import UUID
 
 from app.services.cloudflare_api import CloudflareClient, CloudflareError, resource_id
 
@@ -40,28 +39,45 @@ def dns_plan(
     hostname: str,
     ipv4: str,
     owned_record_id: str = "",
+    tunnel_id: str = "",
 ) -> dict[str, Any]:
+    if tunnel_id:
+        try:
+            tunnel_id = str(UUID(tunnel_id))
+        except ValueError:
+            raise CloudflareError(
+                "Reconnect Cloudflare Tunnel before managing its DNS."
+            ) from None
+    record_type = "CNAME" if tunnel_id else "A"
+    content = f"{tunnel_id}.cfargotunnel.com" if tunnel_id else ipv4
     records = client.records(zone_id, hostname)
     addresses = [row for row in records if row["type"] in {"A", "AAAA", "CNAME", "NS"}]
     result: dict[str, Any] = {
         "hostname": hostname,
         "ipv4": ipv4,
+        "tunnel_id": tunnel_id,
+        "type": record_type,
+        "content": content,
         "record_id": "",
         "action": "create",
         "before": "No address record",
-        "after": f"A {hostname} → {ipv4} · Proxied",
+        "after": f"{record_type} {hostname} → {content} · Proxied",
         "fingerprint": records_fingerprint(records),
         "conflict": "",
     }
     if not addresses:
         return result
-    if len(addresses) == 1 and addresses[0]["type"] == "A":
+    if len(addresses) == 1 and addresses[0]["type"] in {"A", "CNAME"}:
         record = addresses[0]
         result["record_id"] = resource_id(record["id"])
         result["before"] = (
-            f"A {hostname} → {record['content']} · {'Proxied' if record['proxied'] else 'DNS only'}"
+            f"{record['type']} {hostname} → {record['content']} · {'Proxied' if record['proxied'] else 'DNS only'}"
         )
-        if record["content"] == ipv4 and record["proxied"] is True:
+        if (
+            record["type"] == record_type
+            and str(record["content"]).rstrip(".").lower() == content
+            and record["proxied"] is True
+        ):
             result["action"] = "keep"
             return result
         if result["record_id"] == owned_record_id:
@@ -87,6 +103,7 @@ def apply_dns_plan(
         zone_id=zone_id,
         hostname=plan["hostname"],
         ipv4=plan["ipv4"],
+        tunnel_id=plan.get("tunnel_id", ""),
         owned_record_id=owned_record_id,
     )
     if live["fingerprint"] != plan["fingerprint"] or live["conflict"]:
@@ -97,9 +114,9 @@ def apply_dns_plan(
         return live["record_id"]
     path = f"/zones/{resource_id(zone_id)}/dns_records"
     body = {
-        "type": "A",
+        "type": live["type"],
         "name": plan["hostname"],
-        "content": plan["ipv4"],
+        "content": live["content"],
         "proxied": True,
         "ttl": 1,
     }

@@ -86,9 +86,6 @@ def _existing_cgroup_path(value: object) -> tuple[str, Path] | None:
 
 
 def _resolve_container_cgroup(state: dict[str, Any]) -> tuple[str, Path] | None:
-    # Podman's State.CgroupPath names the payload cgroup where limits are applied.
-    # The PID commonly lives below it in init.scope, whose inherited files read as
-    # unbounded and whose usage covers only the init process.
     inspected = _existing_cgroup_path(state.get("CgroupPath"))
     if inspected is not None:
         return inspected

@@ -13,11 +13,13 @@ from app.models.entities import Backend, BackendBackup, ClusterNode
 from app.services.commands import run_command
 from app.services.renderers import safe_slug
 from app.services.ssh_options import SSH_BATCH_OPTIONS
+from app.services.thread_workers import BoundedThreadWorker
 
 
 logger = get_logger("cluster.backups")
 
 MIRROR_ROOT = "/var/lib/cnc/backend-backup-mirrors"
+_mirror_workers = BoundedThreadWorker(1)
 
 
 async def mirror_backend_backup_to_cluster(
@@ -49,20 +51,15 @@ async def mirror_backend_backup_to_cluster(
         destination_dir = f"{MIRROR_ROOT}/{safe_slug(backend.name)}"
         destination_path = f"{destination_dir}/{bundle_path.name}"
         try:
-            _ssh_checked(
+            await _mirror_workers.run(
+                _mirror_bundle,
                 node_ip,
+                bundle_path,
+                destination_dir,
+                destination_path,
+                expected_sha256,
                 settings,
-                f"install -d -m 0755 {shlex.quote(destination_dir)}",
             )
-            _scp_checked(
-                str(bundle_path), f"root@{node_ip}:{destination_path}", settings
-            )
-            if expected_sha256:
-                _ssh_checked(
-                    node_ip,
-                    settings,
-                    _verify_sha256_script(destination_path, expected_sha256),
-                )
             mirrored.append(
                 {
                     "node_uid": node.node_uid,
@@ -93,6 +90,28 @@ async def mirror_backend_backup_to_cluster(
         "mirrored": mirrored,
         "failures": failures,
     }
+
+
+def _mirror_bundle(
+    node_ip: str,
+    bundle_path: Path,
+    destination_dir: str,
+    destination_path: str,
+    expected_sha256: str,
+    settings: Settings,
+) -> None:
+    _ssh_checked(
+        node_ip,
+        settings,
+        f"install -d -m 0755 {shlex.quote(destination_dir)}",
+    )
+    _scp_checked(str(bundle_path), f"root@{node_ip}:{destination_path}", settings)
+    if expected_sha256:
+        _ssh_checked(
+            node_ip,
+            settings,
+            _verify_sha256_script(destination_path, expected_sha256),
+        )
 
 
 async def _healthy_follower_nodes(session: AsyncSession) -> list[ClusterNode]:

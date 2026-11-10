@@ -25,7 +25,8 @@ from app.services import backend_commands
 from app.services.app_healthchecks import probe_backend_health
 from app.services.app_runtime import build_app_container_create_command
 from app.services.commands import CommandError, CommandResult, run_command
-from app.services.container_runtime import container_exists, inspect_container
+from app.services.container_runtime import container_presence, inspect_container
+from app.services.observation import Absent, Present, Unknown
 from app.services.control_events import emit_control_event
 from app.services.renderers import container_name, network_name, safe_slug
 from app.services.resource_profile import build_resource_profile
@@ -921,10 +922,15 @@ async def _run_phase1_monitor_async(
 
     container = container_name(backend.name)
     try:
-        if not container_exists(
+        presence = container_presence(
             container, timeout_sec=settings.command_timeout_status_sec
-        ):
+        )
+        if isinstance(presence, Absent):
             raise RuntimeError(f"container not found: {container}")
+        if isinstance(presence, Unknown):
+            raise RuntimeError(
+                f"cannot observe container {container} ({presence.describe()})"
+            )
         logger.info(
             "app_hardening.phase1.container_found",
             backend_id=backend_id,
@@ -2107,12 +2113,17 @@ def _watch_container(
     lines: list[str] = []
     ok = True
     while datetime.now(UTC).timestamp() < deadline:
-        _result, inspect = inspect_container(
+        observation = inspect_container(
             container, timeout_sec=settings.command_timeout_status_sec
         )
-        status = str(((inspect or {}).get("State") or {}).get("Status") or "")
+        if isinstance(observation, Present):
+            status = str((observation.value.get("State") or {}).get("Status") or "")
+        elif isinstance(observation, Absent):
+            status = "missing"
+        else:
+            status = "unknown"
         lines.append(f"{datetime.now(UTC).isoformat()} state={status}")
-        if status in {"exited", "dead"}:
+        if status in {"exited", "dead", "missing"}:
             ok = False
             break
         if backend.port is not None:
@@ -2661,7 +2672,6 @@ def _feature_rows(
             and phase2 is not None
             and _json_loads_dict(phase2.details_json).get("mount_test_version") != 1
         ):
-            # Older clone tests changed rootfs/privilege flags rather than mount options.
             phase2_rating = ""
         phase1_rating = str(phase1_ratings.get(setting) or "")
         rating = phase2_rating or phase1_rating

@@ -438,7 +438,6 @@ async def update_beta_settings_form(
                 next_settings,
                 operation_kind="ui.settings.netdata",
                 actor="ui",
-                # Settings are host-wide, so this really does cover everything.
                 scope=full_reconcile("ui.settings.netdata").scope(),
             )
             if apply_response.status != "success":

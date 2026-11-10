@@ -1,4 +1,3 @@
-"""Tab-scoped dashboard queries and status freshness policy."""
 
 from __future__ import annotations
 

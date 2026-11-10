@@ -1,4 +1,3 @@
-"""Cloudflare connection metadata; credentials stay in the managed environment."""
 
 from __future__ import annotations
 

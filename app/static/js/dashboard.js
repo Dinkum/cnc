@@ -837,12 +837,11 @@
       const diagnosis = String(service?.diagnostics?.diagnosis || "").trim().toLowerCase();
       if (diagnosis === "healthy") return { value: "healthy", tone: "success" };
       if (diagnosis === "app_unmonitored") return { value: "unmonitored", tone: "warn" };
-      if (["backend_observation_deferred", "backend_observation_unavailable"].includes(diagnosis)) {
+      if (["backend_observation_deferred", "backend_observation_unavailable", "sandbox_observation_unavailable"].includes(diagnosis)) {
         return { value: "unknown", tone: "queued" };
       }
       if (diagnosis) return { value: "unhealthy", tone: "error" };
     }
-    // Missing observations after cache invalidation must not count as failures.
     if (!activeState || activeState === "unknown") return { value: "unknown", tone: "queued" };
     if (activeState === "active" && (kind !== "shield" || service?.ok)) {
       return { value: "healthy", tone: "success" };
@@ -1535,7 +1534,6 @@
       ? (note || substep || "")
       : (substep || activeStep.substep || note || "");
     window.CNCProgress.card.show(SAVE_CARD_KEY, {
-      // "queued" is a running state as far as the surface is concerned.
       tone: tone === "success" || tone === "error" ? tone : "running",
       title: actionLabel,
       headline: mainStage,
@@ -2014,8 +2012,6 @@
     });
   };
 
-  // The card stack is created on demand, so look it up each time rather than
-  // holding a reference that may predate the first card.
   const floatingSaveShellNow = () => {
     const shell = document.querySelector("[data-progress-shell]");
     return shell && !shell.hidden ? shell : null;
@@ -2210,12 +2206,6 @@
     }
   };
 
-  // A row and its expanded detail are one object, so they take one halo between
-  // them. The card inside the detail row is deliberately left alone: haloing it
-  // too drew a second box inside the first.
-  //
-  // "is-busy" rather than "is-pending" because .node-join-panel.is-pending
-  // already means something else entirely (a step that is not unlocked yet).
   const markRowBusy = (kind, id, busy) => {
     if (!id) return;
     const row = document.querySelector(`[data-${kind}-row="${id}"]`);
@@ -3105,7 +3095,6 @@
         try {
           await navigator.clipboard?.writeText(command);
         } catch (_error) {
-          // Clipboard access may be blocked in some browser contexts; still show the next UI state.
         }
         installCopy.textContent = "Copied";
         if (joinStatus) joinStatus.hidden = false;
@@ -3119,7 +3108,6 @@
         try {
           await navigator.clipboard?.writeText(command);
         } catch (_error) {
-          // Clipboard access may be blocked in some browser contexts; the command remains visible.
         }
         tailnetCopy.textContent = "Copied";
       });

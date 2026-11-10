@@ -126,7 +126,6 @@ body::before {
   min-width: 0;
 }
 
-/* ── Site header (replaces old giant hero) ── */
 .site-header {
   display: flex;
   justify-content: space-between;
@@ -421,7 +420,6 @@ a.tab {
   min-width: 0;
 }
 
-/* ── route map ── */
 .route-map {
   display: grid;
   gap: 8px;
@@ -2336,6 +2334,10 @@ a.tab {
   color: var(--text);
 }
 
+#restore-backup-modal {
+  max-width: calc(100vw - 32px);
+}
+
 .confirm-modal::backdrop {
   background: rgba(4, 8, 15, 0.68);
   backdrop-filter: blur(8px);
@@ -2843,7 +2845,6 @@ a.tab {
   gap: 14px;
 }
 
-/* compact inline settings form */
 .sf {
   display: grid;
   gap: 0;
@@ -3073,7 +3074,6 @@ label {
   background: rgba(8, 13, 22, 0.54);
 }
 
-/* --- output tag chips --- */
 .output-tags {
   display: flex;
   flex-wrap: wrap;
@@ -3141,7 +3141,6 @@ label {
   padding: 6px 0;
 }
 
-/* --- add output dropdown --- */
 .output-add-wrap {
   position: relative;
   margin-top: 0;
@@ -3586,8 +3585,9 @@ label {
   font-weight: 800;
 }
 
-.placement-interface-path select {
-  flex: 0 0 176px;
+.placement-interface-arrow {
+  flex: 0 0 auto;
+  font-weight: 900;
 }
 
 .placement-interface-path .placement-interface-target-select {
@@ -3693,7 +3693,6 @@ label {
   margin-top: -8px;
 }
 
-/* --- toggle switch --- */
 .toggle-switch-label {
   display: inline-flex;
   align-items: center;
@@ -4301,10 +4300,6 @@ td {
   background: rgba(255, 255, 255, 0.022);
 }
 
-/* ── busy row: one halo around the whole thing ──
-   A row and its expanded detail are one object, so they get one boundary and
-   one sweep. The summary row carries the ring; when the detail is open it
-   carries the bottom edge instead, and the detail row closes the shape. */
 .click-row.is-busy {
   --busy-spot-x: 12%;
   background:
@@ -4317,7 +4312,6 @@ td {
   animation: busy-sweep 2.8s ease-in-out infinite;
 }
 
-/* Detail open: drop the summary row's bottom edge so the two read as one box. */
 .click-row.is-busy:has(+ .detail-row.is-busy:not([hidden])) {
   box-shadow:
     inset 1px 0 0 rgba(242, 193, 107, 0.34),
@@ -4352,8 +4346,6 @@ td {
   padding: 20px;
 }
 
-/* The detail row closes the shape: sides and bottom, no top edge, no second
-   sweep of its own. The card inside stays plain. */
 .detail-row.is-busy {
   --busy-spot-x: 12%;
   background:
@@ -4394,7 +4386,6 @@ td {
   }
 }
 
-/* ── row affordance indicators ── */
 .th-chevron {
   width: 28px;
 }
@@ -4413,7 +4404,6 @@ td {
   transition: opacity 140ms ease, color 140ms ease, transform 140ms ease;
 }
 
-/* expand rows: chevron rotates down → right when expanded */
 .row-expand .row-chevron {
   transform: rotate(90deg);
 }
@@ -4424,7 +4414,6 @@ td {
   opacity: 0.9;
 }
 
-/* navigate rows: chevron slides right on hover */
 .row-navigate:hover .row-chevron,
 .row-navigate:focus .row-chevron {
   opacity: 1;
@@ -4432,7 +4421,6 @@ td {
   transform: translateX(3px);
 }
 
-/* inline link-action — looks like a subtle hyperlink, not a button */
 .link-action {
   all: unset;
   cursor: pointer;
@@ -4458,7 +4446,6 @@ td {
   filter: none;
 }
 
-/* output detail breadcrumb */
 .back-crumb {
   display: inline-flex;
   align-items: center;
@@ -4477,7 +4464,6 @@ td {
   color: var(--accent);
 }
 
-/* output page — compact bare header */
 .output-page-head {
   padding: 2px 4px 18px;
   display: grid;
@@ -5480,11 +5466,6 @@ pre {
 }
 .metric-export-options button { width: 100%; text-align: left; white-space: nowrap; }
 
-/* ---------------------------------------------------------------------------
-   Progress component
-   One track and two surfaces for every operation pipeline. The card is for work
-   the user can walk away from; the dialog is for work that blocks.
-   --------------------------------------------------------------------------- */
 
 .progress-track {
   height: 8px;
@@ -5522,8 +5503,6 @@ pre {
   box-shadow: 0 0 24px rgba(255, 108, 127, 0.24);
 }
 
-/* A moving highlight reads as "still working" even when the bar is between
-   reported steps. Only ever shown while running. */
 .progress-fill[data-tone="running"]::after {
   content: "";
   position: absolute;
@@ -5569,7 +5548,6 @@ pre {
   box-shadow: 0 0 12px rgba(242, 193, 107, 0.42);
 }
 
-/* --- card surface --------------------------------------------------------- */
 
 .progress-card-shell {
   position: fixed;
@@ -5581,8 +5559,6 @@ pre {
   flex-direction: column-reverse;
   gap: 12px;
   pointer-events: none;
-  /* A toast stack, not a full-bleed footer: cap the width on wide screens and
-     let it sit against the right edge. */
   width: auto;
   max-width: 520px;
   margin-left: auto;

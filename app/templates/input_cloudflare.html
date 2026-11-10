@@ -1,22 +1,33 @@
 {% set cf = detail.get('cloudflare', {}) %}
 {% if cf.get('visible') %}
 <div class="input-shield-card cf-domain-card" data-cf-domain-card>
-  <div class="section-head input-shield-head"><h3>Cloudflare</h3><span class="summary-pill">{{ cf.zone or 'Reconnect required' }}</span></div>
-  {% if not cf.available %}<p class="subtle">Reconnect Cloudflare in Settings to manage this domain.</p>{% endif %}
   <form data-cf-domain-form data-input-id="{{ item.id }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label>Connection
+      <select name="connection" data-cf-connection>
+        <option value="public_ip" {% if cf.connection == 'public_ip' %}selected{% endif %}>Public IP</option>
+        {% if cf.tunnel.configured or cf.connection == 'cloudflare_tunnel' %}<option value="cloudflare_tunnel" {% if cf.connection == 'cloudflare_tunnel' %}selected{% endif %} {% if not cf.tunnel.connected and cf.connection != 'cloudflare_tunnel' %}disabled{% endif %}>Cloudflare Tunnel{{ ' · unavailable' if not cf.tunnel.connected else '' }}</option>{% endif %}
+      </select>
+    </label>
+    <div data-cf-tunnel-fields {% if cf.connection != 'cloudflare_tunnel' %}hidden{% endif %}>
+      <p class="subtle"><a href="{{ cf.tunnel.dashboard_url }}" target="_blank" rel="noopener noreferrer">Add this hostname in Cloudflare ↗</a> under Published application routes, with service <code>{{ cf.tunnel.service_url }}</code>. Cloudflare also creates DNS; resolve any existing address record there first. Switching an existing hostname may interrupt traffic.</p>
+      <p class="subtle">Hostname route: Not verified. Connector runs on the leader.</p>
+    </div>
+    <h3 class="cf-api-heading">Cloudflare API</h3>
+    {% if not cf.available %}<p class="subtle">Connect Cloudflare API in Settings to manage this domain's DNS or certificates.</p>{% endif %}
     <div class="cf-domain-fields">
-      <label>Certificate
+      <label data-cf-certificate-field {% if cf.connection == 'cloudflare_tunnel' %}hidden{% endif %}>Certificate
         <select name="provider">
           <option value="self_signed" {% if cf.provider == 'self_signed' %}selected{% endif %}>Self-signed · Full</option>
-          <option value="cloudflare_origin" {% if cf.provider == 'cloudflare_origin' %}selected{% endif %} {% if not cf.available %}disabled{% endif %}>Cloudflare Origin CA · Full (strict)</option>
+          <option value="cloudflare_origin" {% if cf.provider == 'cloudflare_origin' %}selected{% endif %} {% if not cf.available and cf.provider != 'cloudflare_origin' %}disabled{% endif %}>Cloudflare Origin CA · Full (strict)</option>
         </select>
       </label>
       <label class="toggle cf-dns-toggle"><input name="manage_dns" type="checkbox" {% if cf.dns_enabled %}checked{% endif %}><span>Manage DNS</span></label>
-      <label data-cf-ipv4-field {% if not cf.dns_enabled %}hidden{% endif %}>Serving node IPv4
+      <label data-cf-ipv4-field {% if not cf.dns_enabled or cf.connection == 'cloudflare_tunnel' %}hidden{% endif %}>Serving node IPv4
         <input name="ipv4" value="{{ cf.ipv4 }}" placeholder="e.g. 192.0.2.10" autocomplete="off" spellcheck="false" {% if not cf.dns_enabled %}disabled{% endif %}>
       </label>
     </div>
+    <label class="toggle" data-cf-route-confirm {% if cf.connection != 'cloudflare_tunnel' or not cf.dns_enabled %}hidden{% endif %}><input type="checkbox" name="route_confirmed"><span>I configured this hostname in this Tunnel in Cloudflare.</span></label>
     <p class="subtle">DNS records are proxied through Cloudflare.</p>
     {% if cf.error %}<p class="cf-message is-error">{{ cf.error }}</p>{% endif %}
     <div class="editor-actions"><span class="subtle">{{ cf.status }}</span><button type="submit" class="ghost">Preview changes</button></div>

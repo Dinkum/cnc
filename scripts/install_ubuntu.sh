@@ -56,10 +56,6 @@ MANAGED_PODMAN_LOCAL_COMMAND_PATH="/usr/local/bin/podman"
 MANAGED_PODMAN_DISTRO_PATH="/usr/bin/podman.cnc-distro"
 MANAGED_PODMAN_CONFIG_PATH="/etc/containers/containers.conf.d/85-cnc-runtime.conf"
 MANAGED_PODMAN_SYSTEM_GENERATOR_PATH="/etc/systemd/system-generators/podman-system-generator"
-# Podman's default shm lock backend sizes /dev/shm/libpod_lock from the build,
-# and the distro builds and the pinned build disagree on arm64. The file backend
-# keeps the pinned runtime's locks under /run/libpod instead, where nothing else
-# writes. See write_managed_podman_config for the measured numbers.
 MANAGED_PODMAN_LOCK_TYPE="file"
 
 INSTALL_LOG=""
@@ -224,8 +220,6 @@ run_step() {
   shift 2
 
   step_begin "${id}" "${label}"
-  # Do not put the step in an if/|| condition: Bash then disables errexit
-  # throughout the called function, allowing an early failure to look successful.
   "$@"
   step_finish "${id}" "OK"
 }
@@ -272,15 +266,6 @@ require_ubuntu() {
   source /etc/os-release
   [[ "${ID:-}" == "ubuntu" ]] || fail "this installer targets Ubuntu only (detected: ${ID:-unknown})"
 
-  # Checked up front so an unsupported release fails in the first second with a
-  # clear reason rather than deep inside a container health check.
-  #
-  # Both releases are accepted. 26.04's distro Podman already clears the guest
-  # isolation floor; 24.04's is 4.9.3 and reaches it through the managed
-  # runtime installed below. A measured `podman exec` reliability problem on
-  # 24.04 with that managed runtime is under investigation, tracked in
-  # architecture/apply-convergence.md. Requiring an OS migration is not a
-  # conclusion this gate gets to reach on its own.
   case "${VERSION_ID:-}" in
     24.04 | 26.04) ;;
     *)
@@ -395,9 +380,6 @@ install_binary_atomic() {
 }
 
 verify_staged_podman() {
-  # Exercise the staged tree in place, before anything on the host points at
-  # it. An incomplete or unusable runtime must fail here, while the running one
-  # is still the active one, rather than after the symlinks have moved.
   local runtime_root="$1"
   local required
   for required in \
@@ -429,11 +411,6 @@ verify_staged_podman() {
 }
 
 snapshot_managed_podman_activation() {
-  # Record what the host is actually on, in enough detail to put it back.
-  # Written as a file rather than variables because the restore has to know the
-  # difference between "was a symlink to X" and "did not exist", and the second
-  # is the case a naive restore silently converts into "still points at the new
-  # runtime".
   local snapshot="$1"
   : >"${snapshot}"
   local path
@@ -456,9 +433,6 @@ snapshot_managed_podman_activation() {
     rm -f "${snapshot}.conf"
     printf 'config\t%s\tabsent\n' "${MANAGED_PODMAN_CONFIG_PATH}" >>"${snapshot}"
   fi
-  # Whether the distro binary was already diverted matters: if this run adds
-  # the diversion, undoing it is what puts the distro podman back at its own
-  # path. Leaving it diverted would leave the host without the binary it had.
   if dpkg-divert --list "${MANAGED_PODMAN_COMMAND_PATH}" 2>/dev/null | grep -q .; then
     printf 'divert\t%s\tpresent\n' "${MANAGED_PODMAN_COMMAND_PATH}" >>"${snapshot}"
   else
@@ -467,13 +441,6 @@ snapshot_managed_podman_activation() {
 }
 
 restore_managed_podman_activation() {
-  # Put the host back on the installation it actually had. Deliberately
-  # tolerant: a restore step that cannot run must not stop the ones that can,
-  # and every step is reported.
-  #
-  # "Previously absent" is a real state and is restored as absence. An earlier
-  # version of this only ever wrote links, so a path CNC had created for the
-  # first time was left pointing at the runtime that had just failed.
   local snapshot="$1"
   [[ -f "${snapshot}" ]] || {
     log "no activation snapshot to restore from"
@@ -488,8 +455,6 @@ restore_managed_podman_activation() {
           || log "restore: could not relink ${path}"
         ;;
       file)
-        # A real file here means it was never ours to replace; the diversion
-        # below is what puts it back.
         ;;
       absent)
         rm -f "${path}" 2>/dev/null || log "restore: could not remove ${path}"
@@ -503,13 +468,8 @@ restore_managed_podman_activation() {
         fi
         ;;
       divert)
-        # Undo a diversion only if this run added one: absent before, present
-        # now. Removing the command path unconditionally would delete the
-        # symlink the link restore above had just put back.
         if [[ "${value}" == "absent" ]] \
           && dpkg-divert --list "${MANAGED_PODMAN_COMMAND_PATH}" 2>/dev/null | grep -q .; then
-          # --rename moves the distro binary back to its own path, so the
-          # symlink standing in its place has to go first.
           rm -f "${MANAGED_PODMAN_COMMAND_PATH}" 2>/dev/null || true
           dpkg-divert --quiet --local --rename --remove \
             "${MANAGED_PODMAN_COMMAND_PATH}" >/dev/null 2>&1 \
@@ -529,9 +489,6 @@ activate_managed_podman() {
     return 1
   }
 
-  # Everything below moves the host onto the staged tree. Snapshot what it is
-  # on now so a failure part-way through can put it back: a half-activated
-  # runtime is the one state in which the already-running release stops working.
   local snapshot="${MANAGED_PODMAN_INSTALL_ROOT}/.activation-snapshot"
   run_cmd install -d -m 0755 "${MANAGED_PODMAN_INSTALL_ROOT}" || return $?
   snapshot_managed_podman_activation "${snapshot}" || return $?
@@ -542,7 +499,6 @@ activate_managed_podman() {
     return 1
   fi
 
-  # Prove the host is usable on the new runtime, not merely pointed at it.
   if ! verify_supported_podman; then
     restore_managed_podman_activation "${snapshot}"
     log "the previous runtime was restored. Until the reason above is fixed on this host, app guests cannot start."
@@ -552,9 +508,6 @@ activate_managed_podman() {
 }
 
 report_command_output() {
-  # Print captured command output under the installer's own prefix. A failure
-  # then reads as one labelled report instead of a wall of unlabelled text from
-  # whichever tool happened to write it.
   local text="$1" line
   while IFS= read -r line; do
     [[ -n "${line}" ]] || continue
@@ -563,10 +516,6 @@ report_command_output() {
 }
 
 verify_supported_podman() {
-  # The runtime check, with its reason reported. A failing `podman version` is
-  # how a broken runtime announces itself, and the text it fails with (its lock
-  # store, a missing helper binary) is what an operator has to act on; a step
-  # that fails with no reason costs a second round trip to the host.
   local check_output
   if check_output="$(require_supported_podman 2>&1)"; then
     return 0
@@ -579,9 +528,6 @@ verify_supported_podman() {
 _activate_managed_podman_unsafe() {
   local runtime_root="$1"
 
-  # The verified Ubuntu conmon build retains journald integration. The verified
-  # upstream crun build supplies systemd and AppArmor support alongside the
-  # managed Podman, Quadlet, and network helpers that Ubuntu 24 lacks.
   run_cmd dpkg-divert --quiet --local --rename --add \
     --divert "${MANAGED_PODMAN_DISTRO_PATH}" "${MANAGED_PODMAN_COMMAND_PATH}" || return $?
   run_cmd ln -sfn "${runtime_root}/bin/podman" "${MANAGED_PODMAN_COMMAND_PATH}" || return $?
@@ -596,21 +542,6 @@ _activate_managed_podman_unsafe() {
 }
 
 write_managed_podman_config() {
-  # The managed containers.conf. Written by whoever puts the host on the pinned
-  # tree, and by the config refresh in ensure_supported_podman.
-  #
-  # lock_type = "file" is deliberate, not a leftover default. Podman's default
-  # shm backend sizes /dev/shm/libpod_lock from the build: on arm64 the distro
-  # builds write it at 98880 bytes (4.9.3 on 24.04, 5.7.0 on 26.04) while the
-  # pinned 5.6.2 build expects 82488, and the pinned runtime then refuses to
-  # start anything -- "failed to open 2048 locks in /libpod_lock: numerical
-  # result out of range". The installer's own pre-flight runs the distro podman,
-  # so that mismatched file always exists by the time the pinned runtime is
-  # checked, which is how a fresh arm64 host failed its runtime step on both
-  # supported releases. The file backend keeps the pinned runtime's locks under
-  # /run/libpod, so what the distro left in /dev/shm cannot decide whether this
-  # runtime works. Verified on fresh arm64 24.04 and 26.04 hosts with the
-  # mismatched file present.
   local runtime_root="$1"
   run_cmd install -d -m 0755 "$(dirname "${MANAGED_PODMAN_CONFIG_PATH}")" || return $?
   write_file_atomic "${MANAGED_PODMAN_CONFIG_PATH}" 0644 <<EOF
@@ -761,27 +692,13 @@ install_managed_podman() {
 }
 
 podman_command_present() {
-  # Whether a podman binary exists to be asked at all. A host with no podman
-  # has definitively no running guests; a host whose podman cannot answer is a
-  # different thing entirely, and the two must not collapse into each other.
   command -v podman >/dev/null 2>&1
 }
 
 running_cnc_guest_names() {
-  # Prints the names of running CNC guests, one per line, or returns 1 for
-  # "unknown".
-  #
-  # A failed inspection is not an empty inspection. Treating a Podman that
-  # times out, errors, or hangs as "no guests running" is what would let a
-  # runtime change proceed underneath live containers and break exec into
-  # them. Absence is only reported when it is positively established: either
-  # Podman answered, or there is no Podman installed to answer.
   if ! podman_command_present; then
     return 0
   fi
-  # Captured through a file, not a pipe. A command substitution reads until
-  # every writer closes, so an orphaned grandchild that survived the timeout
-  # keeps the substitution blocked long past it, and the timeout buys nothing.
   local listing_file rc
   listing_file="$(mktemp)" || return 1
   timeout 30s podman ps --format '{{.Names}}' >"${listing_file}" 2>/dev/null </dev/null
@@ -795,8 +712,6 @@ running_cnc_guest_names() {
 }
 
 running_cnc_guest_count() {
-  # The same observation, counted. Kept as a wrapper so there is one place that
-  # decides what "unknown" means.
   local names
   names="$(running_cnc_guest_names)" || return 1
   if [[ -z "${names}" ]]; then
@@ -807,11 +722,6 @@ running_cnc_guest_count() {
 }
 
 managed_podman_runtime_root() {
-  # The one place the expected pinned tree is computed.
-  #
-  # Resolves the architecture itself: callers include the updater, which sources
-  # this file to ask the question without running an install, so it cannot rely
-  # on select_managed_podman_asset having run.
   local arch="${MANAGED_PODMAN_ARCH:-}"
   if [[ -z "${arch}" ]]; then
     case "$(dpkg --print-architecture 2>/dev/null)" in
@@ -824,8 +734,6 @@ managed_podman_runtime_root() {
 }
 
 managed_podman_runtime_tree_is_current() {
-  # Whether the host is pointed at the pinned tree and that tree is complete.
-  # Compares what the host actually points at, not a recorded belief about it.
   local runtime_root
   runtime_root="$(managed_podman_runtime_root)" || return 1
   [[ "$(readlink -f "${MANAGED_PODMAN_COMMAND_PATH}" 2>/dev/null)" == "${runtime_root}/bin/podman" ]] || return 1
@@ -836,11 +744,6 @@ managed_podman_runtime_tree_is_current() {
 }
 
 managed_podman_config_is_current() {
-  # The managed containers.conf is part of the activation, not decoration: a
-  # host on the right tree but an older config still runs on whatever that
-  # config decided. Kept separate from the tree check so that a config-only
-  # difference is repaired as a file write rather than as a runtime change
-  # underneath running guests.
   local runtime_root
   runtime_root="$(managed_podman_runtime_root)" || return 1
   grep -qF "${runtime_root}/libexec/conmon" "${MANAGED_PODMAN_CONFIG_PATH}" 2>/dev/null || return 1
@@ -849,15 +752,11 @@ managed_podman_config_is_current() {
 }
 
 managed_podman_is_current() {
-  # Whether the host is already on the exact pinned runtime, config included.
   managed_podman_runtime_tree_is_current || return 1
   managed_podman_config_is_current
 }
 
 managed_distro_podman_version() {
-  # What the distro's own podman reports, before or after CNC diverts it. For
-  # the log line that says which stack this host was on, so that "the pinned
-  # runtime is being installed" reads as a decision rather than as a surprise.
   local candidate version
   for candidate in "${MANAGED_PODMAN_DISTRO_PATH}" "${MANAGED_PODMAN_COMMAND_PATH}"; do
     if [[ -x "${candidate}" ]]; then
@@ -871,22 +770,6 @@ managed_distro_podman_version() {
 }
 
 ensure_supported_podman() {
-  # The one function that changes the container runtime. The installer calls it
-  # from its runtime step and the updater sources this file and calls the same
-  # function, so the rules below are decided once rather than in two places
-  # that drifted.
-  #
-  # One pinned runtime on every supported release. Deferring to whatever Podman
-  # the distro happens to ship meant 24.04 and 26.04 ran different container
-  # stacks, so a guest problem reproduced on one host and not the other and the
-  # difference was invisible.
-  #
-  # Verified first, changed only when it actually differs. Reinstalling in
-  # place is not free: replacing conmon and crun underneath running containers
-  # breaks `podman exec` into them, and the release symlink being untouched
-  # hides that completely. Measured on a 24.04 host with one running guest, a
-  # needless reinstall took exec from working to 1 of 30, and the guest could
-  # not be restarted afterwards without a reboot.
   select_managed_podman_asset
   local runtime_root
   runtime_root="$(managed_podman_runtime_root)" \
@@ -899,10 +782,6 @@ ensure_supported_podman() {
   fi
 
   if managed_podman_runtime_tree_is_current; then
-    # The tree is the pinned one and only the managed config differs. Writing
-    # the file is the whole change: reinstalling the runtime for that would stop
-    # every guest for nothing, and the runtime that is running is already the
-    # one this config describes.
     log "refreshing the managed runtime config: ${MANAGED_PODMAN_CONFIG_PATH} (podman ${MANAGED_PODMAN_VERSION} is already the active runtime, so no runtime change and no guest restarts)"
     if ! write_managed_podman_config "${runtime_root}"; then
       log "could not rewrite ${MANAGED_PODMAN_CONFIG_PATH}; the runtime already active on this host is unchanged"
@@ -918,21 +797,12 @@ ensure_supported_podman() {
 
   log "container runtime decision: this host ships podman $(managed_distro_podman_version), CNC runs its own pinned podman ${MANAGED_PODMAN_VERSION} on ${MANAGED_PODMAN_ARCH} so that every supported release runs the same container stack"
 
-  # The runtime has to change, which means it changes underneath any guest that
-  # is running. Establish which guests those are before touching anything, and
-  # refuse on an answer that is merely missing.
   local guest_names
   if ! guest_names="$(running_cnc_guest_names)"; then
     log "cannot determine whether guests are running; podman did not answer"
     fail "refusing to change the container runtime while guest state is unknown. Resolve podman on this host, then rerun."
   fi
 
-  # Guests are stopped for the change and started again afterwards. Replacing
-  # conmon and crun underneath a live container breaks `podman exec` into it,
-  # so the container cannot be running across the swap; but stopping and
-  # starting it is this function's job, not an operator's. Quadlet owns the
-  # units, so a stop is clean and a start rebuilds the container on the new
-  # runtime. Guest filesystems live outside the container and are untouched.
   local -a stopped_guests=()
   local guest unit
   if [[ -n "${guest_names}" ]]; then
@@ -944,8 +814,6 @@ ensure_supported_podman() {
         && wait_for_guest_state "${guest}" absent 90; then
         stopped_guests+=("${unit}")
       else
-        # Leaving one running would corrupt exec into it. Put back what was
-        # already stopped and refuse rather than proceed half-way.
         start_stopped_guests "${stopped_guests[@]+"${stopped_guests[@]}"}"
         fail "${unit} did not stop before the runtime change; nothing was changed"
       fi
@@ -954,7 +822,6 @@ ensure_supported_podman() {
 
   log "installing CNC's pinned container runtime (podman ${MANAGED_PODMAN_VERSION}, crun ${MANAGED_CRUN_VERSION}, conmon ${MANAGED_CONMON_VERSION})"
   if ! install_managed_podman; then
-    # activate_managed_podman has already restored the previous installation.
     start_stopped_guests "${stopped_guests[@]+"${stopped_guests[@]}"}"
     fail "the container runtime was not changed; guests were restarted on the runtime that was already there"
   fi
@@ -966,18 +833,16 @@ ensure_supported_podman() {
 }
 
 wait_for_guest_state() {
-  # Wait, bounded, for a guest container to be present or absent. systemd
-  # reports the unit, which is not the same thing: `systemctl start` returned
-  # success on a Quadlet unit whose container never appeared, and `systemctl
-  # stop` returned after a SIGKILL while the unit was still deactivating.
-  # Changing the runtime around a container in either of those states is how a
-  # guest fails to come back.
   local guest="$1" want="$2" deadline=$(( SECONDS + ${3:-60} ))
+  local rc present
   while (( SECONDS < deadline )); do
-    local present=absent
-    if timeout 15s podman container exists "${guest}" >/dev/null 2>&1; then
-      present=present
-    fi
+    rc=0
+    timeout 15s podman container exists "${guest}" >/dev/null 2>&1 || rc=$?
+    case "${rc}" in
+      0) present=present ;;
+      1) present=absent ;;
+      *) present=unknown ;;
+    esac
     [[ "${present}" == "${want}" ]] && return 0
     sleep 2
   done
@@ -985,17 +850,6 @@ wait_for_guest_state() {
 }
 
 start_stopped_guests() {
-  # Bring back exactly the units this run stopped, and confirm each one is
-  # actually running rather than trusting systemd's exit code.
-  #
-  # A plain `systemctl start` is not enough after the runtime has changed. A
-  # guest built under an older Podman carries the rootfs permissions that
-  # Podman granted itself; the pinned runtime enforces the private boundary
-  # instead, so crun fails with "openat /proc/self/cwd: Permission denied" and
-  # the output stays down. That is what happened on the first production
-  # upgrade. The guest's access has to be re-prepared for the runtime it is
-  # about to start on, which is exactly what CNC's own apply does, so a start
-  # that fails is followed by a scoped repair rather than a warning.
   local unit guest name failed=0
   for unit in "$@"; do
     [[ -n "${unit}" ]] || continue
@@ -1021,16 +875,6 @@ start_stopped_guests() {
 }
 
 clear_stale_guest_rootfs_mount() {
-  # A container killed mid-life leaves its idmapped mount on the guest rootfs,
-  # and Podman cannot stack a new idmapped mount on an existing one: the start
-  # fails with "failed to create idmapped mount: mount_setattr ... operation
-  # not permitted" and the output never comes back. This cost a production site
-  # 45 minutes, because the leftover looks like an ordinary mount until you
-  # read its options.
-  #
-  # Only ever unmounts the guest's own rootfs, only when it is a mountpoint,
-  # and only when nothing is running from it. The rootfs contents live on the
-  # host filesystem and are untouched by the unmount.
   local name="$1"
   local rootfs="${CNC_SANDBOX_DIR:-/var/lib/cnc/sandboxes}/${name}/rootfs"
   [[ -d "${rootfs}" ]] || return 0
@@ -1044,9 +888,6 @@ clear_stale_guest_rootfs_mount() {
 }
 
 repair_guest_for_runtime() {
-  # Re-prepare one output for the runtime now installed, using CNC's own repair
-  # rather than a second copy of the logic here. Scoped to the one output, so a
-  # guest that cannot be repaired does not stall the others.
   local name="$1"
   local cli="${CLI_WRAPPER_PATH:-/usr/local/bin/cnc-admin}"
   [[ -x "${cli}" ]] || return 1
@@ -1054,8 +895,6 @@ repair_guest_for_runtime() {
 }
 
 configure_podman_network() {
-  # CNC and UFW own forwarding rules through iptables. Keep Netavark in the
-  # same ruleset instead of allowing a distro-default nftables chain to diverge.
   run_cmd install -d -m 0755 /etc/containers/containers.conf.d
   write_file_atomic /etc/containers/containers.conf.d/90-cnc-network.conf 0644 <<'EOF'
 # Managed by CNC
@@ -1262,7 +1101,6 @@ EOF
 
   write_file_atomic "${SYSCTL_BBR_PATH}" 0644 <<'EOF'
 # Managed by cnc install_ubuntu.sh
-# bbr unavailable on this kernel; leaving current congestion control unchanged.
 EOF
   log "bbr unavailable on this kernel; skipped net.ipv4.tcp_congestion_control=bbr"
 }
@@ -1372,7 +1210,6 @@ EOF
 write_nginx_http_tuning() {
   write_file_atomic "${NGINX_TUNING_PATH}" 0644 <<'EOF'
 # Managed by cnc install_ubuntu.sh
-# Keep this file additive so distro nginx defaults do not trip duplicate-directive errors.
 keepalive_requests 1000;
 proxy_http_version 1.1;
 proxy_set_header Connection "";
@@ -1503,8 +1340,6 @@ set_env_key_value() {
 }
 
 print_initial_access_key() (
-  # The subshell scopes the optional terminal redirection. Reopening /dev/stdout
-  # with > would truncate a redirected file and erase earlier installer output.
   if { true >/dev/tty; } 2>/dev/null; then
     exec >/dev/tty
   fi
@@ -1528,7 +1363,6 @@ ensure_initial_access_key() {
   if (( ${#generated[@]} != 2 )) || [[ -z "${generated[0]}" || -z "${generated[1]}" ]]; then
     fail "failed to generate the initial CNC admin access key"
   fi
-  # Keep the plaintext in installer memory only; the managed env receives the verifier.
   INITIAL_ACCESS_KEY="${generated[0]}"
   set_env_key_value "ACCESS_KEY_HASH" "${generated[1]}"
   chmod 0640 "${ENV_FILE}"
@@ -1728,7 +1562,6 @@ COMMAND_TIMEOUT_STATUS_SEC=5
 STATUS_CACHE_TTL_SEC=60
 UPDATER_SCRIPT_PATH=/var/lib/cnc/current/scripts/update_from_github.sh
 
-# Optional updater settings
 GITHUB_REPO=
 GITHUB_READONLY_PAT=
 GITHUB_REF=main
@@ -2130,6 +1963,7 @@ write_systemd_unit() {
   install_packaged_systemd_asset "${PACKAGED_AUTO_SIZE_TIMER_PATH}" "${AUTO_SIZE_SERVICE_NAME}.timer" || return $?
   install_packaged_systemd_asset "${PACKAGED_BACKEND_ALERTS_SERVICE_PATH}" "${BACKEND_ALERTS_SERVICE_NAME}.service" || return $?
   install_packaged_systemd_asset "${PACKAGED_BACKEND_ALERTS_TIMER_PATH}" "${BACKEND_ALERTS_SERVICE_NAME}.timer" || return $?
+  install_packaged_systemd_asset "packaging/cnc-cloudflare-tunnel.service" "cnc-cloudflare-tunnel.service" || return $?
   install_packaged_systemd_asset "packaging/cnc-cloudflare-domains.service" "cnc-cloudflare-domains.service" || return $?
   install_packaged_systemd_asset "packaging/cnc-cloudflare-domains.timer" "cnc-cloudflare-domains.timer" || return $?
   install_packaged_systemd_asset "packaging/cnc-origin-tls.service" "cnc-origin-tls.service" || return $?
@@ -2156,8 +1990,6 @@ install_packaged_systemd_asset() {
 enable_services() {
   run_cmd systemctl daemon-reload || return $?
   run_cmd systemctl enable "${SERVICE_NAME}" || return $?
-  # A rerun selects a new release; enable --now leaves an already-running
-  # service on its old code. Restart also starts a previously inactive service.
   run_cmd systemctl restart "${SERVICE_NAME}" || return $?
   run_cmd systemctl enable --now "${AUTO_SIZE_SERVICE_NAME}.timer" || return $?
   run_cmd systemctl enable --now "${BACKEND_ALERTS_SERVICE_NAME}.timer" || return $?
@@ -2257,19 +2089,8 @@ verify_nginx_runtime() {
 verify_podman_basic_run() {
   local image_ref="${CNC_INSTALL_SMOKE_IMAGE:-docker.io/library/busybox:1.36}"
   local container_name="cnc-install-runtime-$$-${RANDOM}"
-  # `setsid --wait` puts Podman in its own session and still returns its exit
-  # status. Without it, Podman 5.6.2 tearing down an exec session signals the
-  # caller's process group, and the installer was killed outright: no error,
-  # no log line, the script simply gone after the exec. Reproduced on Ubuntu
-  # 24.04 with the pinned runtime, both from a fresh install and from a
-  # one-line script; isolating the session survives it and propagates a real
-  # exit code, which a longer timeout does not.
   local -a podman_cmd=(setsid --wait timeout --signal=KILL 30s podman)
 
-  # The probe container also has to outlive every command run against it. A
-  # container that exits while an exec is still open kills the caller the same
-  # way, so the probe cannot be allowed to expire mid-check. The explicit stop
-  # and rm below end it, and each failure path force-removes it.
   if ! run_cmd "${podman_cmd[@]}" run --detach --name "${container_name}" \
     --pull=always --log-driver=journald --network none "${image_ref}" sleep 300; then
     setsid --wait timeout --signal=KILL 15s podman rm --force "${container_name}" >/dev/null 2>&1 || true
@@ -2374,8 +2195,6 @@ verify_isolated_app_network() {
     dns_args+=(--dns "${resolver}")
   done
 
-  # Match app Quadlets: direct resolvers avoid a host bridge DNS listener that
-  # UFW correctly rejects. Do not open a host DNS port just for this smoke test.
   run_cmd podman network create --driver bridge --disable-dns "${network_name}" || return $?
   if ! run_cmd podman run --rm --pull=missing --network "${network_name}" "${dns_args[@]}" "${image_ref}" sh -ec \
     'nslookup example.com && wget -T 10 -O /dev/null http://example.com'; then
@@ -2576,9 +2395,6 @@ main() {
   run_step "tailscale.serve" "Expose admin on tailnet HTTPS URL" configure_tailscale_admin_access
 }
 
-# Guarded so the updater can source this file and reuse the runtime installer
-# without running an install. Sourcing must not install traps in the caller's
-# shell either, so those live inside the guard with main.
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   trap on_error ERR
   trap on_exit EXIT

@@ -397,7 +397,6 @@ async def list_recent_output_events(
     since: datetime | None = None,
     limit: int = 12,
 ) -> list[ControlEvent]:
-    """Return a bounded output timeline without letting host chatter starve it."""
     normalized_backend = str(backend_name or "").strip()
     if not normalized_backend:
         return []

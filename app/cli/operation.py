@@ -160,7 +160,6 @@ async def _run_list(
 
     for index, payload in enumerate(payloads):
         if payload["kind"] == "output_exec":
-            # Read retained completion evidence without probing every guest runtime.
             payload = {
                 **payload,
                 **await get_job(settings, payload["id"], observe=False),
@@ -182,7 +181,6 @@ async def _run_show(
             if args.wait:
                 payload = {**payload, "wait_timed_out": pending}
             return 0, payload, None
-        # Waiting observes work; reaching this deadline never cancels it.
         await asyncio.sleep(min(POLL_SECONDS, remaining))
 
 

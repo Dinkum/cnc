@@ -1,6 +1,6 @@
 <article class="card span-2" data-cloudflare-settings>
   <div class="section-head">
-    <h2>Cloudflare</h2>
+    <h2>Cloudflare API</h2>
     <span class="summary-pill {{ 'active' if cloudflare_connection.connected else 'inactive' }}">{{ cloudflare_connection.status }}</span>
   </div>
   {% if cloudflare_connection.configured %}
@@ -17,7 +17,20 @@
   </div>
   {% else %}
   <p class="subtle">Connect your domains to create DNS records and use Cloudflare Origin CA certificates.</p>
-  <div class="editor-actions"><button type="button" data-cf-open>Configure Cloudflare</button></div>
+  <div class="editor-actions"><button type="button" data-cf-open>Configure Cloudflare API</button></div>
   {% endif %}
   <p class="cf-message" data-cf-settings-message role="status"></p>
+</article>
+
+<article class="card span-2" data-tunnel-settings>
+  <div class="section-head"><h2>Cloudflare Tunnel</h2><span class="summary-pill {{ 'active' if cloudflare_tunnel.connected else 'inactive' }}">{{ cloudflare_tunnel.status }}</span></div>
+  {% if cloudflare_tunnel.configured %}
+  <div class="settings-status-list"><div class="settings-status-row"><span class="metric-label">Tunnel token</span><span class="mono">{{ cloudflare_tunnel.token_display }}</span></div></div>
+  {% if cloudflare_tunnel.checked_at %}<p class="subtle">Checked <time data-local-time="{{ cloudflare_tunnel.checked_at }}">{{ cloudflare_tunnel.checked_at }}</time></p>{% endif %}
+  {% if cloudflare_tunnel.error %}<p class="cf-message is-error" role="status">{{ cloudflare_tunnel.error }}</p>{% endif %}
+  <div class="editor-actions"><button type="button" class="ghost" data-tunnel-retest>Retest</button><button type="button" class="ghost" data-tunnel-open>Replace token</button><button type="button" class="ghost" data-tunnel-disconnect>Disconnect</button></div>
+  {% else %}
+  <div class="editor-actions"><button type="button" data-tunnel-open>Configure Cloudflare Tunnel</button></div>
+  {% endif %}
+  <p class="cf-message" data-tunnel-message role="status"></p>
 </article>

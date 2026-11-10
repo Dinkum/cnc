@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import base64
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -55,6 +54,8 @@ from app.services.placement_config import (
 )
 from app.services.sandbox_profiles import app_sandbox_dir, get_app_sandbox_profile
 from app.services.ssh_options import SSH_BATCH_OPTIONS
+from app.services.thread_workers import HostMutationLifecycle
+from app.services.validators import parse_volumes_json
 
 
 LOCAL_NODE_UID = "local"
@@ -104,9 +105,18 @@ async def transfer_backend(
     *,
     backend_id: int,
     target_node_uid: str,
+    pause_source: bool,
     progress_callback: TransferProgressCallback | None = None,
     acquire_lock: bool = True,
+    _lifecycle: HostMutationLifecycle | None = None,
 ) -> TransferResult:
+    """Move an app output to another node.
+
+    With ``pause_source`` the source is frozen before its snapshot, so the
+    target receives every write, and it is unfrozen again if the transfer
+    fails at any point before cutover. Without it the source keeps serving
+    during the copy and writes made after the snapshot are not carried over.
+    """
     if acquire_lock:
         async with host_mutation_operation(
             settings,
@@ -123,9 +133,13 @@ async def transfer_backend(
                 settings,
                 backend_id=backend_id,
                 target_node_uid=target_node_uid,
+                pause_source=pause_source,
                 progress_callback=progress_callback,
                 acquire_lock=False,
+                _lifecycle=HostMutationLifecycle(),
             )
+
+    lifecycle = _lifecycle or HostMutationLifecycle()
 
     backend = (
         await session.execute(
@@ -159,6 +173,7 @@ async def transfer_backend(
             route_target=_route_target(backend, None, target_uid),
             messages=["output is already on the selected node"],
         )
+    _reject_external_volumes(backend)
 
     source_node = (
         await _load_node(session, source_uid) if source_uid != LOCAL_NODE_UID else None
@@ -176,113 +191,154 @@ async def transfer_backend(
     }:
         raise ValueError(f"target node is not healthy: {target_node.state}")
 
-    with tempfile.TemporaryDirectory(
-        prefix=f"cnc-transfer-{backend.name}-"
-    ) as temp_dir_name:
-        temp_dir = Path(temp_dir_name)
-        bundle_path = temp_dir / f"{backend.name}.tar.gz"
-        if source_uid == LOCAL_NODE_UID:
-            _report(progress_callback, 24, "Capturing source state.")
-            await asyncio.to_thread(
-                _archive_local_backend, backend, settings, bundle_path
+    pause_started = False
+    try:
+        if pause_source:
+            _report(progress_callback, 20, "Pausing source.")
+            pause_started = True
+            await lifecycle.run(
+                _set_source_paused, backend, settings, source_node, paused=True
             )
-        else:
-            if source_node is None:
-                raise ValueError("source node is not linked")
-            _report(progress_callback, 24, "Capturing source state from peer.")
-            await asyncio.to_thread(
-                _archive_remote_backend, backend, settings, source_node, bundle_path
-            )
-        messages.append("snapshot captured")
-
-        target_rollback: TargetRollbackState | None = None
-        if target_uid == LOCAL_NODE_UID:
-            _report(progress_callback, 44, "Restoring output on leader.")
-            target_rollback = await asyncio.to_thread(
-                _restore_local_backend, backend, settings, bundle_path
-            )
-            messages.append("restored on leader")
-        else:
-            if target_node is None:
-                raise ValueError("target node is not linked")
-            _report(progress_callback, 38, "Copying snapshot to target.")
-            target_rollback = await asyncio.to_thread(
-                _restore_remote_backend, backend, settings, target_node, bundle_path
-            )
-            messages.append(f"restored on {target_node.name}")
-
-        try:
-            _report(progress_callback, 68, "Checking target health.")
-            if target_uid == LOCAL_NODE_UID:
-                await asyncio.to_thread(_start_local_backend_replica, backend, settings)
-                healthcheck_result = await asyncio.to_thread(
-                    _verify_local_backend, backend, settings
+            messages.append("source paused so the copy includes every write")
+        with tempfile.TemporaryDirectory(
+            prefix=f"cnc-transfer-{backend.name}-"
+        ) as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+            bundle_path = temp_dir / f"{backend.name}.tar.gz"
+            if source_uid == LOCAL_NODE_UID:
+                _report(progress_callback, 24, "Capturing source state.")
+                await lifecycle.run(
+                    _archive_local_backend, backend, settings, bundle_path
                 )
-                target_url = replica_target_url(backend, None, target_uid)
             else:
-                if target_node is None:
-                    raise ValueError("target node is not linked")
-                healthcheck_result = await asyncio.to_thread(
-                    _verify_remote_backend, backend, settings, target_node
+                if source_node is None:
+                    raise ValueError("source node is not linked")
+                _report(progress_callback, 24, "Capturing source state from peer.")
+                await lifecycle.run(
+                    _archive_remote_backend, backend, settings, source_node, bundle_path
                 )
-                target_url = replica_target_url(backend, target_node, target_uid)
-            await record_replica_readiness(
-                session,
-                settings,
-                backend=backend,
-                node_uid=target_uid,
-                setup_mode=REPLICA_SETUP_MODE_TRANSFER,
-                target_url=target_url,
-                healthcheck_result=healthcheck_result,
-            )
-            await session.flush()
+            messages.append("snapshot captured")
 
-            _report(progress_callback, 76, "Saving output placement.")
-            apply_backend_placement(
-                backend,
-                enabled=False,
-                mode="",
-                active_node_uid=target_uid,
-                selected_node_uids=(),
-            )
+            target_rollback: TargetRollbackState | None = None
+            try:
+                if target_uid == LOCAL_NODE_UID:
+                    _report(progress_callback, 44, "Restoring output on leader.")
+                    target_rollback = await lifecycle.run_recoverable(
+                        _restore_local_backend, backend, settings, bundle_path
+                    )
+                    lifecycle.raise_if_cancelled()
+                    messages.append("restored on leader")
+                else:
+                    if target_node is None:
+                        raise ValueError("target node is not linked")
+                    _report(progress_callback, 38, "Copying snapshot to target.")
+                    target_rollback = await lifecycle.run_recoverable(
+                        _restore_remote_backend,
+                        backend,
+                        settings,
+                        target_node,
+                        bundle_path,
+                    )
+                    lifecycle.raise_if_cancelled()
+                    messages.append(f"restored on {target_node.name}")
 
-            _report(progress_callback, 84, "Rendering cluster routes.")
-            with session.no_autoflush:
-                apply_response = await run_apply(
+                _report(progress_callback, 68, "Checking target health.")
+                if target_uid == LOCAL_NODE_UID:
+                    await lifecycle.run(
+                        _start_local_backend_replica, backend, settings
+                    )
+                    healthcheck_result = await lifecycle.run(
+                        _verify_local_backend, backend, settings
+                    )
+                    target_url = replica_target_url(backend, None, target_uid)
+                else:
+                    if target_node is None:
+                        raise ValueError("target node is not linked")
+                    healthcheck_result = await lifecycle.run(
+                        _verify_remote_backend, backend, settings, target_node
+                    )
+                    target_url = replica_target_url(backend, target_node, target_uid)
+                await record_replica_readiness(
                     session,
                     settings,
-                    operation_kind="transfer_backend",
-                    actor="ui",
-                    # A transfer moves one output between machines.
-                    scope=output_change(
-                        "transfer_backend", str(backend.name or "")
-                    ).scope(),
+                    backend=backend,
+                    node_uid=target_uid,
+                    setup_mode=REPLICA_SETUP_MODE_TRANSFER,
+                    target_url=target_url,
+                    healthcheck_result=healthcheck_result,
                 )
-            if apply_response.status != "success":
-                raise RuntimeError(
-                    f"host apply failed after transfer: {apply_response.message}"
-                )
-            if target_rollback is not None:
-                await _discard_target_rollback(
+                await session.flush()
+
+                _report(progress_callback, 76, "Saving output placement.")
+                apply_backend_placement(
                     backend,
-                    settings,
-                    target_rollback,
-                    target_node=target_node,
+                    enabled=False,
+                    mode="",
+                    active_node_uid=target_uid,
+                    selected_node_uids=(),
                 )
-        except Exception as exc:
-            rollback_messages: list[str] = []
-            if target_rollback is not None:
-                rollback_messages = await _restore_target_rollback(
-                    backend,
-                    settings,
-                    target_rollback,
-                    target_node=target_node,
+
+                _report(progress_callback, 84, "Rendering cluster routes.")
+                with session.no_autoflush:
+                    apply_response = await lifecycle.finish(
+                        run_apply(
+                            session,
+                            settings,
+                            operation_kind="transfer_backend",
+                            actor="ui",
+                            scope=output_change(
+                                "transfer_backend", str(backend.name or "")
+                            ).scope(),
+                        )
+                    )
+                if apply_response.status != "success":
+                    raise RuntimeError(
+                        f"host apply failed after transfer: {apply_response.message}"
+                    )
+                lifecycle.mark_committed()
+                if target_rollback is not None:
+                    await lifecycle.finish(
+                        _discard_target_rollback(
+                            backend,
+                            settings,
+                            target_rollback,
+                            target_node=target_node,
+                            lifecycle=lifecycle,
+                        )
+                    )
+                lifecycle.raise_if_cancelled()
+            except BaseException as exc:
+                if lifecycle.committed:
+                    raise
+                rollback_messages: list[str] = []
+                if target_rollback is not None:
+                    rollback_messages = await lifecycle.recover(
+                        lambda: _restore_target_rollback(
+                            backend,
+                            settings,
+                            target_rollback,
+                            target_node=target_node,
+                            lifecycle=lifecycle,
+                        )
+                    )
+                if rollback_messages and isinstance(exc, Exception):
+                    raise RuntimeError(
+                        f"{exc}; restored target rollback: {'; '.join(rollback_messages)}"
+                    ) from exc
+                raise
+    except BaseException:
+        if pause_started and not lifecycle.committed:
+            await lifecycle.recover(
+                lambda: _resume_source_after_failure(
+                    backend, settings, source_node, lifecycle=lifecycle
                 )
-            if rollback_messages:
-                raise RuntimeError(
-                    f"{exc}; restored target rollback: {'; '.join(rollback_messages)}"
-                ) from exc
-            raise
+            )
+        raise
+    if not pause_source:
+        messages.append(
+            "source kept running during the copy; writes made after the snapshot "
+            "were not carried over"
+        )
 
     _report(progress_callback, 92, "Stopping source runtime.")
     cleaned_remote_node_uids: list[str] = []
@@ -292,7 +348,6 @@ async def transfer_backend(
         if node_uid not in {LOCAL_NODE_UID, target_uid}
     )
     if source_uid != target_uid and source_uid == LOCAL_NODE_UID:
-        # run_apply already removes local runtime for remote-owned outputs.
         messages.append("source leader runtime stopped")
     for cleanup_node_uid in cleanup_remote_node_uids:
         cleanup_node: ClusterNode | None = None
@@ -303,7 +358,7 @@ async def transfer_backend(
                 else await _load_node(session, cleanup_node_uid)
             )
             if cleanup_node is not None:
-                await asyncio.to_thread(
+                await lifecycle.run(
                     _cleanup_remote_restored_target, backend, settings, cleanup_node
                 )
                 cleaned_remote_node_uids.append(cleanup_node_uid)
@@ -357,6 +412,7 @@ async def setup_backend_replica(
     setup_mode: str,
     progress_callback: TransferProgressCallback | None = None,
     acquire_lock: bool = True,
+    _lifecycle: HostMutationLifecycle | None = None,
 ) -> ReplicaSetupResult:
     if acquire_lock:
         async with host_mutation_operation(
@@ -377,7 +433,10 @@ async def setup_backend_replica(
                 setup_mode=setup_mode,
                 progress_callback=progress_callback,
                 acquire_lock=False,
+                _lifecycle=HostMutationLifecycle(),
             )
+
+    lifecycle = _lifecycle or HostMutationLifecycle()
 
     backend = (
         await session.execute(
@@ -415,77 +474,80 @@ async def setup_backend_replica(
     }:
         raise ValueError(f"target node is not healthy: {target_node.state}")
 
-    if normalized_mode == REPLICA_SETUP_MODE_CLONE:
-        target_rollback: TargetRollbackState | None = None
-        if target_uid == source_uid:
-            messages.append("selected node already has the source runtime")
-        else:
-            with tempfile.TemporaryDirectory(
-                prefix=f"cnc-replica-{backend.name}-"
-            ) as temp_dir_name:
-                temp_dir = Path(temp_dir_name)
-                bundle_path = temp_dir / f"{backend.name}.tar.gz"
-                if source_uid == LOCAL_NODE_UID:
-                    _report(progress_callback, 24, "Capturing source state.")
-                    await asyncio.to_thread(
-                        _archive_local_backend, backend, settings, bundle_path
-                    )
-                else:
-                    if source_node is None:
-                        raise ValueError("source node is not linked")
-                    _report(progress_callback, 24, "Capturing source state from peer.")
-                    await asyncio.to_thread(
-                        _archive_remote_backend,
-                        backend,
-                        settings,
-                        source_node,
-                        bundle_path,
-                    )
-                messages.append("snapshot captured")
-                if target_uid == LOCAL_NODE_UID:
-                    _report(progress_callback, 54, "Restoring replica on leader.")
-                    target_rollback = await asyncio.to_thread(
-                        _restore_local_backend, backend, settings, bundle_path
-                    )
-                    await asyncio.to_thread(
-                        _start_local_backend_replica, backend, settings
-                    )
-                    messages.append("replica restored on leader")
-                else:
-                    if target_node is None:
-                        raise ValueError("target node is not linked")
-                    _report(progress_callback, 44, "Copying snapshot to target.")
-                    target_rollback = await asyncio.to_thread(
-                        _restore_remote_backend,
-                        backend,
-                        settings,
-                        target_node,
-                        bundle_path,
-                    )
-                    messages.append(f"replica restored on {target_node.name}")
-    else:
-        target_rollback = None
-        if target_uid == LOCAL_NODE_UID:
-            raise ValueError("fresh leader setup is handled by saving placement")
-        if target_node is None:
-            raise ValueError("target node is not linked")
-        _report(progress_callback, 24, "Creating fresh guest.")
-        target_rollback = await asyncio.to_thread(
-            _setup_remote_fresh_backend, backend, settings, target_node
-        )
-        messages.append(f"fresh guest created on {target_node.name}")
-
+    target_rollback: TargetRollbackState | None = None
     try:
+        if normalized_mode == REPLICA_SETUP_MODE_CLONE:
+            if target_uid == source_uid:
+                messages.append("selected node already has the source runtime")
+            else:
+                _reject_external_volumes(backend)
+                with tempfile.TemporaryDirectory(
+                    prefix=f"cnc-replica-{backend.name}-"
+                ) as temp_dir_name:
+                    temp_dir = Path(temp_dir_name)
+                    bundle_path = temp_dir / f"{backend.name}.tar.gz"
+                    if source_uid == LOCAL_NODE_UID:
+                        _report(progress_callback, 24, "Capturing source state.")
+                        await lifecycle.run(
+                            _archive_local_backend, backend, settings, bundle_path
+                        )
+                    else:
+                        if source_node is None:
+                            raise ValueError("source node is not linked")
+                        _report(progress_callback, 24, "Capturing source state from peer.")
+                        await lifecycle.run(
+                            _archive_remote_backend,
+                            backend,
+                            settings,
+                            source_node,
+                            bundle_path,
+                        )
+                    messages.append("snapshot captured")
+                    if target_uid == LOCAL_NODE_UID:
+                        _report(progress_callback, 54, "Restoring replica on leader.")
+                        target_rollback = await lifecycle.run_recoverable(
+                            _restore_local_backend, backend, settings, bundle_path
+                        )
+                        lifecycle.raise_if_cancelled()
+                        await lifecycle.run(
+                            _start_local_backend_replica, backend, settings
+                        )
+                        messages.append("replica restored on leader")
+                    else:
+                        if target_node is None:
+                            raise ValueError("target node is not linked")
+                        _report(progress_callback, 44, "Copying snapshot to target.")
+                        target_rollback = await lifecycle.run_recoverable(
+                            _restore_remote_backend,
+                            backend,
+                            settings,
+                            target_node,
+                            bundle_path,
+                        )
+                        lifecycle.raise_if_cancelled()
+                        messages.append(f"replica restored on {target_node.name}")
+        else:
+            if target_uid == LOCAL_NODE_UID:
+                raise ValueError("fresh leader setup is handled by saving placement")
+            if target_node is None:
+                raise ValueError("target node is not linked")
+            _report(progress_callback, 24, "Creating fresh guest.")
+            target_rollback = await lifecycle.run_recoverable(
+                _setup_remote_fresh_backend, backend, settings, target_node
+            )
+            lifecycle.raise_if_cancelled()
+            messages.append(f"fresh guest created on {target_node.name}")
+
         _report(progress_callback, 76, "Checking target health.")
         if target_uid == LOCAL_NODE_UID:
-            healthcheck_result = await asyncio.to_thread(
+            healthcheck_result = await lifecycle.run(
                 _verify_local_backend, backend, settings
             )
             target_url = replica_target_url(backend, None, target_uid)
         else:
             if target_node is None:
                 raise ValueError("target node is not linked")
-            healthcheck_result = await asyncio.to_thread(
+            healthcheck_result = await lifecycle.run(
                 _verify_remote_backend, backend, settings, target_node
             )
             target_url = replica_target_url(backend, target_node, target_uid)
@@ -498,25 +560,36 @@ async def setup_backend_replica(
             target_url=target_url,
             healthcheck_result=healthcheck_result,
         )
-        await session.commit()
+        await lifecycle.commit(session.commit())
         if target_rollback is not None:
-            await _discard_target_rollback(
+            await lifecycle.finish(
+                _discard_target_rollback(
+                    backend,
+                    settings,
+                    target_rollback,
+                    target_node=target_node,
+                    lifecycle=lifecycle,
+                )
+            )
+        lifecycle.raise_if_cancelled()
+    except BaseException as exc:
+        if lifecycle.committed:
+            raise
+
+        async def restore_precommit_state() -> list[str]:
+            await session.rollback()
+            if target_rollback is None:
+                return []
+            return await _restore_target_rollback(
                 backend,
                 settings,
                 target_rollback,
                 target_node=target_node,
+                lifecycle=lifecycle,
             )
-    except Exception as exc:
-        await session.rollback()
-        rollback_messages: list[str] = []
-        if target_rollback is not None:
-            rollback_messages = await _restore_target_rollback(
-                backend,
-                settings,
-                target_rollback,
-                target_node=target_node,
-            )
-        if rollback_messages:
+
+        rollback_messages = await lifecycle.recover(restore_precommit_state)
+        if rollback_messages and isinstance(exc, Exception):
             raise RuntimeError(
                 f"{exc}; replica target rollback: {'; '.join(rollback_messages)}"
             ) from exc
@@ -586,6 +659,15 @@ def _route_target(backend: Backend, node: ClusterNode | None, node_uid: str) -> 
     if node is None:
         return f"{node_uid}:{backend.port}"
     return f"http://{_node_ip(node)}:{backend.port}"
+
+
+def _reject_external_volumes(backend: Backend) -> None:
+    # The transfer archive carries only the sandbox. Mounted host paths would be
+    # left behind while the target still binds them, so refuse before copying.
+    if parse_volumes_json(backend.volumes_json):
+        raise ValueError(
+            "outputs with mounted volumes cannot be copied to another node yet"
+        )
 
 
 def _archive_local_backend(
@@ -1117,6 +1199,44 @@ def _verify_tcp(host: str, port: int, settings: Settings) -> str:
     raise RuntimeError(last_message)
 
 
+def _set_source_paused(
+    backend: Backend,
+    settings: Settings,
+    node: ClusterNode | None,
+    *,
+    paused: bool,
+) -> None:
+    command = (
+        f"podman {'pause' if paused else 'unpause'} {container_name(backend.name)}"
+    )
+    if node is None:
+        _run_checked(shlex.split(command), settings)
+    else:
+        _ssh_checked(node, settings, command)
+
+
+async def _resume_source_after_failure(
+    backend: Backend,
+    settings: Settings,
+    node: ClusterNode | None,
+    *,
+    lifecycle: HostMutationLifecycle,
+) -> None:
+    try:
+        await lifecycle.run(
+            _set_source_paused, backend, settings, node, paused=False
+        )
+    except Exception as exc:
+        # The transfer error stays the one raised; this one must still reach
+        # the operator, since the source is left frozen until it is resumed.
+        logger.error(
+            "cluster_transfer.source_resume_failed",
+            backend=backend.name,
+            error=str(exc),
+            action=f"podman unpause {container_name(backend.name)}",
+        )
+
+
 def _stop_local_backend(backend: Backend, settings: Settings) -> None:
     container = container_name(backend.name)
     network = network_name(backend.name)
@@ -1143,16 +1263,17 @@ async def _restore_target_rollback(
     rollback: TargetRollbackState,
     *,
     target_node: ClusterNode | None,
+    lifecycle: HostMutationLifecycle,
 ) -> list[str]:
     try:
         if rollback.target_uid == LOCAL_NODE_UID:
-            await asyncio.to_thread(
+            await lifecycle.run(
                 _restore_local_target_rollback, backend, settings, rollback
             )
             return ["local target rollback restored"]
         if target_node is None:
             return ["target node missing; restored target rollback skipped"]
-        await asyncio.to_thread(
+        await lifecycle.run(
             _restore_remote_target_rollback,
             backend,
             settings,
@@ -1176,14 +1297,15 @@ async def _discard_target_rollback(
     rollback: TargetRollbackState,
     *,
     target_node: ClusterNode | None,
+    lifecycle: HostMutationLifecycle,
 ) -> None:
     try:
         if rollback.target_uid == LOCAL_NODE_UID:
-            await asyncio.to_thread(_discard_local_target_rollback, rollback)
+            await lifecycle.run(_discard_local_target_rollback, rollback)
             return
         if target_node is None:
             return
-        await asyncio.to_thread(
+        await lifecycle.run(
             _discard_remote_target_rollback, settings, target_node, rollback
         )
     except Exception as exc:

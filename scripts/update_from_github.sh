@@ -7,7 +7,6 @@ CLI_WRAPPER_PATH="${CLI_WRAPPER_PATH:-/usr/local/bin/cnc-admin}"
 LLM_HELP_WRAPPER_PATH="${LLM_HELP_WRAPPER_PATH:-/usr/local/bin/llm-help}"
 SYSTEMD_UNIT_DIR="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
 MIGRATION_BOUNDARY_CROSSED=0
-# The incoming release uses this marker to distinguish manifest-aware updaters.
 # shellcheck disable=SC2034
 UPDATER_ASSET_MANIFEST_V1=1
 
@@ -181,7 +180,6 @@ sync_systemd_units_from_dir() {
     esac
   done <<< "${manifest}"
   [[ "${#asset_sources[@]}" -gt 0 ]] || return 1
-  # A malformed release must fail before changing any installed unit.
   for source_path in "${asset_sources[@]}"; do
     [[ -f "${source_dir}/${source_path}" ]] || return 1
   done
@@ -348,10 +346,6 @@ prepare_release() {
 }
 
 require_supported_host() {
-  # Refuse an environment the new release cannot run on, before anything is
-  # cloned, built or switched. The updater used to check only that its own
-  # script existed, so an incompatible host found that out by breaking after
-  # the release had already been swapped.
   [[ -f /etc/os-release ]] || fail "cannot detect OS: missing /etc/os-release"
   # shellcheck disable=SC1091
   source /etc/os-release
@@ -373,28 +367,6 @@ require_supported_host() {
 }
 
 ensure_pinned_runtime() {
-  # Bring the container runtime to what the NEW release pins, by calling that
-  # release's own `ensure_supported_podman`. That function is the single owner
-  # of every runtime-change rule: verify before changing, refuse when guest
-  # state cannot be observed, stop running guests across the change and start
-  # them again after it, and restore the previous installation if activation
-  # fails. None of those decisions are repeated here, because two copies of
-  # them is how they drifted.
-  #
-  # A runtime change therefore interrupts guests briefly. That is inherent:
-  # conmon and crun cannot be replaced under a live container without breaking
-  # exec into it. The alternative was refusing and handing the operator a
-  # manual stop/start, which is the same outage plus a person.
-  #
-  # A managed config that is merely out of date is not a runtime change: the
-  # shared function rewrites the file and touches no running container, so a
-  # release that only pins a different config does not interrupt anything.
-  #
-  # Runs after the release is prepared and before it is switched, so a host
-  # whose runtime cannot be made compatible keeps running the old release.
-  #
-  # Sourced in a subshell: the installer defines its own `log` and `fail`, and
-  # those must not replace the updater's for the rest of the run.
   local installer="${RELEASE_DIR}/scripts/install_ubuntu.sh"
   [[ -f "${installer}" ]] || fail "release is missing scripts/install_ubuntu.sh"
   log "ensuring the runtime this release pins"
@@ -402,16 +374,12 @@ ensure_pinned_runtime() {
     set -Eeuo pipefail
     # shellcheck disable=SC1090
     source "${installer}"
-    # Consumed by the sourced installer's runtime check.
     # shellcheck disable=SC2034
     APP_DIR="${RELEASE_DIR}"
     ensure_supported_podman
   ) || fail "the container runtime was not changed; release not switched. See the log above for the reason."
   log "runtime satisfies the release requirement"
 
-  # Fault injection, for proving the property this ordering exists for: that a
-  # failure once the shared runtime has been dealt with leaves the running
-  # release and its guests working. Off unless explicitly set.
   if [[ -n "${CNC_UPDATE_FAIL_AFTER_RUNTIME:-}" ]]; then
     fail "injected failure after runtime activation (CNC_UPDATE_FAIL_AFTER_RUNTIME)"
   fi
@@ -431,8 +399,6 @@ validate_release() {
   )
   (
     cd "${RELEASE_DIR}" &&
-      # This updater repairs and rechecks the runtime after the cloned-DB
-      # preflight. Older installed updaters omit the flag and still fail safe.
       "${RELEASE_DIR}/.venv/bin/python" -m app.release_preflight --database-url "${DATABASE_URL}" --skip-runtime-check
   )
 }

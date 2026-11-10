@@ -193,8 +193,6 @@ def safe_extract_tar(
         )
         extracted.append(target)
 
-    # Apply directory permissions last, after descendants, so an archived 0000
-    # directory cannot obstruct extraction. No guest runs in this private stage.
     for member, target in sorted(
         metadata, key=lambda item: len(item[1].parts), reverse=True
     ):
@@ -281,10 +279,6 @@ def _validated_symlink_target(
             error_code="symlink",
         )
     if _is_guest_symlink_path(relative_path, guest_symlink_roots):
-        # Guest filesystem archives contain normal Linux symlinks, including
-        # absolute links and links that would escape when interpreted by the
-        # host. Extraction still never writes through symlinks because every
-        # member path is checked before it is created.
         return link_name
     try:
         if link_path.is_absolute():

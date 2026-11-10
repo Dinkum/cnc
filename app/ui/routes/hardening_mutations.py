@@ -26,6 +26,7 @@ from app.dependencies import (
 from app.logger import get_logger
 from app.models.entities import Backend
 from app.security import enforce_csrf
+from app.services.mutation_queue import enqueue_mutation
 from app.services.app_hardening import (
     active_hardening_run,
     cancel_latest_hardening_run,
@@ -45,7 +46,6 @@ from app.services.operations import (
 from app.ui.errors import operator_error_json as _operator_error_json
 from app.ui.mutation_feedback import host_mutation_preflight_message
 from app.ui.operations.common import operation_backend, operation_response
-from app.ui.operations.hardening import run_hardening_apply
 
 logger = get_logger("ui")
 
@@ -124,7 +124,6 @@ async def preview_hardening_configuration(
 async def apply_hardening_configuration(
     backend_id: int,
     request: Request,
-    background_tasks: BackgroundTasks,
     csrf_token: str = Form(...),
     mode: Literal["recommended", "manual", "previous"] = Form(...),
     configuration: str = Form("{}", max_length=16_384),
@@ -156,7 +155,6 @@ async def apply_hardening_configuration(
     )
     if blocked:
         raise HTTPException(status_code=409, detail=blocked)
-    # Release the read transaction before the separate operation writer opens SQLite.
     await session.rollback()
     operation = await create_operation(
         settings,
@@ -166,11 +164,11 @@ async def apply_hardening_configuration(
         phase="Apply security configuration",
         details={"message": "Security configuration queued.", "backend_id": backend_id},
     )
-    background_tasks.add_task(
-        run_hardening_apply,
+    await enqueue_mutation(
         settings,
         operation.id,
-        backend_id,
+        "hardening_apply",
+        backend_id=backend_id,
         mode=mode,
         configuration=configuration,
         revision=revision,

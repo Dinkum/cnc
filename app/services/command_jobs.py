@@ -49,8 +49,6 @@ class CommandJobError(ValueError):
 
 @contextmanager
 def submission_guard(settings: Settings) -> Iterator[None]:
-    # Hold the existing maintenance lock only while starting/stopping a job, not
-    # while its app command runs. CNC cannot replace the runtime under a launch.
     lock = try_acquire_host_mutation_lock(settings)
     if lock is None:
         raise CommandJobError(
@@ -74,8 +72,6 @@ async def job_session(settings: Settings) -> AsyncIterator[AsyncSession]:
 
 
 async def _bounded_thread(function, *args):
-    # Cancellation cannot release a guest lock while its submission is still in
-    # flight. The underlying control command has its own short hard deadline.
     task = asyncio.create_task(asyncio.to_thread(function, *args))
     try:
         return await asyncio.shield(task)
@@ -166,8 +162,6 @@ async def submit_job(
     if previous_id is not None:
         return await get_job(settings, previous_id)
 
-    # Reconcile finished jobs before their guest artifacts become eligible for
-    # retention cleanup. These reads never enter a guest.
     async with job_session(settings) as session:
         active_ids = list(
             (
@@ -207,8 +201,6 @@ async def submit_job(
             raise CommandJobError(
                 "runtime_unavailable", "a running output could not be confirmed"
             )
-        # Commit both identity and operation BEFORE any guest side effect. Unlike
-        # best-effort audit operations, failure here must prevent execution.
         async with job_session(settings) as session:
             backend = await session.get(Backend, backend_id)
             if (
@@ -359,8 +351,6 @@ async def get_job(
         container_started_at = job.container_started_at
         execution_token = job.execution_token
 
-    # Do not hold a database snapshot while host inspection is in flight. Another
-    # reader can record completion, or cancellation can be requested, meanwhile.
     result = None
     unreadable = False
     observed = None
@@ -372,8 +362,6 @@ async def get_job(
         unreadable = True
     if result is None and observe and not unreadable:
         observed = await _bounded_thread(runtime.observe_runtime, output)
-        # Completion may have arrived while inspecting the runtime. It takes
-        # precedence over a stopped runtime observation when its marker is valid.
         try:
             result = read_job_result(
                 settings, output, operation_id, execution_token=execution_token
@@ -389,8 +377,6 @@ async def get_job(
                 "operation_not_found", "command operation not found", operation_id
             )
         if job.execution_token != execution_token:
-            # Retention may reuse an integer ID while an earlier observer waits.
-            # Its evidence belongs exclusively to the original execution token.
             return payload(job, operation)
         values = {}
         if operation.status in ACTIVE:
@@ -400,8 +386,6 @@ async def get_job(
                 elif result["service_result"] in {"success", "signal"} and result[
                     "exit_kind"
                 ] in {"killed", "dumped"}:
-                    # Read cancellation at the update itself, not from the earlier
-                    # snapshot, so a concurrent request cannot be misclassified.
                     cancellation = (
                         select(CommandJob.cancel_requested)
                         .where(CommandJob.operation_id == operation_id)
@@ -441,8 +425,6 @@ async def get_job(
                 elif operation.phase == "observation_unavailable":
                     values = {"phase": "executing"}
             if values:
-                # Terminal outcomes are immutable: a delayed observer can only
-                # update an operation that is still active at write time.
                 await session.execute(
                     update(Operation)
                     .where(
@@ -462,7 +444,6 @@ async def get_job(
             await session.refresh(operation)
             await session.refresh(job)
         response = payload(job, operation)
-    # The durable terminal record must win before the execution slot is released.
     if response["status"] not in ACTIVE:
         release_job(settings, output, operation_id, execution_token=execution_token)
     return response
@@ -481,8 +462,6 @@ async def cancel_job(settings: Settings, operation_id: int) -> dict:
         container_id = job.container_id
         execution_token = job.execution_token
     with submission_guard(settings):
-        # Recheck after waiting for maintenance: never stop a coincidentally
-        # named service in a replacement container.
         payload = await get_job(settings, operation_id)
         if payload["status"] not in ACTIVE:
             return payload

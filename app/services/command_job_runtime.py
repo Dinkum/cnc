@@ -9,10 +9,8 @@ from app.services.command_job_files import (
     artifact_name,
 )
 from app.services.commands import CommandResult, run_podman_exec
-from app.services.container_runtime import (
-    inspect_container,
-    inspect_result_reports_missing,
-)
+from app.services.container_runtime import inspect_container
+from app.services.observation import Absent, Unknown
 from app.services.renderers import container_name
 
 
@@ -24,10 +22,13 @@ def unit_name(operation_id: int, execution_token: str) -> str:
 
 
 def observe_runtime(output: str) -> dict:
-    result, payload = inspect_container(container_name(output), CONTROL_TIMEOUT_SEC)
-    if inspect_result_reports_missing(result):
+    observation = inspect_container(container_name(output), CONTROL_TIMEOUT_SEC)
+    if isinstance(observation, Absent):
         return {"state": "missing"}
-    if not result.ok or not payload or not isinstance(payload.get("State"), dict):
+    if isinstance(observation, Unknown):
+        return {"state": "unknown"}
+    payload = observation.value
+    if not isinstance(payload.get("State"), dict):
         return {"state": "unknown"}
     state = payload["State"]
     if not payload.get("Id") or not state.get("StartedAt"):
@@ -49,8 +50,6 @@ def guest_launch_script(
 ) -> str:
     directory = f"/{GUEST_JOB_ROOT}/{artifact_name(operation_id, execution_token)}"
     invocation = shlex.join(argv)
-    # Drain excess output instead of closing the pipe: an output cap must not
-    # SIGPIPE an otherwise healthy command. Separate FIFOs retain stream identity.
     runner = f"""set -u
 cd {shlex.quote(directory)} || exit 1
 capture() {{
@@ -70,16 +69,11 @@ code=$?
 wait "$out_pid" "$err_pid"
 exit "$code"
 """
-    # ExecStopPost runs after the entire service cgroup is stopped, including on
-    # cancellation and an explicit RuntimeMaxSec deadline. Do not infer timeout
-    # or cancellation from an application's numeric exit code.
     finalizer = (
         f"umask 077; printf '%s\\t%s\\t%s\\n' "
         '"${SERVICE_RESULT:-resources}" "${EXIT_CODE:-none}" "${EXIT_STATUS:-none}" '
         f"> {directory}/result.tmp && mv {directory}/result.tmp {directory}/result"
     )
-    # Keep shell expansion inside a script file. systemd-run serializes Exec*
-    # properties itself; pre-escaping percent/dollar signs corrupts the record.
     finalizer_command = f"/bin/bash {directory}/finish"
     command = [
         "systemd-run",
@@ -95,7 +89,6 @@ exit "$code"
     ]
     if timeout_sec is not None:
         command.append(f"--property=RuntimeMaxSec={timeout_sec}s")
-    # A file avoids systemd's argv expansion of user shell text/$/% characters.
     command.extend(["--", "/bin/bash", f"{directory}/run"])
     cleanup = (
         'cleanup_job() {\n [[ "$1" =~ ^[1-9][0-9]*(-[0-9a-f]{32})?$ ]] || return\n'
@@ -124,8 +117,6 @@ exit "$code"
         + "\n"
     )
     cleanup += ' rmdir -- "$old" 2>/dev/null || :\n}\n'
-    # Include filesystem entries whose operation metadata has already expired.
-    # Reconciliation before submission commits still-active completion records.
     cleanup += f"for old_id in $(find /{GUEST_JOB_ROOT} -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' -printf '%f\\n' 2>/dev/null | sort -nr | tail -n +20); do\n"
     cleanup += (
         f' [ -f /{GUEST_JOB_ROOT}/"$old_id"/result ] && cleanup_job "$old_id"\ndone\n'
@@ -134,8 +125,6 @@ exit "$code"
         old_name = artifact_name(old_id, old_token)
         if old_name == artifact_name(operation_id, execution_token):
             raise ValueError("cannot purge the command being submitted")
-        # Only generated artifacts of jobs already committed terminal in CNC.
-        # Cleanup executes inside the guest namespace, never through host paths.
         cleanup += f"cleanup_job {old_name}\n"
     return (
         cleanup + f"umask 077\nmkdir -p /{GUEST_JOB_ROOT}\n"
@@ -154,8 +143,6 @@ def launch_job(
     purge_jobs: list[tuple[int, str]],
     execution_token: str,
 ) -> CommandResult:
-    # The caller holds the guest guard and has durably reserved this job. This
-    # deadline bounds submission only; the detached service owns execution time.
     return run_podman_exec(
         container_id,
         [

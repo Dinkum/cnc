@@ -70,8 +70,6 @@ async def llm_help_async(
             if backend is None:
                 return 1, None, f"backend not found: {backend_name}"
 
-        # LLM help must remain available when a guest or the wider status fan-out is
-        # unhealthy. Cached status is context, not a dependency of the handoff.
         service_map = cached_service_map(peek_cached_status())
         llm_help_host = resolve_llm_help_host(settings)
         backend_ssh_host = resolve_backend_llm_help_host(settings)

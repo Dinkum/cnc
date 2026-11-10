@@ -18,6 +18,7 @@ from app.services.queries import load_inputs_by_ids
 from app.services.validators import (
     ValidationError,
     validate_backend_collection,
+    ensure_volume_sources_not_nested,
     validate_backend_shape,
     validate_input_bindings,
 )
@@ -110,6 +111,7 @@ async def create_backend(
     backend = backend_from_payload(payload)
     backend.inputs = await load_inputs(session, payload.input_ids)
     validate_backend_shape(backend)
+    ensure_volume_sources_not_nested(backend)
     if backend.kind == "app" and backend.port is not None:
         ensure_loopback_port_free(
             backend.port, field_name=f"backend {backend.name} port"
@@ -132,16 +134,27 @@ async def update_backend(
 ) -> Backend:
     backend = await require_backend(session, backend_id)
     previous_port = backend.port
+    previous_volumes_json = backend.volumes_json
     values = payload.model_dump(exclude_unset=True)
     if "kind" in values:
         requested_kind = values.pop("kind")
         if requested_kind is not None and requested_kind != backend.kind:
             raise ValidationError("output type is locked after creation")
+    if (
+        backend.kind == "app"
+        and values.get("name") is not None
+        and values["name"] != backend.name
+    ):
+        # The name is the app's runtime identity: container, rootfs, network
+        # and SSH account. Changing it would orphan all of them.
+        raise ValidationError("app output names are locked after creation")
     if "input_ids" in values:
         backend.inputs = await load_inputs(session, values.pop("input_ids") or [])
     for key, value in values.items():
         setattr(backend, key, value)
     validate_backend_shape(backend)
+    if backend.volumes_json != previous_volumes_json:
+        ensure_volume_sources_not_nested(backend)
     if (
         backend.kind == "app"
         and backend.port is not None

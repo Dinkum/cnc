@@ -1,4 +1,3 @@
-"""Portable guest filesystem metadata, independent of a host's user-ID map."""
 
 from __future__ import annotations
 
@@ -17,6 +16,8 @@ from typing import Callable
 ID_COUNT = 65536
 XATTR_HEADER = "CNC.guest.xattrs"
 MAX_XATTR_BYTES = 256 * 1024
+POSIX_ACL_USER = 2
+POSIX_ACL_GROUP = 8
 
 
 @dataclass(frozen=True)
@@ -31,7 +32,7 @@ def parse_id_map(text: str) -> tuple[IdMapping, ...]:
         IdMapping(*map(int, line.split())) for line in text.splitlines() if line.strip()
     )
     if all(item.guest == item.host for item in maps):
-        return ()  # Legacy host-root guests already expose canonical ownership.
+        return ()
     for item in maps:
         if (
             item.guest < 0
@@ -81,8 +82,6 @@ class GuestArchiveView:
                 "Cannot inspect the guest archive ownership view."
             ) from exc
         if result.returncode:
-            # Podman uses 125 for both absence and observation errors. Only an
-            # explicit existence query's documented 'absent' result permits raw IDs.
             exists_command = ["podman", "container", "exists", container]
             exists = (
                 runner(exists_command, timeout_sec=15)
@@ -142,8 +141,8 @@ def normalize_xattr(name: str, value: bytes, view: GuestArchiveView) -> bytes:
         normalized = bytearray(value)
         for offset in range(4, len(value), 8):
             tag, _permissions, ident = struct.unpack_from("<HHI", value, offset)
-            if tag in {2, 8}:  # ACL_USER / ACL_GROUP carry numeric IDs.
-                mapping = view.uid_map if tag == 2 else view.gid_map
+            if tag in {POSIX_ACL_USER, POSIX_ACL_GROUP}:
+                mapping = view.uid_map if tag == POSIX_ACL_USER else view.gid_map
                 struct.pack_into("<I", normalized, offset + 4, guest_id(ident, mapping))
             elif tag not in {1, 4, 16, 32}:
                 raise ValueError("Unsupported guest POSIX ACL entry.")
@@ -165,7 +164,6 @@ def capture_xattrs(path: Path, view: GuestArchiveView) -> dict[str, str]:
     result = {}
     size = 0
     for name in names:
-        # Host LSM labels are not guest state and must not cross hosts.
         if name in {"security.selinux", "security.apparmor"}:
             continue
         value = os.getxattr(path, name, follow_symlinks=False)
@@ -265,8 +263,6 @@ def restore_guest_metadata(
         if ownership_only:
             return
         os.utime(fd, (member.mtime, member.mtime))
-        # chown (and timestamp changes on some filesystems) clears special bits
-        # and file capabilities; restore those only after ordinary metadata.
         os.fchmod(fd, member.mode & 0o7777)
         for name, value in decode_xattrs(member).items():
             os.setxattr(fd, name, value)

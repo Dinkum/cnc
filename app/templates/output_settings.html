@@ -3,7 +3,7 @@
   <div class="output-setting-heading"><h3>General</h3></div>
   <div class="output-setting-fields"><div class="settings-lines">            <div class="settings-line sf-row">
               <label class="settings-key" for="sf-name">name</label>
-              <input id="sf-name" name="name" required value="{{ selected_backend.name }}">
+              <input id="sf-name" name="name" required value="{{ selected_backend.name }}"{% if selected_backend.kind == "app" %} readonly title="App names are locked after creation"{% endif %}>
             </div>
             <div class="settings-line sf-row">
               <label class="settings-key" for="sf-notes">notes</label>

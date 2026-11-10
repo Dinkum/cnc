@@ -1,4 +1,3 @@
-"""Request-aware SSH destinations and operator command presentation."""
 
 from __future__ import annotations
 
@@ -62,7 +61,6 @@ def ssh_destination_for_request(request: Request) -> str:
 
 
 def _page_ssh_destination(request: Request) -> str:
-    # Keep output first paint free of synchronous DNS lookups.
     host = (request.url.hostname or "").strip()
     return host or "SERVER_IP"
 

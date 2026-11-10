@@ -29,7 +29,5 @@ def _with_cnc_errors(function):
     return wrapped
 
 
-# The standard-library implementation is also bundled with the remote guest
-# helper. Keep archive validation identical on CNC and transfer-only hosts.
 validate_safe_tar = _with_cnc_errors(tar_safety.validate_safe_tar)
 safe_extract_tar = _with_cnc_errors(tar_safety.safe_extract_tar)

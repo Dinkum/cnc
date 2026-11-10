@@ -1,6 +1,6 @@
 <dialog class="cf-dialog" id="cloudflare-setup" aria-labelledby="cloudflare-setup-title">
   <div class="cf-dialog-card">
-    <div class="section-head"><h2 id="cloudflare-setup-title">Configure Cloudflare</h2><button type="button" class="ghost modal-close-button" data-cf-close aria-label="Close Cloudflare setup">&times;</button></div>
+    <div class="section-head"><h2 id="cloudflare-setup-title">Configure Cloudflare API</h2><button type="button" class="ghost modal-close-button" data-cf-close aria-label="Close Cloudflare setup">&times;</button></div>
     <p class="subtle">Create an API token with access to the domains you want CNC to manage.</p>
     <ol class="cf-setup-steps">
       <li><a href="https://dash.cloudflare.com/profile/api-tokens" target="_blank" rel="noopener noreferrer">Open Cloudflare API tokens ↗</a> and choose <strong>Create Custom Token</strong>.</li>
@@ -32,5 +32,22 @@
     <p class="subtle" data-cf-mode-note>Cloudflare's zone-wide encryption mode will stay unchanged.</p>
     <p class="cf-message" data-cf-preview-message role="status"></p>
     <div class="editor-actions"><button type="button" class="ghost" data-cf-close>Cancel</button><button type="button" data-cf-apply>Apply changes</button></div>
+  </div>
+</dialog>
+
+<dialog class="cf-dialog" id="cloudflare-tunnel-setup" aria-labelledby="cloudflare-tunnel-title">
+  <div class="cf-dialog-card">
+    <div class="section-head"><h2 id="cloudflare-tunnel-title">Configure Cloudflare Tunnel</h2><button type="button" class="ghost modal-close-button" data-tunnel-close aria-label="Close Tunnel setup">&times;</button></div>
+    <ol class="cf-setup-steps">
+      <li><a href="{{ cloudflare_tunnel.dashboard_url }}" target="_blank" rel="noopener noreferrer">Open Cloudflare Tunnels ↗</a> and create a Cloudflared tunnel.</li>
+      <li>Open <strong>Add a replica</strong> and copy the Tunnel token from the installation command.</li>
+      <li>After connecting, add your hostnames under <strong>Published application routes</strong>, with service <code>{{ cloudflare_tunnel.service_url }}</code>. Cloudflare creates DNS for each hostname; existing address records can conflict.</li>
+    </ol>
+    <form data-tunnel-connect-form>
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label>Tunnel token<input name="tunnel_token" type="password" placeholder="Paste your Tunnel token" autocomplete="new-password" spellcheck="false" required></label>
+      <p class="cf-message" data-tunnel-connect-message role="status"></p>
+      <div class="editor-actions"><button type="button" class="ghost" data-tunnel-close>Cancel</button><button type="submit">Connect Tunnel</button></div>
+    </form>
   </div>
 </dialog>

@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-"""Host preparation and the shared Ubuntu guest isolation contract.
-
-This module is also installed as a standalone helper on container hosts. Keep it
-standard-library-only so a transferred guest can start without the CNC server.
-"""
 
 from __future__ import annotations
 
@@ -57,7 +52,6 @@ def guest_podman_args() -> list[str]:
         f"--hooks-dir={GUEST_ROOTFS_HOOK.parent}",
         "--cap-add=SYS_ADMIN",
         "--cap-add=MKNOD",
-        # Audit writes address the host audit subsystem, not a guest resource.
         "--cap-drop=AUDIT_WRITE",
         f"--security-opt=apparmor={GUEST_APPARMOR_PROFILE}",
     ]
@@ -68,7 +62,6 @@ def guest_rootfs_argument(rootfs: Path | str) -> str:
 
 
 def guest_volume_arguments(volumes: list[str]) -> list[str]:
-    """Keep the existing guest ownership view on absolute host bind mounts."""
     result = []
     for volume in volumes:
         parts = volume.split(":", 2)
@@ -102,8 +95,6 @@ def validate_guest_hardening(policy: dict) -> None:
 
 
 def guest_apparmor_profile() -> str:
-    # A remount wildcard must REQUIRE ro+remount+bind. AppArmor's `options in`
-    # accepts subsets, which would also authorize a plain writable bind mount.
     optional = ("nosuid", "nodev", "noexec", "relatime", "strictatime")
     read_only_rules = "\n".join(
         "  mount options=(" + ", ".join(("ro", "remount", "bind", *extra)) + ") -> /**,"
@@ -124,7 +115,6 @@ profile {GUEST_APPARMOR_PROFILE} flags=(attach_disconnected,mediate_deleted) {{
   signal (receive) peer={{/usr/bin/,/usr/sbin/,}}podman,
   ptrace (trace,read) peer={GUEST_APPARMOR_PROFILE},
 
-  # systemd builds service mount namespaces below its private staging tree.
   mount options=(rw, rprivate) -> /,
   mount options=(rw, rslave) -> /,
   mount options=(rw, rshared) -> /,
@@ -134,8 +124,6 @@ profile {GUEST_APPARMOR_PROFILE} flags=(attach_disconnected,mediate_deleted) {{
   mount options=(ro, remount, bind) -> /,
 {read_only_rules}
   mount options=(rw, move) /run/systemd/** -> /run/systemd/**,
-  # This construction-zone exception allows service-specific bind/remount flags.
-  # It cannot mount a new filesystem outside systemd's staging tree.
   mount options in (rw, ro, bind, rbind, remount, nosuid, nodev, noexec, relatime, strictatime, silent, slave, rslave, private, rprivate, shared, rshared, unbindable, runbindable) -> /run/systemd/**,
   mount fstype=tmpfs -> /run/systemd/**,
   mount fstype=tmpfs -> /tmp/,
@@ -149,8 +137,6 @@ profile {GUEST_APPARMOR_PROFILE} flags=(attach_disconnected,mediate_deleted) {{
   deny /proc/sysrq-trigger rwklx,
   deny /proc/kcore rwklx,
   deny /proc/sys/** w,
-  # Keep the cgroup subtree available to guest systemd, while denying writes
-  # through the remaining host sysfs interfaces.
   deny /sys/[^f]*/** wklx,
   deny /sys/f[^s]*/** wklx,
   deny /sys/fs/[^c]*/** wklx,
@@ -219,11 +205,6 @@ def ensure_subid_pool(
     lock: Path = Path("/run/lock/cnc-guest-subids.lock"),
     host_ids: set[int] | None = None,
 ) -> SubidRange:
-    """Reserve one pool; Podman owns concurrent allocation and range release.
-
-    UID/GID files cannot be replaced atomically together. A partially written
-    reservation is retained and completed on retry, never allocated a new base.
-    """
     lock.parent.mkdir(parents=True, exist_ok=True)
     with lock.open("a") as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
@@ -307,7 +288,6 @@ def ensure_subid_pool(
 
 
 def protect_sandbox_directory(sandbox: Path) -> None:
-    """Guest-owned setuid files must never be executable through a host path."""
     if sandbox.is_symlink():
         raise ValueError("Sandbox directory cannot be a symlink.")
     sandbox.mkdir(parents=True, mode=0o700, exist_ok=True)
@@ -332,10 +312,6 @@ def validate_guest_volume_paths(
         options = parts[2].split(",") if len(parts) == 3 else []
         if "ro" in options and "rw" not in options:
             continue
-        # Writable guest files retain canonical host IDs, including setuid root.
-        # Require an existing private boundary; never chmod a user's shared data.
-        # The boundary must sit outside the mounted subtree, where guest root
-        # cannot chmod it to expose canonical setuid files to host users.
         parents = [parent for parent in source.parents if parent.exists()]
         boundary = next(
             (
@@ -366,7 +342,6 @@ def preflight_guest_storage(
     mounted_sources: list[Path],
     managed_root: Path = Path("/var/lib/cnc/apps"),
 ) -> list[str]:
-    """Repair only CNC's private storage boundary, never guest-owned contents."""
     repaired: list[str] = []
     for volume in volumes:
         source = Path(volume.split(":", 1)[0])
@@ -376,10 +351,7 @@ def preflight_guest_storage(
         except ValueError:
             if managed_root not in source.parents:
                 raise
-        # Validate existence and canonical paths before considering a repair.
         validate_guest_volume_paths([f"{source}:/storage:ro"])
-        # Legacy mount sources may use an alias even though new mounts reject
-        # symlinks. Such a mount must not expose the boundary inside a guest.
         canonical_sources = [path.resolve() for path in mounted_sources]
         if any(
             managed_root == path or path in managed_root.parents
@@ -410,8 +382,6 @@ def preflight_guest_storage(
             raise ValueError(
                 "CNC storage parent has an access-control list; automatic repair is unsafe."
             )
-        # Only the host-owned outer boundary changes. Guest data and ownership
-        # remain untouched, and the boundary cannot be chmodded from the guest.
         managed_root.chmod(0o700)
         repaired.append(str(managed_root))
         validate_guest_volume_paths([volume])
@@ -479,8 +449,6 @@ def prepare_rootfs_access(spec: dict) -> None:
     ):
         raise ValueError("Rootfs access hook requires an isolated guest UID map.")
     protect_sandbox_directory(sandbox)
-    # Grant traversal only to this guest's allocated UID. The directory remains
-    # root-owned, with no group/other access, and stale named entries are replaced.
     subprocess.run(
         [
             "setfacl",
@@ -505,8 +473,6 @@ def require_supported_podman() -> None:
             timeout=15,
         )
     except FileNotFoundError as error:
-        # A host with no podman at all is a different problem from a host whose
-        # podman is broken, and the two must not read the same.
         raise ValueError(
             "podman is not installed on this host. The installer installs CNC's "
             "pinned runtime; a host without it has not had that step applied."
@@ -517,9 +483,6 @@ def require_supported_podman() -> None:
             "on `podman version` cannot run app guests."
         ) from error
     except subprocess.CalledProcessError as error:
-        # The interesting text is the runtime's own message, not a traceback:
-        # a broken runtime (an unusable lock store, a missing helper) fails here
-        # first, and this is the line an operator has to act on.
         detail = (error.stderr or error.stdout or "").strip().splitlines()
         reason = " / ".join(line.strip() for line in detail[-3:]) or "no output"
         raise ValueError(
@@ -527,8 +490,6 @@ def require_supported_podman() -> None:
         ) from error
     version = result.stdout.strip()
     match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:[+~-].*)?", version)
-    # Earlier Podman widens every rootfs ancestor to be world-traversable when
-    # starting a user-namespaced guest, defeating the private host boundary.
     if match is None or tuple(map(int, match.groups())) < (5, 2, 0):
         raise ValueError(
             "CNC app guests require Podman 5.2.0 or newer to preserve private "
@@ -564,8 +525,6 @@ def prepare_guest_host(
         raise ValueError("Guest AppArmor profile cannot be a symlink.")
     if not profile_path.exists() or profile_path.read_bytes() != content:
         _atomic_write(profile_path, content, 0o644)
-    # Load on every start: the file surviving reboot does not prove the kernel
-    # profile is loaded, and Quadlet must never fall back to an unconfined guest.
     subprocess.run(["apparmor_parser", "-r", str(profile_path)], check=True, timeout=30)
     if rootfs is not None:
         if rootfs.is_symlink() or not rootfs.is_dir():
@@ -574,7 +533,6 @@ def prepare_guest_host(
 
 
 def guest_helper_bytes() -> bytes:
-    """Build a deterministic standard-library zip application for every host."""
     buffer = io.BytesIO()
     buffer.write(b"#!/usr/bin/env python3\n")
     sources = {
@@ -659,9 +617,6 @@ def main() -> None:
         try:
             require_supported_podman()
         except ValueError as error:
-            # The installer calls this to decide whether a host can run guests.
-            # Its output is read by an operator, so it gets one line naming the
-            # reason instead of a traceback through this module.
             print(f"[runtime] {error}", file=sys.stderr)
             raise SystemExit(1) from error
     elif args.archive is not None:

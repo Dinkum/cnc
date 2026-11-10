@@ -1,9 +1,3 @@
-"""shield: the password gate container placed in front of an output.
-
-Owns its Quadlet unit and two files under the Shield state directory. When
-Shield is switched off the same tool takes the container down and removes them,
-which is why it stays applicable while its assets still exist.
-"""
 
 from __future__ import annotations
 
@@ -24,18 +18,14 @@ from app.services.shield_runtime import (
 from app.services.tools.core import Plan
 
 tool_name = "shield"
-#: Phase strings this tool owns. Published to clients in apply details and
-#: matched by the progress card, so they keep their existing spelling.
 phases = ("shield_runtime",)
 
 
 def shield_wanted(desired: DesiredState, settings: Settings) -> bool:
-    """Whether Shield is in play at all, either wanted or still installed."""
     return bool(desired.shield_required) or _assets_exist(settings)
 
 
 async def shield(plan: Plan) -> bool:
-    """Converge Shield, including tearing it down when it is no longer wanted."""
     if (
         not _assets_exist(plan.settings)
         and not plan.desired.shield_required
@@ -58,12 +48,6 @@ async def shield(plan: Plan) -> bool:
 
 
 def _service_active(plan: Plan) -> bool:
-    """Whether the Shield container is actually running.
-
-    Matching files are not convergence. A restart that failed after the files
-    were written left them correct on disk, so the next attempt saw a match and
-    skipped the restart, reporting a gate that was never up as converged.
-    """
     if not plan.desired.shield_required:
         return True
     runner = getattr(plan.services.runtime_services, "run_command", run_command)

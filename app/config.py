@@ -48,6 +48,7 @@ class Settings(BaseSettings):
         "2a06:98c0::/29,2c0f:f248::/32"
     )
     cloudflare_api_token: str = Field(default="", repr=False)
+    cloudflare_tunnel_token: str = Field(default="", repr=False)
     cloudflare_ips_v4_url: str = "https://www.cloudflare.com/ips-v4"
     cloudflare_ips_v6_url: str = "https://www.cloudflare.com/ips-v6"
     cloudflare_sync_timeout_sec: int = Field(default=15, ge=3, le=300)
@@ -79,7 +80,11 @@ class Settings(BaseSettings):
     backend_backup_upload_max_bytes: int = Field(
         default=2 * 1024 * 1024 * 1024, ge=1024 * 1024
     )
+    backend_backup_expanded_max_bytes: int = Field(
+        default=256 * 1024 * 1024 * 1024, ge=1024 * 1024
+    )
     app_control_dir: Path = Path("/var/lib/cnc/app-control")
+    host_journal_dir: Path | None = None
     app_sandbox_dir: Path = Path("/var/lib/cnc/sandboxes")
     app_quadlet_dir: Path = Path("/etc/containers/systemd")
     guest_runtime_helper_path: Path = Path("/usr/local/bin/cnc-prepare-guest")
@@ -156,6 +161,10 @@ class Settings(BaseSettings):
 
     static_files_dir: Path = Path("app/static")
     templates_dir: Path = Path("app/templates")
+
+    @property
+    def resolved_host_journal_dir(self) -> Path:
+        return self.host_journal_dir or self.app_control_dir.parent / "journal"
 
     @property
     def sqlite_path(self) -> str:

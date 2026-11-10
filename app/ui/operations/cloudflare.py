@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from app.config import Settings
 from app.logger import get_logger
+from app.services.mutation_queue import mutation_runner
 from app.services.cloudflare_api import CloudflareError
 from app.services.cloudflare_domains import (
     apply_domain_preview,
@@ -15,6 +16,7 @@ from app.ui.operations.common import background_db_session
 logger = get_logger("cloudflare.domains")
 
 
+@mutation_runner("cloudflare_domain")
 async def run_domain_operation(
     settings: Settings, operation_id: int, input_id: int, preview_id: str
 ) -> None:

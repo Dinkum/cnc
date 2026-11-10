@@ -216,9 +216,6 @@ def run_backend_guest_command(
             timeout_sec=remaining,
             command_runner=command_runner,
         )
-        # The guest's `timeout` wrapper (or the command itself) can return 124
-        # while Podman returns normally. Only a host-side deadline leaves the
-        # exec session's outcome uncertain and requires latching the circuit.
         if result.timed_out:
             open_guest_exec_circuit(
                 settings,

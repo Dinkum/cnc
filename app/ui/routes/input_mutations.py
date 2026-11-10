@@ -4,7 +4,6 @@ from typing import Annotated
 
 from fastapi import (
     APIRouter,
-    BackgroundTasks,
     Depends,
     Form,
     Request,
@@ -27,6 +26,7 @@ from app.logger import get_logger
 from app.models.entities import Input
 from app.security import enforce_csrf
 from app.services import input_commands
+from app.services.mutation_queue import enqueue_mutation
 from app.services.apply_service import run_apply
 from app.services.error_reporting import (
     ErrorCode,
@@ -62,11 +62,6 @@ from app.ui.mutation_feedback import (
     host_mutation_preflight_message,
 )
 from app.ui.operations.common import operation_response as _operation_response
-from app.ui.operations.inputs import (
-    _run_create_input_operation,
-    _run_delete_input_operation,
-    _run_update_input_operation,
-)
 from app.ui.progress import (
     _input_progress_details,
     _planned_operation_progress_details,
@@ -115,6 +110,7 @@ async def create_input_form(
     value: str = Form(...),
     enabled: bool = Form(False),
     https_enabled: Annotated[bool, Form()] = False,
+    connection: Annotated[str, Form()] = "public_ip",
     session: AsyncSession = Depends(db_session_dependency),
 ) -> HTMLResponse:
     enforce_csrf(request, settings, csrf_token)
@@ -155,6 +151,7 @@ async def create_input_form(
             backend_ids=form.getlist("backend_ids"),
             enabled=enabled,
             https_enabled=https_enabled if kind == "domain" else False,
+            connection=connection if kind == "domain" else "public_ip",
         )
         if async_dashboard:
             operation = await create_operation(
@@ -171,21 +168,20 @@ async def create_input_form(
                     input_value=payload.value,
                 ),
             )
-            background_tasks = BackgroundTasks()
-            background_tasks.add_task(
-                _run_create_input_operation,
+            await enqueue_mutation(
                 settings,
                 operation.id,
-                {
+                "create_input",
+                form_values={
                     "kind": kind,
                     "value": value,
                     "backend_ids": [str(item) for item in form.getlist("backend_ids")],
                     "enabled": enabled,
                     "https_enabled": https_enabled if kind == "domain" else False,
+                    "connection": connection if kind == "domain" else "public_ip",
                 },
             )
             response = _operation_response(operation, message="Input create started.")
-            response.background = background_tasks
             return response
         item = await input_commands.create_input(session, payload, commit=False)
         attached_backend_ids = [backend.id for backend in item.backends]
@@ -337,8 +333,6 @@ async def _delete_input_and_redirect(
     snapshot = {
         "hostname": item.hostname,
     }
-    # Captured before the delete: these are the outputs whose ingress this
-    # change affects, and the only ones it may touch.
     detached_output_names = {str(backend.name) for backend in item.backends}
     await input_commands.delete_input(session, input_id)
     mutation = await converge_change(
@@ -387,15 +381,13 @@ async def _input_delete_operation_response(
             input_id=input_id,
         ),
     )
-    background_tasks = BackgroundTasks()
-    background_tasks.add_task(
-        _run_delete_input_operation,
+    await enqueue_mutation(
         settings,
         operation.id,
-        input_id,
+        "delete_input",
+        input_id=input_id,
     )
     response = _operation_response(operation, message="Input delete started.")
-    response.background = background_tasks
     return response
 
 
@@ -501,24 +493,22 @@ async def update_input_form(
                     input_value=item.hostname,
                 ),
             )
-            background_tasks = BackgroundTasks()
-            background_tasks.add_task(
-                _run_update_input_operation,
+            await enqueue_mutation(
                 settings,
                 operation.id,
-                input_id,
-                {
+                "update_input",
+                input_id=input_id,
+                form_values={
                     "backend_ids": [
                         str(value) for value in form.getlist("backend_ids")
                     ],
                     "enabled": next_enabled,
                     "https_enabled": https_enabled if item.kind == "domain" else False,
                     "shield_enabled": shield_enabled,
-                    "shield_access_code": shield_access_code,
                 },
+                secret_kwargs={"shield_access_code": shield_access_code},
             )
             response = _operation_response(operation, message="Input save started.")
-            response.background = background_tasks
             return response
         item = await input_commands.update_input(
             session, input_id, payload, commit=False

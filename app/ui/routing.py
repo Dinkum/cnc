@@ -1,4 +1,3 @@
-"""Canonical input/output route projections, attachment options, and shield presentation."""
 
 from __future__ import annotations
 
@@ -156,13 +155,14 @@ def build_shield_status(
         and str(shield_service_data.get("ActiveState") or "").strip().lower()
         == "active"
     )
-    output_state = (
-        "healthy"
-        if shield_backend is not None
-        and shield_backend.enabled
-        and shield_service_active
-        else ("missing" if shield_backend is None else "unhealthy")
-    )
+    if shield_backend is None:
+        output_state = "missing"
+    elif not shield_backend.enabled:
+        output_state = "unhealthy"
+    elif not shield_service_data or shield_service_data.get("ActiveState") == "unknown":
+        output_state = "unknown"
+    else:
+        output_state = "healthy" if shield_service_active else "unhealthy"
     config_ready = server_enabled and bool(enabled_shield_inputs)
     ready = config_ready and output_state == "healthy"
     return {

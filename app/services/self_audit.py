@@ -559,8 +559,6 @@ async def handle_startup_self_audit_notification(
         )
         notified = False
         if should_notify:
-            # Notification delivery owns the same host-state lock for its durable
-            # outbox, so it must run between the short state transactions.
             notified = await send_pushover_notification_async(
                 settings,
                 title=_startup_self_audit_failure_title(outcome),

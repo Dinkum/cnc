@@ -219,7 +219,6 @@ def probe_backend_health(
             http_status=status_code,
         )
     if result.ok and status_code is None:
-        # Older tests and wrapper fakes may not emulate curl's `-w %{http_code}` output.
         return BackendHealthcheckProbeResult(ok=True, error="", plan=plan)
     error = (
         result.stderr

@@ -1,4 +1,3 @@
-/* Output sections share one hierarchy and each form owns its own save boundary. */
 .output-area-title { font-size: 18px; font-weight: 650; letter-spacing: -.025em; margin: 0 0 16px; }
 .output-overview, .output-configuration, .output-access { margin-bottom: 36px; }
 .output-overview-grid { align-items: start; gap: 16px; }

@@ -16,7 +16,7 @@
 
   const operationRow = (operation) => {
     const statusLabel = String(operation.presentation?.status_label || "unknown");
-    const status = statusLabel === "saved" ? "success" : (statusLabel === "failed" ? "failed" : "unknown");
+    const status = String(operation.presentation?.state || "unknown");
     const details = operation.details && typeof operation.details === "object" ? operation.details : {};
     const label = String(operation.kind || "operation").replace(/^ui\./, "").replaceAll(/[._]/g, " ").replaceAll(/\bbackend\b/g, "output");
     const target = details.backend_name || details.input_name || (operation.backend_id ? `Output ${operation.backend_id}` : "");
@@ -73,7 +73,6 @@
     }
   };
 
-  // Delegation survives the dashboard replacing a lazily loaded Home panel.
   document.addEventListener("click", (event) => {
     if (!event.target.closest("[data-operation-history-open]")) return;
     dialog.showModal();

@@ -56,8 +56,14 @@ from app.ui.diagnostics import (
 from app.ui.errors import operator_error_json as _operator_error_json
 from app.ui.errors import operator_error_payload as _operator_error_payload
 from app.ui.metric_history import run_metric_history_request
-from app.ui.outputs.data import enabled_runtime_backends_for_resource_profile
-from app.ui.outputs.health import service_metrics_from_status_payload
+from app.ui.outputs.data import (
+    enabled_runtime_backends_for_resource_profile,
+    load_shield_configuration,
+)
+from app.ui.outputs.health import (
+    service_map_from_status_payload,
+    service_metrics_from_status_payload,
+)
 from app.ui.outputs.presentation import (
     build_output_detail,
     output_signal_cards,
@@ -70,6 +76,7 @@ from app.ui.resources import (
 )
 from app.ui.routing import (
     build_input_attach_options,
+    build_shield_status,
     get_input_kind,
     get_input_value,
     input_kind_label,
@@ -184,6 +191,13 @@ async def output_runtime_signals(
         f"{input_kind_label(get_input_kind(item))}: {get_input_value(item)}"
         for item in sorted(backend.inputs, key=lambda item: item.id)
     ]
+    service_map = service_map_from_status_payload(peek_cached_status())
+    shield_backends, shield_inputs = await load_shield_configuration(
+        session, settings, output_kind=backend.kind
+    )
+    shield_status = build_shield_status(
+        shield_backends, shield_inputs, settings, service_map
+    )
     try:
         runtime_diagnostics = await collect_output_runtime_diagnostics_for_ui(
             backend, settings
@@ -198,13 +212,14 @@ async def output_runtime_signals(
                 "runtime_health_summary": "Runtime inspection is still running.",
                 "output_signal_cards": [],
                 "runtime_alert": None,
+                "shield_status": shield_status,
             },
             status_code=202,
             headers={"Retry-After": "1"},
         )
     detail = build_output_detail(
         backend=backend,
-        service_map={},
+        service_map=service_map,
         attached_input_ids=backend.input_ids,
         attached_input_labels=attached_input_labels,
         last_applied_at=None,
@@ -219,6 +234,7 @@ async def output_runtime_signals(
         "runtime_state_detail": detail.get("runtime_state_detail"),
         "output_signal_cards": output_signal_cards(detail),
         "runtime_alert": detail.get("runtime_health_alert"),
+        "shield_status": shield_status,
     }
 
 
@@ -292,7 +308,6 @@ async def output_metric_history(
                 labels["soft_limit_label"] = (
                     f"SOFT LIMIT ({format_metric_data_size(memory_limits['soft'])})"
                 )
-        # All database work is finished before CPU-heavy chart calculation.
         payload = await render_metric_history(data)
         payload.update(labels)
         return payload

@@ -1,5 +1,3 @@
-"""Sign node-owned CSRs through Cloudflare without transferring private keys."""
-
 from __future__ import annotations
 
 import base64
@@ -25,9 +23,16 @@ from app.services.origin_tls import (
 
 
 def input_certificate_path(
-    item: Input | None, control_dir: Path = DEFAULT_CONTROL_DIR
+    item: Input | None,
+    control_dir: Path = DEFAULT_CONTROL_DIR,
+    *,
+    connection: str | None = None,
 ) -> str | None:
-    if item is None or not item.https_enabled:
+    if (
+        item is None
+        or not item.https_enabled
+        or (connection or item.connection) == "cloudflare_tunnel"
+    ):
         return None
     if item.https_provider == "cloudflare_origin":
         return str(origin_certificate_path(item.hostname, control_dir))

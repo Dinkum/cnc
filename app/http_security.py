@@ -6,14 +6,11 @@ from starlette.datastructures import MutableHeaders
 SECURITY_RESPONSE_HEADERS = {
     "X-Frame-Options": "DENY",
     "X-Content-Type-Options": "nosniff",
-    # Native form POSTs need their same-origin identity for the origin guard.
-    # no-referrer makes browsers send Origin: null even to our own access page.
     "Referrer-Policy": "same-origin",
 }
 
 
 class SecurityHeadersMiddleware:
-    """Apply browser hardening headers without changing response bodies or caching."""
 
     def __init__(self, app) -> None:
         self.app = app

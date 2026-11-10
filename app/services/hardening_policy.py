@@ -18,7 +18,6 @@ if TYPE_CHECKING:
 
 
 class HardeningPolicy(BaseModel):
-    """Reviewed container controls, never arbitrary Podman or systemd arguments."""
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -202,7 +201,6 @@ def hardening_volumes(policy: HardeningPolicy, volumes: list[str]) -> list[str]:
 
 
 def hardening_revision(backend: Backend, summary: dict) -> str:
-    # Bind review to both the saved output and the exact persisted evidence.
     payload = {
         "backend": {
             column.name: getattr(backend, column.name)
@@ -385,7 +383,6 @@ def recommended_hardening_policy(
         elif setting == "explicit_tmpfs_paths":
             current["tmpfs_paths"] = "tmp_run"
         elif setting in ("ipc_none", "ipc_private"):
-            # Select one namespace mode; never emit contradictory IPC flags.
             current["ipc"] = "none" if "ipc_none" in recommended else "private"
         elif setting in ("pids_limit", "nofile_ulimit", "shm_size"):
             values = (phase1.get("details") or {}).get("values") or {}
@@ -425,7 +422,6 @@ def recommended_hardening_policy(
                     "Choose explicit tmpfs paths before setting their mount options.",
                 )
     if current["ipc"] == "none" and current["shm_size_mib"] is not None:
-        # Keep an existing shared-memory allocation rather than silently removing it.
         if read_hardening_policy(backend).shm_size_mib is not None:
             current["ipc"] = read_hardening_policy(backend).ipc
             skip("ipc_none", "Conflicts with the saved shared-memory allocation.")

@@ -13,7 +13,6 @@ import tempfile
 
 
 SQLITE_PREFIX = "sqlite+aiosqlite:///"
-#: Releases this build supports. Mirrors `require_ubuntu` in the installer.
 SUPPORTED_UBUNTU_RELEASES = frozenset({"24.04", "26.04"})
 
 
@@ -52,7 +51,7 @@ async def _run_database_startup_check(database_url: str) -> None:
 
 
 class ReleaseIncompatibleError(RuntimeError):
-    """This release cannot run on this host, established before it is switched."""
+    pass
 
 
 def _staged_installer_remedy() -> str:
@@ -61,14 +60,6 @@ def _staged_installer_remedy() -> str:
 
 
 def check_host_release() -> str:
-    """Refuse an OS this release does not support.
-
-    Lives here rather than only in the updater script because the updater that
-    runs the *first* upgrade is the one already installed on the host, and it
-    predates any shell-level gate. What every updater since v0.1.104 does run,
-    from the new release and before the switch, is this module. Putting the
-    check here is what makes it apply to the upgrade that installs it.
-    """
     os_release = Path("/etc/os-release")
     if not os_release.exists():
         raise ReleaseIncompatibleError("cannot detect OS: missing /etc/os-release")
@@ -93,17 +84,8 @@ def check_host_release() -> str:
 
 
 def check_container_runtime() -> str:
-    """Refuse to switch onto a release whose guests this runtime cannot run.
-
-    A host below the guest isolation floor would install cleanly and then fail
-    on its first guest operation. Reported as a refusal before the switch
-    instead, so the working release stays active.
-    """
     from app.services.guest_isolation import require_supported_podman
 
-    # This release's own installer, at the path it is staged at. An operator
-    # reading the refusal should not have to work out which copy to run: the
-    # old release's installer is exactly the one that cannot help here.
     remedy = (
         f"run this release's installer: {_staged_installer_remedy()}. "
         "The installer activates the release when it succeeds."
@@ -120,7 +102,6 @@ def check_container_runtime() -> str:
 
 
 def check_installed_updater_assets(updater_script_path: Path) -> None:
-    """Ensure the updater running this hop can install the new release's units."""
     from app.services.runtime_assets import MANAGED_SYSTEMD_ASSETS, MANAGED_TIMER_UNITS
 
     try:
@@ -130,8 +111,6 @@ def check_installed_updater_assets(updater_script_path: Path) -> None:
             f"cannot inspect installed updater at {updater_script_path}: {exc}"
         ) from exc
 
-    # Manifest-aware updaters read the incoming release's complete asset list.
-    # Older updaters use a fixed list, which must be checked item by item.
     if "UPDATER_ASSET_MANIFEST_V1=1" in updater:
         return
 
@@ -159,7 +138,6 @@ def check_installed_updater_assets(updater_script_path: Path) -> None:
 
 
 def check_staged_systemd_assets() -> None:
-    """Catch an incomplete release package before host runtime work begins."""
     from app.services.runtime_assets import MANAGED_SYSTEMD_ASSETS, MANAGED_TIMER_UNITS
 
     packaging_dir = Path(__file__).resolve().parent.parent / "packaging"
@@ -183,10 +161,6 @@ def run_release_preflight(
     skip_runtime_check: bool = False,
     updater_script_path: Path | None = None,
 ) -> None:
-    # Only the updater that repairs and rechecks the staged runtime may defer
-    # this check. Older installed updaters call the default path and fail safe.
-    # Host compatibility first: it is the cheapest check and the one whose
-    # failure means nothing else is worth doing.
     check_host_release()
     check_staged_systemd_assets()
     if updater_script_path is not None:

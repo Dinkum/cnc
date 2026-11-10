@@ -91,12 +91,17 @@ For each test, CNC:
 
 CNC expects a fresh Ubuntu VPS.
 
-### Recommended Setup
+### Prerequisites
 
-- Ubuntu 24.04 LTS
+- **Ubuntu 24.04 LTS or Ubuntu 26.04 LTS**, on `amd64` or `arm64`
 - root or sudo access
-- a Tailscale tailnet
-- a Cloudflare managed domains
+
+That is the whole list. The installer takes the host from there, including
+installing the exact container runtime CNC's guest isolation needs rather than
+using whatever the release ships. Updates do the same.
+
+You will also want a Tailscale tailnet and a Cloudflare-managed domain to reach
+what you host, but CNC installs without them.
 
 ### Run The Installer
 

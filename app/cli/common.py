@@ -117,7 +117,6 @@ async def load_shield_status_payload(settings: Settings) -> dict[str, object]:
                 .all()
             )
     except Exception:
-        # Preserve command output even when shield metadata is temporarily unavailable.
         pass
 
     return collect_shield_status(backends=backends, inputs=inputs, settings=settings)

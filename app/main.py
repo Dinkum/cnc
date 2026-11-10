@@ -51,6 +51,12 @@ from app.security import CNCTrustedHostMiddleware
 from app.static_delivery import build_static_asset_app, stylesheet_asset_version
 from app.services.error_reporting import CNCError, ErrorCode, cnc_error_from_payload
 from app.services.app_hardening import fail_interrupted_hardening_runs
+from app.services.host_journal import recover_interrupted_journals
+from app.services.mutation_queue import (
+    SHUTDOWN_GRACE_SEC,
+    run_mutation_worker,
+    stop_mutation_worker,
+)
 from app.services.backend_backup_service import (
     fail_interrupted_backend_backups,
     drain_backup_descriptions,
@@ -307,6 +313,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     watchdog = systemd_watchdog_controller_from_env()
     watchdog_task: asyncio.Task[None] | None = None
     notification_dispatch_task: asyncio.Task[None] | None = None
+    mutation_worker_task: asyncio.Task[None] | None = None
+    mutation_worker_stop = asyncio.Event()
     ssh_audit_listener: BackendSshAuditListener | None = None
     if watchdog:
         watchdog.notify_status(status_message="cnc-admin starting")
@@ -336,9 +344,19 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         notification_dispatch_task = asyncio.create_task(
             run_pushover_outbox_dispatcher(settings)
         )
+        mutation_worker_task = asyncio.create_task(
+            run_mutation_worker(settings, mutation_worker_stop),
+            name="cnc-mutation-worker",
+        )
         logger.info("app.startup", host=settings.admin_host, port=settings.admin_port)
         yield
     finally:
+        if mutation_worker_task is not None:
+            await stop_mutation_worker(
+                mutation_worker_task,
+                mutation_worker_stop,
+                grace_sec=SHUTDOWN_GRACE_SEC,
+            )
         cleanup_task = getattr(_app.state, "cnc_startup_interrupted_cleanup_task", None)
         if cleanup_task is not None and not cleanup_task.done():
             cleanup_task.cancel()
@@ -500,6 +518,7 @@ async def _run_interrupted_cleanup_if_unlocked(settings) -> str:
 
 
 async def _run_interrupted_cleanup_steps(settings) -> None:
+    await recover_interrupted_journals(settings)
     await fail_interrupted_operations(settings)
     await fail_interrupted_hardening_runs(settings)
     await fail_interrupted_backend_backups(settings)

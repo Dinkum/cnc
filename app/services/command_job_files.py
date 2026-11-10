@@ -56,7 +56,6 @@ def reserved_job(settings: Settings, output: str) -> int | None:
         return None
     except (UnicodeError, ValueError) as exc:
         raise OSError("invalid background command reservation") from exc
-    # Corrupt guard state must fail closed, not admit another guest command.
     if not isinstance(payload, dict) or type(payload.get("operation_id")) is not int:
         raise OSError("invalid background command reservation")
     operation_id = payload["operation_id"]
@@ -85,8 +84,6 @@ def release_job(
     try:
         lock.__enter__()
     except BlockingIOError:
-        # A submitter can already own this lock when inspecting an existing job.
-        # Terminal reservations do not block admission, so defer cleanup safely.
         return
     try:
         try:
@@ -97,8 +94,6 @@ def release_job(
             raise OSError("invalid background command reservation") from exc
         if not isinstance(payload, dict):
             raise OSError("invalid background command reservation")
-        # Compare and remove while holding the same lock that serializes reserve.
-        # An older observer must never unlink a newer command's reservation.
         if (
             type(payload.get("operation_id")) is int
             and payload["operation_id"] == operation_id
@@ -143,7 +138,6 @@ def _read_guest_file(
     offset: int = 0,
     limit: int = MAX_READ_BYTES,
 ) -> bytes | None:
-    """Read bounded regular files without following guest-controlled symlinks."""
     if operation_id <= 0 or name not in {
         "result",
         "stdout",

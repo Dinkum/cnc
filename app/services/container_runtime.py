@@ -9,6 +9,7 @@ from app.services.commands import (
     run_command,
     run_command_checked_async,
 )
+from app.services.observation import ABSENT, Observation, Present, Unknown
 
 
 _INSPECT_MISSING_MARKERS = (
@@ -22,68 +23,95 @@ _INSPECT_MISSING_MARKERS = (
 )
 
 
-def _parse_json_list(stdout: str) -> list[dict[str, Any]]:
+Inspection = Observation[dict[str, Any]]
+
+
+def _parse_json_list(stdout: str) -> list[dict[str, Any]] | None:
     try:
-        payload = json.loads(stdout or "[]")
+        payload = json.loads(stdout)
     except json.JSONDecodeError:
-        return []
-    if not isinstance(payload, list):
-        return []
-    return [entry for entry in payload if isinstance(entry, dict)]
+        return None
+    if not isinstance(payload, list) or any(not isinstance(entry, dict) for entry in payload):
+        return None
+    return payload
 
 
-def inspect_container(
-    container: str, timeout_sec: int
-) -> tuple[CommandResult, dict[str, Any] | None]:
-    result = run_command(["podman", "inspect", container], timeout_sec=timeout_sec)
-    payloads = _parse_json_list(result.stdout)
-    return result, (payloads[0] if payloads else None)
+def _command_detail(result: CommandResult) -> str:
+    text = (result.stderr or result.stdout or "").strip()
+    return text[:500] if text else f"exit {result.returncode}"
 
 
-def inspect_network(
-    network: str, timeout_sec: int
-) -> tuple[CommandResult, dict[str, Any] | None]:
-    result = run_command(
-        ["podman", "network", "inspect", network], timeout_sec=timeout_sec
-    )
-    payloads = _parse_json_list(result.stdout)
-    return result, (payloads[0] if payloads else None)
-
-
-def inspect_result_reports_missing(result: CommandResult) -> bool:
-    """Return true only when Podman definitively says the inspected object is absent."""
+def reports_missing(result: CommandResult) -> bool:
     if result.returncode != 125:
         return False
     output = "\n".join(part for part in (result.stderr, result.stdout) if part).lower()
     return any(marker in output for marker in _INSPECT_MISSING_MARKERS)
 
 
-def list_external_containers(timeout_sec: int) -> list[dict[str, Any]]:
-    result = run_command(
-        ["podman", "ps", "-a", "--external", "--format", "json"],
-        timeout_sec=timeout_sec,
-    )
+def classify_inspection(result: CommandResult) -> Inspection:
+    if result.timed_out:
+        return Unknown("timed_out", _command_detail(result))
     if not result.ok:
-        return []
-    return _parse_json_list(result.stdout)
+        if reports_missing(result):
+            return ABSENT
+        return Unknown("command_failed", _command_detail(result))
+    payloads = _parse_json_list(result.stdout)
+    if not payloads:
+        return Unknown("malformed_payload", (result.stdout or "").strip()[:200])
+    return Present(payloads[0])
 
 
-def list_mounted_containers(timeout_sec: int) -> list[dict[str, Any]]:
-    result = run_command(
-        ["podman", "mount", "--format", "json"],
-        timeout_sec=timeout_sec,
+def inspect_container(container: str, timeout_sec: int) -> Inspection:
+    return classify_inspection(
+        run_command(["podman", "inspect", container], timeout_sec=timeout_sec)
     )
+
+
+def inspect_network(network: str, timeout_sec: int) -> Inspection:
+    return classify_inspection(
+        run_command(["podman", "network", "inspect", network], timeout_sec=timeout_sec)
+    )
+
+
+def classify_listing(result: CommandResult) -> Observation[list[dict[str, Any]]]:
+    if result.timed_out:
+        return Unknown("timed_out", _command_detail(result))
     if not result.ok:
-        return []
-    return _parse_json_list(result.stdout)
+        return Unknown("command_failed", _command_detail(result))
+    entries = _parse_json_list(result.stdout or "[]")
+    if entries is None:
+        return Unknown("malformed_payload", (result.stdout or "").strip()[:200])
+    return Present(entries)
 
 
-def container_exists(container: str, timeout_sec: int) -> bool:
+def list_external_containers(timeout_sec: int) -> Observation[list[dict[str, Any]]]:
+    return classify_listing(
+        run_command(
+            ["podman", "ps", "-a", "--external", "--format", "json"],
+            timeout_sec=timeout_sec,
+        )
+    )
+
+
+def list_mounted_containers(timeout_sec: int) -> Observation[list[dict[str, Any]]]:
+    return classify_listing(
+        run_command(["podman", "mount", "--format", "json"], timeout_sec=timeout_sec)
+    )
+
+
+def container_presence(container: str, timeout_sec: int) -> Observation[str]:
+    # `podman container exists` exits 1 for a missing container and 125 for its own failures.
     result = run_command(
         ["podman", "container", "exists", container],
         timeout_sec=timeout_sec,
     )
-    return result.returncode == 0
+    if result.timed_out:
+        return Unknown("timed_out", _command_detail(result))
+    if result.returncode == 0:
+        return Present(container)
+    if result.returncode == 1:
+        return ABSENT
+    return Unknown("command_failed", _command_detail(result))
 
 
 async def read_container_stats(container: str, timeout_sec: int) -> CommandResult:

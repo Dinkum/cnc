@@ -1,4 +1,3 @@
-"""Coordinate output page loading and its pure template projection."""
 
 from sqlalchemy.ext.asyncio import AsyncSession
 

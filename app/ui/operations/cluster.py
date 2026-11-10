@@ -4,6 +4,7 @@ import asyncio
 
 from app.config import Settings
 from app.logger import get_logger
+from app.services.mutation_queue import mutation_runner
 from app.services.cluster_transfer import setup_backend_replica, transfer_backend
 from app.services.error_reporting import ErrorCode, error_context
 from app.services.operations import OperationHandle
@@ -15,11 +16,14 @@ from app.ui.progress import _operation_progress_details
 logger = get_logger("ui")
 
 
+@mutation_runner("transfer_backend")
 async def _run_transfer_operation(
     settings: Settings,
     operation_id: int | None,
     backend_id: int,
     target_node: str,
+    *,
+    pause_source: bool,
 ) -> None:
     operation = OperationHandle(
         id=operation_id, kind="transfer_backend", settings=settings
@@ -70,6 +74,7 @@ async def _run_transfer_operation(
                 settings,
                 backend_id=backend_id,
                 target_node_uid=target_node,
+                pause_source=pause_source,
                 progress_callback=report_transfer_progress,
             )
             for progress_update in progress_updates:
@@ -77,13 +82,19 @@ async def _run_transfer_operation(
                     await asyncio.wrap_future(progress_update)
                 except Exception as exc:
                     logger.warning("ui.transfer.progress_update_failed", error=str(exc))
+            transferred = f"{result.backend_name} transferred to {result.target_label}."
+            if not pause_source:
+                transferred += (
+                    " It kept running during the copy, so writes made after the"
+                    " snapshot were not carried over."
+                )
             await operation.complete(
                 "success",
                 phase="Transfer output",
                 details={
                     "progress": 100,
-                    "message": f"{result.backend_name} transferred to {result.target_label}.",
-                    "flash_success": f"{result.backend_name} transferred to {result.target_label}.",
+                    "message": transferred,
+                    "flash_success": transferred,
                     "backend_id": result.backend_id,
                     "backend_name": result.backend_name,
                     "source_node_uid": result.source_node_uid,
@@ -91,6 +102,7 @@ async def _run_transfer_operation(
                     "target_label": result.target_label,
                     "route_target": result.route_target,
                     "messages": result.messages,
+                    "source_paused": pause_source,
                 },
             )
     except Exception as exc:
@@ -123,6 +135,7 @@ async def _run_transfer_operation(
         )
 
 
+@mutation_runner("setup_backend_replica")
 async def _run_replica_setup_operation(
     settings: Settings,
     operation_id: int | None,

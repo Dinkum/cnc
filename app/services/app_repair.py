@@ -174,7 +174,6 @@ def _remove_legacy_loopback_proxy(backend_name: str, settings: Settings) -> list
 
 
 def plan_app_backend_repair(before: dict[str, Any]) -> list[dict[str, str]]:
-    """Build a small, idempotent host-runtime plan from one diagnostic snapshot."""
     issues = {str(issue) for issue in before.get("issues") or []}
     diagnosis = str(before.get("diagnosis") or "")
     plan: list[dict[str, str]] = []
@@ -189,8 +188,6 @@ def plan_app_backend_repair(before: dict[str, Any]) -> list[dict[str, str]]:
     if diagnosis in OBSERVATION_ONLY_DIAGNOSES:
         return plan
 
-    # Guest exec failure is a host/runtime boundary failure. Do not enter the
-    # guest or clear its durable state; restart the owning Quadlet exactly once.
     if diagnosis == "backend_exec_unavailable":
         exec_status = str(before.get("backend_exec_status") or "").strip().lower()
         if before.get("container_exists") and exec_status not in {

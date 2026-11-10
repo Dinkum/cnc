@@ -147,7 +147,6 @@ class BackendSshKey(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
-    # Retain revoked IDs so a later key never reuses a downloaded key's identity.
     revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
 
@@ -157,6 +156,7 @@ class Input(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     kind: Mapped[str] = mapped_column(String(32), nullable=False, default="domain")
     hostname: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    connection: Mapped[str] = mapped_column(String(32), nullable=False, default="public_ip", server_default="public_ip")
     https_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="0"
     )
@@ -777,3 +777,13 @@ class ControlEvent(Base):
                 continue
             rows.append({"label": label, "value": value})
         return rows
+
+
+class HostJournalCommit(Base):
+    __tablename__ = "host_journal_commits"
+
+    journal_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )

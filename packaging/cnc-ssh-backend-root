@@ -40,8 +40,6 @@ if [[ -n "${SSH_ORIGINAL_COMMAND:-}" ]]; then
   fi
 fi
 
-# This is deliberately a no-ack local datagram. Audit delivery must never add
-# a process, database query, filesystem write, or waitable dependency to SSH.
 audit_event() {
   local event="$1"
   local reason="${2:-}"

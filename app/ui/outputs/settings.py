@@ -1,4 +1,3 @@
-"""Explicit form boundaries for independently saved Output settings."""
 
 from collections.abc import Mapping
 
@@ -95,8 +94,6 @@ def backend_section_payload(
             if payload.get("healthcheck_mode") not in {"none", "tcp", "http"}:
                 raise ValidationError("Choose a health-check mode.")
     try:
-        # Only the section's submitted fields may reach the update service. Do
-        # not fill missing fields from a stale page snapshot or form defaults.
         return BackendUpdate(**payload)
     except SchemaValidationError as exc:
         raise ValidationError(_schema_validation_message(exc)) from exc

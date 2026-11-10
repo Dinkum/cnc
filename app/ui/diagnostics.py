@@ -1,4 +1,3 @@
-"""Own output runtime probes, coalesced tasks, cached results, and shutdown draining."""
 
 from __future__ import annotations
 
@@ -42,8 +41,6 @@ async def cancel_runtime_diagnostics() -> None:
     ]
     for task in tasks:
         task.cancel()
-    # Queued probes stop immediately; running threads keep their worker slot
-    # until completion, so shutdown cannot abandon their subprocess work.
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
     _RUNTIME_DIAGNOSTICS_CACHE.clear()

@@ -11,13 +11,16 @@ from app.logger import get_logger
 from app.models.entities import Backend
 from app.schemas.apply import ApplyResponse
 from app.services import backend_commands
+from app.services.mutation_queue import mutation_runner
 from app.services.apply_service import default_apply_services, run_apply
 from app.services.error_reporting import ErrorCode
-from app.services.config_change import output_change
+from app.services.config_change import ConfigChange, converge_change
 from app.ui.operations.action import Action
 from app.ui.operations.save import Reporter, SaveResult, Subject, run_save
-from app.services.inter_app_interfaces import apply_inbound_inter_app_interface_statuses
-from app.services.config_change import converge_change
+from app.services.inter_app_interfaces import (
+    apply_inbound_inter_app_interface_statuses,
+    inter_app_interface_peer_names,
+)
 from app.services.operations import OperationHandle
 from app.services.shield_service import make_code_hash
 from app.services.validators import ValidationError
@@ -91,6 +94,7 @@ async def _commit_output_save_apply(
     operation_name: str,
     backend_id: int,
     backend_name: str,
+    related_outputs: set[str] | None = None,
 ) -> ApplyResponse:
     services = replace(
         default_apply_services(),
@@ -100,11 +104,13 @@ async def _commit_output_save_apply(
             backend_name=backend_name,
         ),
     )
-    # Editing one output is not a reason to reconcile every other one.
     mutation = await converge_change(
         session,
         settings,
-        output_change(operation_name, backend_name),
+        ConfigChange(
+            kind=operation_name,
+            outputs=frozenset({backend_name, *(related_outputs or ())}),
+        ),
         apply_runner=run_apply,
         apply_services=services,
         operation_handle=operation,
@@ -124,12 +130,6 @@ async def _run_output_save_operation(
     progress_extra: dict[str, object],
     failure_extra: dict[str, object],
 ) -> None:
-    """Every output edit: change rows, converge, report.
-
-    A thin shim over the shared save path. It exists only to keep the four
-    output wrappers reading the way they always have while the vocabulary and
-    the flow come from one place.
-    """
 
     async def mutate(session, operation, backend, report):
         name = str(backend.name or "")
@@ -172,12 +172,21 @@ async def _run_output_save_operation(
     )
 
 
+@mutation_runner("update_backend")
 async def _run_update_backend_operation(
     settings: Settings,
     operation_id: int | None,
     backend_id: int,
     form_values: dict[str, object],
+    shield_access_code: str = "",
 ) -> None:
+    if shield_access_code and "section" in form_values:
+        form_values = {
+            **form_values,
+            "values": {**form_values["values"], "shield_access_code": shield_access_code},
+        }
+    elif shield_access_code:
+        form_values = {**form_values, "shield_access_code": shield_access_code}
     async def save(
         session: AsyncSession,
         operation: OperationHandle,
@@ -300,6 +309,7 @@ async def _run_update_backend_operation(
     )
 
 
+@mutation_runner("update_backend_inputs")
 async def _run_update_backend_inputs_operation(
     settings: Settings,
     operation_id: int | None,
@@ -351,6 +361,7 @@ async def _run_update_backend_inputs_operation(
     )
 
 
+@mutation_runner("update_backend_state")
 async def _run_update_backend_state_operation(
     settings: Settings,
     operation_id: int | None,
@@ -397,6 +408,7 @@ async def _run_update_backend_state_operation(
     )
 
 
+@mutation_runner("update_backend_interface")
 async def _run_update_backend_interface_operation(
     settings: Settings,
     operation_id: int | None,
@@ -405,7 +417,6 @@ async def _run_update_backend_interface_operation(
     source_backend_id: int,
     interface_name: str,
     status: str,
-    direction: str,
 ) -> None:
     async def save(
         session: AsyncSession,
@@ -413,14 +424,15 @@ async def _run_update_backend_interface_operation(
         backend: Backend,
         backend_name: str,
     ) -> _OutputSaveResult:
+        peers = await inter_app_interface_peer_names(session, backend.id)
         await apply_inbound_inter_app_interface_statuses(
             session,
             target_backend_id=backend.id,
             source_backend_ids=[str(source_backend_id)],
             names=[interface_name],
             statuses=[status],
-            directions=[direction],
         )
+        peers |= await inter_app_interface_peer_names(session, backend.id)
         apply_response = await _commit_output_save_apply(
             session,
             settings,
@@ -428,13 +440,13 @@ async def _run_update_backend_interface_operation(
             operation_name="ui.backend.interface",
             backend_id=backend_id,
             backend_name=backend_name,
+            related_outputs=peers,
         )
         return _OutputSaveResult(
             apply_response=apply_response,
             backend_name=backend_name,
             extra_details={
                 "status": status,
-                "direction": direction,
                 "source_backend_id": source_backend_id,
                 "interface_name": interface_name,
             },
@@ -458,7 +470,6 @@ async def _run_update_backend_interface_operation(
             "source_backend_id": source_backend_id,
             "interface_name": interface_name,
             "status": status,
-            "direction": direction,
         },
         failure_extra={
             "source_backend_id": source_backend_id,

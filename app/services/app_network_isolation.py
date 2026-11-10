@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import ipaddress
 from pathlib import Path
 import tempfile
@@ -8,7 +9,13 @@ from typing import Any
 from app.config import Settings
 from app.logger import get_logger
 from app.services.commands import CommandError, CommandResult
-from app.services.guest_exec import run_backend_guest_command
+from app.services.observation import Absent, Present
+from app.services.guest_exec import (
+    EXEC_CIRCUIT_OPEN_RETURN_CODE,
+    EXEC_GUARD_BUSY_RETURN_CODE,
+    EXEC_GUARD_UNAVAILABLE_RETURN_CODE,
+    run_backend_guest_command,
+)
 from app.services.renderers import container_name, network_name
 from app.services.runtime_services import (
     AppRuntimeServices,
@@ -17,6 +24,7 @@ from app.services.runtime_services import (
 
 
 APP_ISOLATION_CHAIN = "CNC_APP_ISOLATION"
+CANARY_SOURCE_CONCURRENCY = 4
 logger = get_logger("app.network_isolation")
 
 
@@ -85,13 +93,28 @@ async def reconcile_app_network_isolation(
     network_subnets: dict[str, list[str]] = {}
     for backend_name in sorted(backend_names):
         network = network_name(backend_name)
-        _result, payload = services.inspect_network(
+        observation = services.inspect_network(
             network, settings.command_timeout_status_sec
         )
-        discovered = _network_subnets(payload)
-        if discovered:
-            network_subnets[network] = discovered
-            subnets.extend(discovered)
+        if isinstance(observation, Absent):
+            continue
+        discovered = (
+            _network_subnets(observation.value)
+            if isinstance(observation, Present)
+            else []
+        )
+        if not discovered:
+            detail = (
+                "no IPv4 subnets"
+                if isinstance(observation, Present)
+                else observation.describe()
+            )
+            raise RuntimeError(
+                f"cannot read subnets for {network} ({detail}); "
+                "isolation rules left unchanged"
+            )
+        network_subnets[network] = discovered
+        subnets.extend(discovered)
 
     subnets = list(dict.fromkeys(subnets))
     await _ensure_isolation_chain(subnets, settings, services=services)
@@ -158,7 +181,14 @@ def audit_app_network_isolation_guard(
 
 
 def _probe_unavailable(result: CommandResult) -> bool:
-    if result.returncode in {75, 124, 126, 127}:
+    if result.returncode in {
+        EXEC_CIRCUIT_OPEN_RETURN_CODE,
+        EXEC_GUARD_BUSY_RETURN_CODE,
+        EXEC_GUARD_UNAVAILABLE_RETURN_CODE,
+        124,
+        126,
+        127,
+    }:
         return True
     combined = f"{result.stderr}\n{result.stdout}".lower()
     markers = (
@@ -171,6 +201,118 @@ def _probe_unavailable(result: CommandResult) -> bool:
         "cannot exec",
     )
     return any(marker in combined for marker in markers)
+
+
+def _probe_from_source(
+    source: dict[str, object],
+    nodes: list[dict[str, object]],
+    settings: Settings,
+    services: AppRuntimeServices,
+) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
+    checks: list[dict[str, object]] = []
+    leaks: list[dict[str, object]] = []
+    unknown: list[dict[str, object]] = []
+    if not source["inspect_ok"]:
+        unknown.append(
+            {"backend": source["backend"], "reason": "source_container_unavailable"}
+        )
+        return checks, leaks, unknown
+    for target in nodes:
+        if source["backend"] == target["backend"]:
+            continue
+        dns_command = [
+            "getent",
+            "hosts",
+            str(target["container"]),
+        ]
+        dns_result = run_backend_guest_command(
+            str(source["backend"]),
+            settings,
+            dns_command,
+            timeout_sec=settings.command_timeout_status_sec,
+            command_runner=services.run_command,
+            source="network_isolation",
+        )
+        dns_resolved = dns_result.ok and bool((dns_result.stdout or "").strip())
+        if not dns_result.ok and _probe_unavailable(dns_result):
+            unknown.append(
+                {
+                    "source": source["backend"],
+                    "target": target["backend"],
+                    "reason": "dns_probe_unavailable",
+                    "detail": dns_result.stderr or dns_result.stdout,
+                }
+            )
+        if dns_resolved:
+            leaks.append(
+                {
+                    "source": source["backend"],
+                    "target": target["backend"],
+                    "check": "dns",
+                    "detail": (dns_result.stdout or "").strip(),
+                }
+            )
+
+        target_address = str(target.get("address") or "")
+        target_port = int(target.get("handoff_port") or 0)
+        if not target["inspect_ok"] or not target_address or target_port <= 0:
+            unknown.append(
+                {
+                    "source": source["backend"],
+                    "target": target["backend"],
+                    "reason": "target_private_endpoint_unavailable",
+                }
+            )
+            continue
+
+        connect_command = [
+            "curl",
+            "-sS",
+            "-o",
+            "/dev/null",
+            "--connect-timeout",
+            "2",
+            "--max-time",
+            "3",
+            "-w",
+            "%{http_code}",
+            f"http://{target_address}:{target_port}/",
+        ]
+        connect_result = run_backend_guest_command(
+            str(source["backend"]),
+            settings,
+            connect_command,
+            timeout_sec=settings.command_timeout_status_sec,
+            command_runner=services.run_command,
+            source="network_isolation",
+        )
+        connected = connect_result.ok
+        if not connect_result.ok and _probe_unavailable(connect_result):
+            unknown.append(
+                {
+                    "source": source["backend"],
+                    "target": target["backend"],
+                    "reason": "connect_probe_unavailable",
+                    "detail": connect_result.stderr or connect_result.stdout,
+                }
+            )
+        check = {
+            "source": source["backend"],
+            "target": target["backend"],
+            "dns_resolved": dns_resolved,
+            "private_connect_ok": connected,
+        }
+        checks.append(check)
+        if connected:
+            leaks.append(
+                {
+                    "source": source["backend"],
+                    "target": target["backend"],
+                    "check": "private_connect",
+                    "detail": (connect_result.stdout or "").strip() or "connected",
+                }
+            )
+    return checks, leaks, unknown
 
 
 def collect_app_network_isolation_canary(
@@ -187,9 +329,10 @@ def collect_app_network_isolation_canary(
         ):
             continue
         container = container_name(str(getattr(backend, "name", "")))
-        result, payload = services.inspect_container(
+        observation = services.inspect_container(
             container, settings.command_timeout_status_sec
         )
+        payload = observation.value if isinstance(observation, Present) else None
         address = _container_ipv4(payload)
         nodes.append(
             {
@@ -197,114 +340,24 @@ def collect_app_network_isolation_canary(
                 "container": container,
                 "address": address or "",
                 "handoff_port": int(getattr(backend, "handoff_port", 0) or 0),
-                "inspect_ok": result.ok and isinstance(payload, dict),
+                "inspect_ok": payload is not None,
             }
         )
 
     checks: list[dict[str, object]] = []
     leaks: list[dict[str, object]] = []
     unknown: list[dict[str, object]] = []
-    for source in nodes:
-        if not source["inspect_ok"]:
-            unknown.append(
-                {"backend": source["backend"], "reason": "source_container_unavailable"}
-            )
-            continue
-        for target in nodes:
-            if source["backend"] == target["backend"]:
-                continue
-            dns_command = [
-                "getent",
-                "hosts",
-                str(target["container"]),
-            ]
-            dns_result = run_backend_guest_command(
-                str(source["backend"]),
-                settings,
-                dns_command,
-                timeout_sec=settings.command_timeout_status_sec,
-                command_runner=services.run_command,
-                source="network_isolation",
-            )
-            dns_resolved = dns_result.ok and bool((dns_result.stdout or "").strip())
-            if not dns_result.ok and _probe_unavailable(dns_result):
-                unknown.append(
-                    {
-                        "source": source["backend"],
-                        "target": target["backend"],
-                        "reason": "dns_probe_unavailable",
-                        "detail": dns_result.stderr or dns_result.stdout,
-                    }
-                )
-            if dns_resolved:
-                leaks.append(
-                    {
-                        "source": source["backend"],
-                        "target": target["backend"],
-                        "check": "dns",
-                        "detail": (dns_result.stdout or "").strip(),
-                    }
-                )
-
-            target_address = str(target.get("address") or "")
-            target_port = int(target.get("handoff_port") or 0)
-            if not target["inspect_ok"] or not target_address or target_port <= 0:
-                unknown.append(
-                    {
-                        "source": source["backend"],
-                        "target": target["backend"],
-                        "reason": "target_private_endpoint_unavailable",
-                    }
-                )
-                continue
-
-            connect_command = [
-                "curl",
-                "-sS",
-                "-o",
-                "/dev/null",
-                "--connect-timeout",
-                "2",
-                "--max-time",
-                "3",
-                "-w",
-                "%{http_code}",
-                f"http://{target_address}:{target_port}/",
-            ]
-            connect_result = run_backend_guest_command(
-                str(source["backend"]),
-                settings,
-                connect_command,
-                timeout_sec=settings.command_timeout_status_sec,
-                command_runner=services.run_command,
-                source="network_isolation",
-            )
-            connected = connect_result.ok
-            if not connect_result.ok and _probe_unavailable(connect_result):
-                unknown.append(
-                    {
-                        "source": source["backend"],
-                        "target": target["backend"],
-                        "reason": "connect_probe_unavailable",
-                        "detail": connect_result.stderr or connect_result.stdout,
-                    }
-                )
-            check = {
-                "source": source["backend"],
-                "target": target["backend"],
-                "dns_resolved": dns_resolved,
-                "private_connect_ok": connected,
-            }
-            checks.append(check)
-            if connected:
-                leaks.append(
-                    {
-                        "source": source["backend"],
-                        "target": target["backend"],
-                        "check": "private_connect",
-                        "detail": (connect_result.stdout or "").strip() or "connected",
-                    }
-                )
+    # Probes from one guest stay sequential, behind that guest's exec guard;
+    # different guests are probed concurrently so the check scales with the
+    # number of apps rather than the number of pairs.
+    with ThreadPoolExecutor(max_workers=CANARY_SOURCE_CONCURRENCY) as pool:
+        for source_checks, source_leaks, source_unknown in pool.map(
+            lambda source: _probe_from_source(source, nodes, settings, services),
+            nodes,
+        ):
+            checks.extend(source_checks)
+            leaks.extend(source_leaks)
+            unknown.extend(source_unknown)
 
     return {
         "checked": True,
@@ -324,82 +377,51 @@ async def _ensure_isolation_chain(
     *,
     services: AppRuntimeServices,
 ) -> None:
-    snapshot_result = services.run_command(
-        ["iptables-save"],
+    """Publish the whole isolation policy in one iptables transaction.
+
+    Flushing the live chain and appending rules one at a time leaves apps able
+    to reach each other until the last rule lands, and a cancellation in
+    between leaves them open indefinitely. ``iptables-restore --noflush``
+    swaps the filter table in a single commit: the old policy holds until the
+    new one is complete, and a rejected transaction changes nothing. Rules
+    outside this chain and its FORWARD jump are left as they are.
+    """
+    current = services.run_command(
+        ["iptables-save", "-t", "filter"],
         settings.command_timeout_apply_sec,
     )
-    if not snapshot_result.ok:
-        raise CommandError(snapshot_result)
-
-    create_result = services.run_command(
-        ["iptables", "-N", APP_ISOLATION_CHAIN],
-        settings.command_timeout_apply_sec,
+    if not current.ok:
+        raise CommandError(current)
+    jump = f"-A FORWARD -j {APP_ISOLATION_CHAIN}"
+    existing_jumps = sum(
+        1 for line in (current.stdout or "").splitlines() if line.strip() == jump
     )
-    if (
-        not create_result.ok
-        and "already exists" not in (create_result.stderr or "").lower()
-    ):
-        raise CommandError(create_result)
-
-    try:
-        await services.run_command_checked_async(
-            ["iptables", "-F", APP_ISOLATION_CHAIN],
-            timeout_sec=settings.command_timeout_apply_sec,
-        )
-        for source in subnets:
-            for destination in subnets:
-                if source == destination:
-                    continue
-                await services.run_command_checked_async(
-                    [
-                        "iptables",
-                        "-A",
-                        APP_ISOLATION_CHAIN,
-                        "-s",
-                        source,
-                        "-d",
-                        destination,
-                        "-j",
-                        "REJECT",
-                    ],
-                    timeout_sec=settings.command_timeout_apply_sec,
-                )
-
-        for _ in range(20):
-            delete_result = services.run_command(
-                ["iptables", "-D", "FORWARD", "-j", APP_ISOLATION_CHAIN],
-                settings.command_timeout_apply_sec,
-            )
-            if not delete_result.ok:
-                break
-        await services.run_command_checked_async(
-            ["iptables", "-I", "FORWARD", "1", "-j", APP_ISOLATION_CHAIN],
-            timeout_sec=settings.command_timeout_apply_sec,
-        )
-    except Exception:
-        restore_result = _restore_iptables_snapshot(
-            snapshot_result.stdout,
-            settings,
-            services=services,
-        )
+    lines = ["*filter", f":{APP_ISOLATION_CHAIN} - [0:0]"]
+    lines.extend(
+        f"-A {APP_ISOLATION_CHAIN} -s {source} -d {destination} -j REJECT"
+        for source in subnets
+        for destination in subnets
+        if source != destination
+    )
+    lines.extend(f"-D FORWARD -j {APP_ISOLATION_CHAIN}" for _ in range(existing_jumps))
+    lines.extend([f"-I FORWARD 1 -j {APP_ISOLATION_CHAIN}", "COMMIT", ""])
+    result = _iptables_restore_noflush("\n".join(lines), settings, services=services)
+    if not result.ok:
         logger.warning(
-            "app.network_isolation.rollback_after_reconcile_failure",
+            "app.network_isolation.transaction_rejected",
             chain=APP_ISOLATION_CHAIN,
             subnet_count=len(subnets),
-            restore_ok=restore_result.ok,
-            restore_stderr=restore_result.stderr,
+            stderr=result.stderr,
         )
-        if not restore_result.ok:
-            raise CommandError(restore_result)
-        raise
+        raise CommandError(result)
 
 
-def _restore_iptables_snapshot(
-    snapshot: str,
+def _iptables_restore_noflush(
+    rules: str,
     settings: Settings,
     *,
     services: AppRuntimeServices,
-):
+) -> CommandResult:
     temp_name = ""
     try:
         with tempfile.NamedTemporaryFile(
@@ -410,19 +432,17 @@ def _restore_iptables_snapshot(
             delete=False,
         ) as handle:
             temp_name = handle.name
-            handle.write(snapshot)
-            if snapshot and not snapshot.endswith("\n"):
-                handle.write("\n")
+            handle.write(rules)
         return services.run_command(
-            ["iptables-restore", temp_name],
+            ["iptables-restore", "--noflush", temp_name],
             settings.command_timeout_apply_sec,
         )
     except OSError as exc:
         return CommandResult(
-            ["iptables-restore", "<snapshot>"],
+            ["iptables-restore", "--noflush", "<rules>"],
             1,
             "",
-            f"iptables snapshot restore file failed: {exc}",
+            f"iptables rules file failed: {exc}",
         )
     finally:
         if temp_name:
@@ -430,6 +450,6 @@ def _restore_iptables_snapshot(
                 Path(temp_name).unlink()
             except OSError:
                 logger.warning(
-                    "app.network_isolation.restore_snapshot_cleanup_failed",
+                    "app.network_isolation.rules_file_cleanup_failed",
                     path=temp_name,
                 )

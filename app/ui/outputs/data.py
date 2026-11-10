@@ -1,4 +1,3 @@
-"""Output resource-profile queries."""
 
 from __future__ import annotations
 
@@ -65,6 +64,33 @@ class OutputPageData:
     placement_readiness: dict[str, ReplicaReadinessStatus]
 
 
+async def load_shield_configuration(
+    session: AsyncSession, settings: Settings, *, output_kind: str
+) -> tuple[list[Backend], list[Input]]:
+    backends = list(
+        (
+            await session.scalars(
+                select(Backend).where(Backend.kind == "shield").limit(1)
+            )
+        ).all()
+    )
+    inputs = (
+        list(
+            (
+                await session.scalars(
+                    select(Input)
+                    .options(selectinload(Input.backends))
+                    .where(Input.kind == "shield")
+                    .order_by(Input.id.asc())
+                )
+            ).all()
+        )
+        if settings.shield_enabled or output_kind == "shield"
+        else []
+    )
+    return backends, inputs
+
+
 async def load_output_page_data(
     session: AsyncSession,
     settings: Settings,
@@ -86,7 +112,7 @@ async def load_output_page_data(
         settings, await enabled_runtime_backends_for_resource_profile(session)
     )
 
-    cached_status_payload = peek_cached_status() if prefer_cached_runtime else None
+    cached_status_payload = peek_cached_status()
     runtime_diagnostics: dict[str, object] | None = None
     if backend.kind == "app":
         if prefer_cached_runtime:
@@ -100,30 +126,8 @@ async def load_output_page_data(
                 collect_app_backend_diagnostics, backend, settings
             )
 
-    shield_backends = list(
-        (
-            await session.execute(
-                select(Backend).where(Backend.kind == "shield").limit(1)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    shield_inputs = (
-        list(
-            (
-                await session.execute(
-                    select(Input)
-                    .options(selectinload(Input.backends))
-                    .where(Input.kind == "shield")
-                    .order_by(Input.id.asc())
-                )
-            )
-            .scalars()
-            .all()
-        )
-        if settings.shield_enabled or backend.kind == "shield"
-        else []
+    shield_backends, shield_inputs = await load_shield_configuration(
+        session, settings, output_kind=backend.kind
     )
     total_input_count = int(
         (await session.execute(select(func.count(Input.id)))).scalar_one() or 0

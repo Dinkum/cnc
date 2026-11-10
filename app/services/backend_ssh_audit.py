@@ -186,8 +186,6 @@ def start_backend_ssh_audit_listener(
         handle.bind((AUDIT_LISTEN_HOST, port))
     except OSError as exc:
         handle.close()
-        # OpenSSH's own journal remains authoritative if this best-effort mirror
-        # cannot bind. CNC availability must not depend on telemetry delivery.
         logger.warning(
             "backend.ssh.audit_listener.unavailable",
             host=AUDIT_LISTEN_HOST,

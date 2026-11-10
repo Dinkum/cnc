@@ -1,4 +1,3 @@
-"""HTTP responses, flash cookies, template rendering, and bounded upload copying."""
 
 from __future__ import annotations
 

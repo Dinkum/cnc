@@ -1,4 +1,3 @@
-"""Coalesce chart requests and bound work before opening database connections."""
 
 from __future__ import annotations
 
@@ -20,8 +19,6 @@ class _HistoryRequests:
     tasks: dict[Hashable, asyncio.Task[HistoryResponse]] = field(default_factory=dict)
 
 
-# Distinct requests have a short bounded queue; matching requests share one build.
-# A running build owns its session and survives cancellation of any one caller.
 _MAX_PENDING = 8
 _REQUESTS: dict[asyncio.AbstractEventLoop, _HistoryRequests] = {}
 
@@ -53,7 +50,6 @@ async def run_metric_history_request(
             state.tasks.pop(key, None)
             if not state.tasks and _REQUESTS.get(loop) is state:
                 _REQUESTS.pop(loop, None)
-            # The last HTTP caller may have disconnected; always retrieve errors.
             if not done.cancelled():
                 done.exception()
 
@@ -69,5 +65,4 @@ async def cancel_metric_history_requests() -> None:
     for task in tasks:
         task.cancel()
     if tasks:
-        # BoundedThreadWorker drains active calculation threads before releasing.
         await asyncio.gather(*tasks, return_exceptions=True)

@@ -70,7 +70,6 @@ def render_shield_quadlet(settings: Settings) -> str:
 
 
 def render_shield_env(settings: Settings) -> str:
-    # Podman EnvironmentFile does not unquote values — write bare values only.
     values = {
         "SHIELD_SECRET_KEY": settings.shield_secret_key,
         "SHIELD_ACCESS_CODE_HASH": settings.shield_access_code_hash,

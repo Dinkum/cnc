@@ -101,9 +101,6 @@ async def apply_async(settings: Settings) -> CommandResult:
     from app.services.config_change import full_reconcile
 
     async with SessionLocal() as session:
-        # The CLI apply is the explicit whole-host reconcile. It is the only
-        # entry point permitted to repair things nobody specifically asked
-        # about; every ordinary save is scoped to what it changed.
         response = await run_apply(
             session,
             settings,

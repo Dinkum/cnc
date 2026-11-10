@@ -1,4 +1,4 @@
-from typing import Annotated, Optional
+from typing import Annotated, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -14,6 +14,7 @@ class InputIn(BaseModel):
     backend_ids: list[int] = Field(default_factory=list)
     enabled: bool = True
     https_enabled: bool = False
+    connection: Literal["public_ip", "cloudflare_tunnel"] = "public_ip"
     shield_enabled: bool = False
     shield_code_hash: Optional[str] = None
     shield_access_code: Optional[str] = None
@@ -35,6 +36,7 @@ class InputUpdate(BaseModel):
     backend_ids: Optional[list[int]] = None
     enabled: UpdateValue[bool] = None
     https_enabled: UpdateValue[bool] = None
+    connection: UpdateValue[Literal["public_ip", "cloudflare_tunnel"]] = None
     shield_enabled: UpdateValue[bool] = None
     shield_code_hash: Optional[str] = None
     shield_access_code: Optional[str] = None
@@ -65,6 +67,7 @@ class InputOut(BaseModel):
     backend_ids: list[int]
     enabled: bool
     https_enabled: bool
+    connection: str
     https_provider: str
     cloudflare_dns_enabled: bool
     cloudflare_dns_ipv4: Optional[str]

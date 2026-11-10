@@ -187,8 +187,8 @@ def _parse_admin_log_entries(lines: list[str]) -> list[dict[str, object]]:
                     "message": "",
                     "category": block_header_match.group("category").strip(),
                 }
-            else:
-                current_header = legacy_header_match.groupdict()  # type: ignore[union-attr]
+            elif legacy_header_match is not None:
+                current_header = legacy_header_match.groupdict()
                 current_header["category"] = ""
             current_lines = [line]
             continue

@@ -68,7 +68,15 @@ from app.services.bootstrap_state import (
     write_bootstrap_state,
     write_failure_artifact,
 )
-from app.services.commands import CommandError
+from app.services.commands import CommandError, CommandResult
+from app.services.container_runtime import classify_listing
+from app.services.observation import (
+    Observation,
+    ObservationUnavailable,
+    Unknown,
+    known,
+    present_value,
+)
 from app.services.guest_exec import (
     EXEC_CIRCUIT_OPEN_RETURN_CODE,
     EXEC_GUARD_BUSY_RETURN_CODE,
@@ -97,10 +105,12 @@ from app.services.systemd_memory import (
     SystemdMemoryPolicyError,
     converge_systemd_memory_policy,
 )
+from app.services.thread_workers import BoundedThreadWorker
 from app.services.validators import ensure_backend_name, parse_volumes_json
 
 
 logger = get_logger("apply.runtime")
+_filesystem_workers = BoundedThreadWorker(2)
 
 _RUNTIME_GUEST_EXEC_GUARD_WAIT_SEC = 0.25
 _TERMINAL_GUEST_EXEC_OUTCOMES = {
@@ -168,10 +178,6 @@ async def apply_app_backends(
     selected_backend_names: set[str] | None = None,
     cleanup_deleted: bool = True,
     cleanup_deleted_filesystem: bool = True,
-    #: Which absent runtimes this call may remove. None means every one, which
-    #: is what a full reconcile wants. A scoped save passes the outputs it
-    #: concerns, so deleting one output cannot also tear down a runtime whose
-    #: row is momentarily missing for an unrelated reason.
     removable_backend_names: set[str] | None = None,
     reconcile_network_isolation: bool = True,
     operation_id: int | None = None,
@@ -407,7 +413,7 @@ async def _cleanup_deleted_app_runtime(
                 "json",
             ],
             settings.command_timeout_status_sec,
-        ).stdout
+        )
     ):
         backend_name = _entry_backend_label(entry)
         if not backend_name or backend_name in desired_app_names:
@@ -416,8 +422,6 @@ async def _cleanup_deleted_app_runtime(
             removable_backend_names is not None
             and backend_name not in removable_backend_names
         ):
-            # Absent from desired state but not this change's to remove. A
-            # scoped save leaves it for the reconcile that owns it.
             continue
         deleted_backend_names.add(backend_name)
         target = _entry_primary_name(entry) or _entry_id(entry)
@@ -440,7 +444,7 @@ async def _cleanup_deleted_app_runtime(
                 "json",
             ],
             settings.command_timeout_status_sec,
-        ).stdout
+        )
     ):
         if _entry_label(entry, "io.cnc.kind") == "interface":
             continue
@@ -451,8 +455,6 @@ async def _cleanup_deleted_app_runtime(
             removable_backend_names is not None
             and backend_name not in removable_backend_names
         ):
-            # Absent from desired state but not this change's to remove. A
-            # scoped save leaves it for the reconcile that owns it.
             continue
         deleted_backend_names.add(backend_name)
         target = _entry_primary_name(entry) or _entry_id(entry)
@@ -467,9 +469,6 @@ async def _cleanup_deleted_app_runtime(
 
     quadlet_files_removed: list[str] = []
     legacy_reboot_bridges_removed: list[str] = []
-    # Orphaned Quadlet units get the same filter as containers and networks.
-    # Without it a scoped delete swept up every unit whose row was absent,
-    # including outputs this change was never meant to touch.
     deleted_backend_names.update(
         backend_name
         for backend_name in managed_quadlet_backend_names(settings)
@@ -498,8 +497,6 @@ async def _cleanup_deleted_app_runtime(
         or legacy_reboot_bridges_removed
     ):
         await _systemctl_daemon_reload(settings, services=services)
-    # Guest filesystems are the least recoverable thing CNC removes, so the
-    # scope filter matters most here.
     filesystem_artifacts_removed = (
         _cleanup_deleted_app_filesystem_artifacts(
             desired_app_names, settings, removable=removable_backend_names
@@ -537,7 +534,7 @@ async def _cleanup_stale_interface_runtime(
                 "json",
             ],
             settings.command_timeout_status_sec,
-        ).stdout
+        )
     ):
         if _entry_label(entry, "io.cnc.kind") != "interface":
             continue
@@ -570,12 +567,6 @@ def _cleanup_deleted_app_filesystem_artifacts(
     *,
     removable: set[str] | None = None,
 ) -> list[str]:
-    """Remove guest storage for outputs desired state no longer names.
-
-    ``removable`` narrows that to the outputs the change actually concerns.
-    Destroying another output's guest filesystem is the least recoverable
-    mistake CNC can make, so a scoped save never reaches past its own.
-    """
     backend_names: set[str] = set()
     if settings.app_control_dir.exists():
         for path in settings.app_control_dir.iterdir():
@@ -603,7 +594,7 @@ async def remove_deleted_app_filesystem_artifacts(
     backend_names: set[str], settings: Settings
 ) -> list[str]:
     """Remove marked persistent state for exact, already-committed deletions."""
-    return await asyncio.to_thread(
+    return await _filesystem_workers.run(
         _remove_deleted_app_filesystem_artifacts, set(backend_names), settings
     )
 
@@ -678,14 +669,20 @@ def _app_healthcheck_failures(
     return failures
 
 
-def _managed_podman_entries(stdout: str) -> list[dict[str, Any]]:
-    try:
-        payload = json.loads(stdout or "[]")
-    except json.JSONDecodeError:
-        return []
-    if not isinstance(payload, list):
-        return []
-    return [entry for entry in payload if isinstance(entry, dict)]
+def _managed_podman_entries(result: CommandResult) -> list[dict[str, Any]]:
+    observation = classify_listing(result)
+    if isinstance(observation, Unknown):
+        raise ApplyFailed(
+            f"cannot list managed Podman objects ({observation.describe()}); "
+            "cleanup left unchanged",
+            phase="app_runtime",
+            details={
+                "command": result.command,
+                "observation_reason": observation.reason,
+                "observation_detail": observation.detail,
+            },
+        )
+    return observation.value
 
 
 def _entry_backend_label(entry: dict[str, Any]) -> str:
@@ -694,6 +691,8 @@ def _entry_backend_label(entry: dict[str, Any]) -> str:
 
 def _entry_label(entry: dict[str, Any], key: str) -> str:
     labels = entry.get("Labels")
+    if not isinstance(labels, dict):
+        labels = entry.get("labels")
     if isinstance(labels, dict):
         return str(labels.get(key) or "").strip()
     return ""
@@ -707,12 +706,17 @@ def _entry_primary_name(entry: dict[str, Any]) -> str:
                 return name
     if isinstance(names, str) and names:
         return names
-    name = entry.get("Name")
+    name = entry.get("Name") or entry.get("name")
     return name if isinstance(name, str) else ""
 
 
 def _entry_id(entry: dict[str, Any]) -> str:
-    value = entry.get("Id") or entry.get("ID") or entry.get("NetworkID")
+    value = (
+        entry.get("Id")
+        or entry.get("ID")
+        or entry.get("NetworkID")
+        or entry.get("id")
+    )
     return value if isinstance(value, str) else ""
 
 
@@ -1359,6 +1363,28 @@ async def _self_test_guest_rootfs(
     return self_test_steps
 
 
+def _unpack_guest_seed_archive(
+    export_tar: Path, extracted_rootfs: Path, preserved_root: Path
+) -> list[str]:
+    with tarfile.open(export_tar, "r:*") as archive:
+        safe_extract_tar(
+            archive,
+            extracted_rootfs,
+            allow_relative_symlinks=True,
+            guest_symlink_roots={PurePosixPath()},
+            guest_metadata_roots={PurePosixPath()},
+        )
+    # Exported images may omit a root-directory entry. The extractor's
+    # private staging mode must not become guest /: nonroot services need
+    # traversal. Its enclosing TemporaryDirectory and sandbox stay private.
+    extracted_rootfs.chmod(0o755)
+    (extracted_rootfs / "etc").mkdir(parents=True, exist_ok=True)
+    machine_id_path = extracted_rootfs / "etc/machine-id"
+    if not machine_id_path.exists():
+        machine_id_path.write_text("", encoding="utf-8")
+    return _restore_guest_systemd_state(extracted_rootfs, preserved_root)
+
+
 async def _seed_persistent_guest_rootfs(
     backend: Backend,
     settings: Settings,
@@ -1367,8 +1393,6 @@ async def _seed_persistent_guest_rootfs(
     allow_reseed: bool = False,
 ) -> dict[str, Any]:
     expected_profile = _expected_profile_state(backend)
-    # The shared directory is traversable; each root-owned guest directory is
-    # private and receives only its allocated UID's traversal ACL at startup.
     protect_sandbox_directory(settings.app_sandbox_dir)
     settings.app_sandbox_dir.chmod(0o755)
     sandbox_dir = app_sandbox_rootfs_path(settings, backend.name).parent
@@ -1434,7 +1458,9 @@ async def _seed_persistent_guest_rootfs(
         preserved_root = temp_dir / "preserved"
         preserved_steps: list[str] = []
         if rootfs_reseed_required:
-            preserved_steps = _preserve_guest_systemd_state(rootfs_dir, preserved_root)
+            preserved_steps = await _filesystem_workers.run(
+                _preserve_guest_systemd_state, rootfs_dir, preserved_root
+            )
         temp_container = f"{container_name(backend.name)}-seed-{temp_dir.name[-8:]}"
         export_tar = temp_dir / "guest-rootfs.tar"
         extracted_rootfs = temp_dir / "rootfs"
@@ -1487,21 +1513,15 @@ async def _seed_persistent_guest_rootfs(
                 settings, backend, "seed_container_remove", "succeeded"
             )
         _record_guest_seed_step(settings, backend, "seed_archive_extract", "running")
-        with tarfile.open(export_tar, "r:*") as archive:
-            safe_extract_tar(
-                archive,
+        preserved_steps.extend(
+            await _filesystem_workers.run(
+                _unpack_guest_seed_archive,
+                export_tar,
                 extracted_rootfs,
-                allow_relative_symlinks=True,
-                guest_symlink_roots={PurePosixPath()},
-                guest_metadata_roots={PurePosixPath()},
+                preserved_root,
             )
-        # Exported images may omit a root-directory entry. The extractor's
-        # private staging mode must not become guest /: nonroot services need
-        # traversal. Its enclosing TemporaryDirectory and sandbox stay private.
-        extracted_rootfs.chmod(0o755)
+        )
         _record_guest_seed_step(settings, backend, "seed_archive_extract", "succeeded")
-        (extracted_rootfs / "etc").mkdir(parents=True, exist_ok=True)
-        machine_id_path = extracted_rootfs / "etc/machine-id"
         _record_app_reconcile_step(
             settings,
             backend,
@@ -1509,11 +1529,6 @@ async def _seed_persistent_guest_rootfs(
             substep="guest_identity_prepare",
             status="succeeded",
             kind="seed",
-        )
-        if not machine_id_path.exists():
-            machine_id_path.write_text("", encoding="utf-8")
-        preserved_steps.extend(
-            _restore_guest_systemd_state(extracted_rootfs, preserved_root)
         )
         if preserved_steps:
             _record_app_reconcile_step(
@@ -1541,7 +1556,9 @@ async def _seed_persistent_guest_rootfs(
                 )
             )
         except Exception:
-            shutil.rmtree(extracted_rootfs, ignore_errors=True)
+            await _filesystem_workers.run(
+                shutil.rmtree, extracted_rootfs, ignore_errors=True
+            )
             raise
 
         had_existing_rootfs = rootfs_dir.exists()
@@ -1584,7 +1601,9 @@ async def _seed_persistent_guest_rootfs(
             raise
         _record_guest_seed_step(settings, backend, "rootfs_activate", "succeeded")
         if quarantine_rootfs is None:
-            shutil.rmtree(rollback_rootfs, ignore_errors=True)
+            await _filesystem_workers.run(
+                shutil.rmtree, rollback_rootfs, ignore_errors=True
+            )
         else:
             logger.warning(
                 "app.rootfs_reseed.quarantine_retained",
@@ -1784,6 +1803,28 @@ def _container_is_quadlet_managed(inspect_payload: dict[str, Any] | None) -> boo
     return bool(labels.get("PODMAN_SYSTEMD_UNIT"))
 
 
+def _known_or_fail(
+    observation: Observation[dict[str, Any]],
+    subject: str,
+    *,
+    backend_name: str,
+    phase: str,
+) -> dict[str, Any] | None:
+    try:
+        return known(observation, subject)
+    except ObservationUnavailable as exc:
+        raise ApplyFailed(
+            f"app backend {backend_name}: {exc}",
+            phase=phase,
+            details={
+                "backend": backend_name,
+                "observation": subject,
+                "observation_reason": exc.unknown.reason,
+                "observation_detail": exc.unknown.detail,
+            },
+        ) from exc
+
+
 def _container_requires_quadlet_migration(
     current_spec: dict[str, Any],
     inspect_payload: dict[str, Any] | None,
@@ -1834,9 +1875,11 @@ def legacy_direct_podman_migration_backend_reasons(
         bridge_path = _legacy_reboot_bridge_path(settings, container_name(backend.name))
         if not bridge_path.exists():
             continue
-        _inspect_result, inspect_payload = services.inspect_container(
-            container_name(backend.name),
-            timeout_sec=settings.command_timeout_status_sec,
+        inspect_payload = present_value(
+            services.inspect_container(
+                container_name(backend.name),
+                timeout_sec=settings.command_timeout_status_sec,
+            )
         )
         if _container_requires_quadlet_migration(
             current_spec, inspect_payload, settings, container_name(backend.name)
@@ -1921,7 +1964,6 @@ class AppRuntimeReconciler:
             read_saved_spec(settings, backend.name),
             self.current_spec,
         )
-        self.inspect_result = None
         self.inspect_payload = None
         self.network_payload = None
         self.create_action = "reuse"
@@ -1973,7 +2015,6 @@ class AppRuntimeReconciler:
         actions.extend(f"removed {name}" for name in removed_artifacts)
 
         self.saved_spec = None
-        self.inspect_result = None
         self.inspect_payload = None
         self.create_action = "create"
 
@@ -2151,8 +2192,6 @@ class AppRuntimeReconciler:
         self._isolation_rollback_dir = backup
 
     async def _restore_previous_isolation_runtime(self) -> None:
-        # Only runtime artifacts changed: idmapped storage needs no recursive
-        # ownership conversion, so the previous Quadlet can reuse the same data.
         self.remove_runtime_on_apply_failure = False
         await _stop_app_quadlet_backend(
             self.backend.name, self.settings, services=self.services
@@ -2184,22 +2223,33 @@ class AppRuntimeReconciler:
             policy, parse_volumes_json(self.backend.volumes_json)
         )
         guest_volume_arguments(volumes)
-        # Fail before stopping an existing guest if the host cannot prepare the
-        # confined runtime. ExecStartPre repeats this after host reboot.
         await self.services.run_command_checked_async(
             [str(self.settings.guest_runtime_helper_path)]
             + [arg for volume in volumes for arg in ("--volume", volume)],
             timeout_sec=self.settings.command_timeout_apply_sec,
         )
-        self.inspect_result, self.inspect_payload = self.services.inspect_container(
-            self.container,
-            timeout_sec=self.settings.command_timeout_status_sec,
+        self.inspect_payload = _known_or_fail(
+            self.services.inspect_container(
+                self.container,
+                timeout_sec=self.settings.command_timeout_status_sec,
+            ),
+            f"container {self.container}",
+            backend_name=self.backend.name,
+            phase="app_create",
         )
-        _network_result, self.network_payload = self.services.inspect_network(
-            self.network,
-            timeout_sec=self.settings.command_timeout_status_sec,
+        self.network_payload = _known_or_fail(
+            self.services.inspect_network(
+                self.network,
+                timeout_sec=self.settings.command_timeout_status_sec,
+            ),
+            f"network {self.network}",
+            backend_name=self.backend.name,
+            phase="app_network",
         )
         container_exists = self.inspect_payload is not None
+        guest_state_preexisting = _sandbox_dir_has_runtime_artifacts(
+            app_sandbox_rootfs_path(self.settings, self.backend.name).parent
+        )
         if (
             container_exists
             and self.saved_spec is not None
@@ -2231,7 +2281,7 @@ class AppRuntimeReconciler:
                         },
                     )
             self.create_action = "create"
-            self.remove_runtime_on_apply_failure = self.saved_spec is None
+            self.remove_runtime_on_apply_failure = not guest_state_preexisting
         elif self.saved_spec is None:
             auto_repair_details = await self._auto_repair_prepare_drift(
                 reason="missing_saved_spec",
@@ -2247,11 +2297,6 @@ class AppRuntimeReconciler:
                     details={
                         "backend": self.backend.name,
                         "container": self.container,
-                        "stderr": clip_output(
-                            self.inspect_result.stderr
-                            if self.inspect_result is not None
-                            else ""
-                        ),
                         "runtime_diagnostics": runtime_diagnostics,
                     },
                 )
@@ -2669,9 +2714,14 @@ class AppRuntimeReconciler:
         }
 
     async def _publish_phase(self) -> dict[str, Any]:
-        _, self.inspect_payload = self.services.inspect_container(
-            self.container,
-            timeout_sec=self.settings.command_timeout_status_sec,
+        self.inspect_payload = _known_or_fail(
+            self.services.inspect_container(
+                self.container,
+                timeout_sec=self.settings.command_timeout_status_sec,
+            ),
+            f"container {self.container}",
+            backend_name=self.backend.name,
+            phase="app_network",
         )
         target_ip = container_ipv4_address(self.backend, self.inspect_payload)
         if target_ip is None:
@@ -2770,9 +2820,14 @@ def _app_container_running(
     services: AppRuntimeServices | None = None,
 ) -> bool:
     services = services or default_app_runtime_services()
-    _, payload = services.inspect_container(
-        container_name(backend.name),
-        timeout_sec=settings.command_timeout_status_sec,
+    payload = _known_or_fail(
+        services.inspect_container(
+            container_name(backend.name),
+            timeout_sec=settings.command_timeout_status_sec,
+        ),
+        f"container {container_name(backend.name)}",
+        backend_name=backend.name,
+        phase="app_create",
     )
     state = payload.get("State") if isinstance(payload, dict) else {}
     if not isinstance(state, dict):
@@ -2828,8 +2883,6 @@ def _guest_systemd_state(
 ) -> dict[str, Any]:
     services = services or default_app_runtime_services()
     wait_arg = " --wait" if wait else ""
-    # `is-system-running --wait` still fails immediately before the guest bus exists.
-    # Keep that transient startup race inside the one already-bounded exec session.
     manager_wait = (
         "until systemctl show-environment >/dev/null 2>&1; do sleep 0.1; done; "
         if wait
@@ -2944,11 +2997,17 @@ def _normalize_saved_spec(
 ) -> dict[str, Any] | None:
     if saved_spec is None:
         return None
-    # Older releases may have persisted a partial runtime spec. Missing keys are
-    # schema drift, not a requested rebuild, so backfill them from current state.
     normalized = dict(saved_spec)
-    # A missing policy means the old runtime had no reviewed hardening overrides.
     normalized.setdefault("hardening", {})
+    # Interfaces once carried a "direction" that never reached the runtime.
+    # Dropping it from older specs keeps its removal from forcing a rebuild.
+    if isinstance(normalized.get("inter_app_interfaces"), list):
+        normalized["inter_app_interfaces"] = [
+            {key: value for key, value in item.items() if key != "direction"}
+            if isinstance(item, dict)
+            else item
+            for item in normalized["inter_app_interfaces"]
+        ]
     if "guest_isolation_revision" in current_spec:
         normalized.setdefault("guest_isolation_revision", 0)
     for key, value in current_spec.items():
@@ -3075,9 +3134,11 @@ async def _bootstrap_app_backend(
             backend=backend.name,
             container=container,
         )
-    _inspect_result, inspect_payload = services.inspect_container(
-        container,
-        timeout_sec=settings.command_timeout_status_sec,
+    inspect_payload = present_value(
+        services.inspect_container(
+            container,
+            timeout_sec=settings.command_timeout_status_sec,
+        )
     )
     container_id = (
         inspect_payload.get("Id") if isinstance(inspect_payload, dict) else None
@@ -3399,6 +3460,8 @@ def _aggregate_healthcheck_status(
     return "ok" if all(item.get("ok") for item in checked) else "degraded"
 
 
+
+
 async def _cleanup_disabled_app_backend(
     backend: Backend,
     settings: Settings,
@@ -3408,13 +3471,23 @@ async def _cleanup_disabled_app_backend(
     services = services or default_app_runtime_services()
     container = container_name(backend.name)
     network = network_name(backend.name)
-    _inspect_result, inspect_payload = services.inspect_container(
-        container,
-        timeout_sec=settings.command_timeout_status_sec,
+    inspect_payload = _known_or_fail(
+        services.inspect_container(
+            container,
+            timeout_sec=settings.command_timeout_status_sec,
+        ),
+        f"container {container}",
+        backend_name=backend.name,
+        phase="app_runtime",
     )
-    _network_result, network_payload = services.inspect_network(
-        network,
-        timeout_sec=settings.command_timeout_status_sec,
+    network_payload = _known_or_fail(
+        services.inspect_network(
+            network,
+            timeout_sec=settings.command_timeout_status_sec,
+        ),
+        f"network {network}",
+        backend_name=backend.name,
+        phase="app_runtime",
     )
     state = inspect_payload.get("State") if isinstance(inspect_payload, dict) else {}
     container_running = isinstance(state, dict) and bool(state.get("Running"))

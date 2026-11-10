@@ -1,22 +1,12 @@
 (() => {
-  // Shared progress rendering for every operation pipeline. The server already
-  // speaks one language (OPERATION_PROGRESS_TREES), so this module is the one
-  // client-side translation from operation payloads to a rendered surface.
-  //
-  // Two surfaces exist on purpose:
-  //   card   - operations the user can walk away from (saves, backups, updates)
-  //   dialog - operations that block, because leaving mid-flight is confusing
-  //            (delete, clone, transfer, replica setup)
 
   const RUNNING_MIN = 4;
   const RUNNING_MAX = 96;
   const SUCCESS_DISMISS_MS = 4000;
-  const TERMINAL_STATUSES = new Set(["success", "failed", "partial", "cancelled"]);
+  const TERMINAL_STATUSES = new Set(["success", "failed", "partial", "cancelled", "unknown"]);
 
   const clamp = (value, low, high) => Math.max(low, Math.min(high, value));
 
-  // Matching strips dots and underscores so "app_runtime" and "App runtime."
-  // reach the same pipeline step. Display text keeps its own normalization.
   const matchText = (value) => String(value ?? "")
     .replaceAll(".", " ")
     .replaceAll("_", " ")
@@ -65,14 +55,10 @@
 
   const isTerminalStatus = (status) => TERMINAL_STATUSES.has(String(status || "").toLowerCase());
 
-  // ---------------------------------------------------------------------------
-  // Step resolution
-  //
-  // Two strategies existed independently and neither had the other's coverage.
-  // The dashboard matched a step exactly by (phase, substate); output detail
-  // matched progress fuzzily by message against substep/note. Both run here, in
-  // order, so a pipeline resolves through whichever path knows the answer.
-  // ---------------------------------------------------------------------------
+  const operatorState = (payload) => String(
+    payload?.presentation?.state || payload?.status || "",
+  ).toLowerCase();
+
 
   const exactStep = (steps, phase, substate) => {
     const wantPhase = matchText(phase);
@@ -89,8 +75,6 @@
     return steps.find((step) => matchText(step.headline) === wantPhase) || null;
   };
 
-  // Highest step whose substep or note equals the message. Highest wins because
-  // a pipeline can repeat wording across phases and the later one is the truth.
   const messageProgress = (steps, message) => {
     const wantMessage = matchText(message);
     if (!wantMessage || !Array.isArray(steps)) return 0;
@@ -149,13 +133,10 @@
     };
   };
 
-  // ---------------------------------------------------------------------------
-  // Meta pills
-  // ---------------------------------------------------------------------------
 
   const operationMeta = (payload, startedAt) => {
     const meta = [];
-    const status = String(payload?.status || "").toLowerCase();
+    const status = operatorState(payload);
     const statusLabel = String(
       payload?.presentation?.status_label
       || (status === "success" ? "saved" : (isTerminalStatus(status) ? "failed" : "")),
@@ -176,9 +157,6 @@
     return duration ? [{ label: "took", value: duration }] : [];
   };
 
-  // ---------------------------------------------------------------------------
-  // Tracker: raw operation payload -> render frame
-  // ---------------------------------------------------------------------------
 
   const createTracker = ({
     steps = [],
@@ -188,14 +166,12 @@
     startedAt = null,
   } = {}) => {
     const seed = firstStep(steps, fallbackTitle, fallbackNote, fallbackProgress);
-    // Progress is monotonic. A pipeline that reports a phase out of order, or a
-    // retry that re-reads an earlier event, must never walk the bar backwards.
     let lastProgress = seed.progress;
     let lastStage = { headline: seed.headline, note: seed.note };
 
     const frameFor = (payload, { tone, title } = {}) => {
       const details = payload?.details || {};
-      const status = String(payload?.status || "").toLowerCase();
+      const status = operatorState(payload);
       const terminal = isTerminalStatus(status);
       const phase = String(payload?.phase || "");
       const substate = String(details.substate || "");
@@ -225,7 +201,6 @@
 
       const presentedTone = terminal ? String(payload?.presentation?.tone || "") : "";
       const resolvedTone = tone || presentedTone || (terminal ? (status === "success" ? "success" : "error") : "running");
-      // A running bar never reads 0% or 100%: both look finished or stuck.
       const visible = resolvedTone === "running"
         ? clamp(displayProgress, RUNNING_MIN, RUNNING_MAX)
         : displayProgress;
@@ -233,8 +208,6 @@
       const flashSuccess = details.flash_success || payload?.flash_success || "";
       const flashError = details.flash_error || payload?.flash_error || payload?.error || "";
       const recovery = String(payload?.presentation?.recovery_detail || "");
-      // A failure reports its cause, never the step it happened to die on.
-      // Carried on the frame so no caller has to remember to pass it.
       const resolvedNote = resolvedTone === "error"
         ? (flashError || recovery || displayStage.note)
         : displayStage.note;
@@ -274,8 +247,6 @@
         terminal: false,
       }),
       frame: frameFor,
-      // Transport hiccups keep the last known stage and say so, rather than
-      // resetting the bar or implying the operation itself failed.
       retryFrame: ({ status, title } = {}) => ({
         tone: "running",
         title: title || fallbackTitle,
@@ -289,7 +260,6 @@
         meta: [],
         terminal: false,
       }),
-      // Terminal state for flows that finish without an operation payload.
       localFrame: ({ tone = "success", title, headline, note } = {}) => ({
         tone,
         title: title || fallbackTitle,
@@ -304,9 +274,6 @@
     };
   };
 
-  // ---------------------------------------------------------------------------
-  // Shared bar rendering
-  // ---------------------------------------------------------------------------
 
   const paintTrack = (root, frame) => {
     if (!root) return;
@@ -370,13 +337,6 @@
     return Boolean(list.length);
   };
 
-  // ---------------------------------------------------------------------------
-  // Card surface: operations the user can walk away from
-  //
-  // Dismissal lives here and nowhere else. Running persists, success clears
-  // itself, error waits for the reader, and anything carrying an action waits
-  // because the action is the point.
-  // ---------------------------------------------------------------------------
 
   const cardSurface = (() => {
     const cards = new Map();
@@ -481,8 +441,6 @@
         window.clearTimeout(entry.timer);
         entry.timer = null;
       }
-      // Success clears itself so the screen returns to the work. An error, or
-      // anything offering a next step, stays until the reader deals with it.
       if (frame.tone === "success" && !hasActions) {
         entry.timer = window.setTimeout(() => dismiss(key), SUCCESS_DISMISS_MS);
       }
@@ -498,13 +456,6 @@
     };
   })();
 
-  // ---------------------------------------------------------------------------
-  // Dialog surface: operations that block
-  //
-  // One state machine for every progress dialog. Sections are tagged
-  // [data-progress-state] and action groups [data-progress-actions-for], so a
-  // dialog declares its states in markup and needs no bespoke JS.
-  // ---------------------------------------------------------------------------
 
   const createDialogSurface = (dialog) => {
     if (!dialog) return null;
@@ -517,7 +468,6 @@
         section.hidden = section.dataset.progressState !== mode;
       });
       actionGroups.forEach((group) => {
-        // A group may serve several states: data-progress-actions-for="success error"
         const serves = String(group.dataset.progressActionsFor || "").split(/\s+/).filter(Boolean);
         group.hidden = !serves.includes(mode);
       });
@@ -553,9 +503,6 @@
     };
   };
 
-  // ---------------------------------------------------------------------------
-  // Narrative log
-  // ---------------------------------------------------------------------------
 
   const appendNarrative = (target, message) => {
     if (!target || !message) return;
@@ -584,7 +531,6 @@
     operationMeta,
     shortAlphanumericCode,
     stepIndexForProgress,
-    // Exported for tests and for surfaces that resolve steps directly.
     _internals: { exactStep, phaseStep, messageProgress, phaseProgress, resolveProgress, resolveStage, firstStep, matchText },
   });
 })();

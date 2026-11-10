@@ -1,4 +1,3 @@
-"""netdata: the metrics agent, installed natively and bound to loopback."""
 
 from __future__ import annotations
 
@@ -13,13 +12,10 @@ from app.services.netdata_runtime import (
 from app.services.tools.core import Plan
 
 tool_name = "netdata"
-#: Phase strings this tool owns. Published to clients in apply details and
-#: matched by the progress card, so they keep their existing spelling.
 phases = ("netdata_runtime",)
 
 
 async def netdata(plan: Plan) -> bool:
-    """Converge the agent. Asking it is the comparison; there is no file to diff."""
     if not plan.desired.netdata_required:
         return False
     if converged(plan.desired, plan.settings):

@@ -163,8 +163,6 @@ async def send_pushover_notification_async(
             emergency_key=emergency_key,
         )
     except Exception as exc:
-        # Prefer direct delivery to a silent drop if the durable state is
-        # unexpectedly unavailable; production normally takes the outbox path.
         logger.error(
             "notification.pushover.outbox_failed",
             **_notification_error_context(exc),

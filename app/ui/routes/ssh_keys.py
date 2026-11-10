@@ -1,4 +1,3 @@
-"""SSH key metadata and one-time creation responses for app outputs."""
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import JSONResponse

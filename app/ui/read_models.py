@@ -85,7 +85,6 @@ def dashboard_scope(active_tab: str | None) -> DashboardScope:
 
 
 async def latest_successful_apply_at(session: AsyncSession) -> datetime | None:
-    # Page freshness needs only a timestamp, not the potentially large snapshots.
     return (
         await session.execute(
             select(ApplyRun.created_at)

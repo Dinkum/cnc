@@ -27,7 +27,6 @@ BACKEND_SSH_ACCESS_NOTE = (
 
 
 def cached_service_map(status_payload: object) -> dict[str, dict[str, object]]:
-    """Normalize optional cached status without triggering live guest probes."""
     if not isinstance(status_payload, dict):
         return {}
     services = status_payload.get("services")

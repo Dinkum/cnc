@@ -1,4 +1,3 @@
-"""Resource limits, metrics, and sizing presentation shared by UI surfaces."""
 
 from __future__ import annotations
 

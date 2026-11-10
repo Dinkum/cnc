@@ -1,4 +1,3 @@
-"""Output cards, resource badges, and detail presentation from supplied data."""
 
 from __future__ import annotations
 
@@ -45,7 +44,9 @@ from app.ui.forms import (
 from app.ui.outputs.data import OutputPageData
 from app.ui.outputs.events import event_rows
 from app.ui.outputs.health import (
+    UNKNOWN_RUNTIME_DIAGNOSES,
     runtime_health_view,
+    service_map_from_status_payload,
     service_metrics_from_status_payload,
 )
 from app.ui.resources import format_cpu_limit, format_memory_limit
@@ -170,17 +171,13 @@ def _output_runtime_badge(
             return {"value": "healthy", "tone": "success"}
         if diagnosis == "app_unmonitored":
             return {"value": "unmonitored", "tone": "warn"}
-        if diagnosis in {
-            "backend_observation_deferred",
-            "backend_observation_unavailable",
-        }:
+        if diagnosis in UNKNOWN_RUNTIME_DIAGNOSES:
             return {"value": "unknown", "tone": "queued"}
         if diagnosis:
             return {"value": "unhealthy", "tone": "error"}
     active_state = str(unit_data.get("ActiveState") or "").strip().lower()
     if active_state == "active":
         return {"value": "healthy", "tone": "success"}
-    # A cold post-mutation cache has no observation, not a failed runtime.
     if not active_state or active_state == "unknown":
         return {"value": "unknown", "tone": "queued"}
     return {"value": "unhealthy", "tone": "error"}
@@ -649,10 +646,11 @@ def build_output_page_context(
         f"{input_kind_label(get_input_kind(item))}: {get_input_value(item)}"
         for item in sorted(data.backend.inputs, key=lambda item: item.id)
     ]
+    service_map = service_map_from_status_payload(data.cached_status_payload)
 
     detail = build_output_detail(
         backend=data.backend,
-        service_map={},
+        service_map=service_map,
         attached_input_ids=data.backend.input_ids,
         attached_input_labels=attached_input_labels,
         last_applied_at=data.last_applied_at,
@@ -675,7 +673,7 @@ def build_output_page_context(
         list(data.backend.inputs)
     )
     shield_status = build_shield_status(
-        data.shield_backends, data.shield_inputs, settings
+        data.shield_backends, data.shield_inputs, settings, service_map
     )
 
     return {

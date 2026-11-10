@@ -186,7 +186,6 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     except Exception:
         if json_output:
-            # SQL/OS exceptions may embed credentials or command arguments.
             _emit_error(
                 "command_unavailable",
                 "command could not complete; inspect CNC logs before retrying a mutation",

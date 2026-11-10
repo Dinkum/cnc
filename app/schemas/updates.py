@@ -13,6 +13,4 @@ def _reject_null(value: T) -> T:
     return value
 
 
-# None is an internal default for omitted fields, never an accepted wire value.
-# Keep null out of OpenAPI as well as runtime validation.
 UpdateValue = Annotated[T | SkipJsonSchema[None], BeforeValidator(_reject_null)]

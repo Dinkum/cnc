@@ -11,8 +11,8 @@ from pathlib import Path
 from app.services.hardening_policy import read_hardening_policy
 from app.config import Settings
 from app.models.entities import Backend
-from app.services.commands import CommandResult
 from app.services.container_runtime import (
+    Inspection,
     inspect_container as runtime_inspect_container,
     inspect_network as runtime_inspect_network,
 )
@@ -175,7 +175,6 @@ def runtime_spec(
                 "env_key": item.env_key,
                 "url": item.url,
                 "role": "source" if item.source_backend == backend.name else "target",
-                "direction": item.direction,
             }
             for item in sorted(
                 inter_app_interfaces,
@@ -250,15 +249,11 @@ def read_saved_spec(settings: Settings, backend_name: str) -> dict[str, Any] | N
         return None
 
 
-def inspect_container(
-    container: str, timeout_sec: int
-) -> tuple[CommandResult, dict[str, Any] | None]:
+def inspect_container(container: str, timeout_sec: int) -> Inspection:
     return runtime_inspect_container(container, timeout_sec)
 
 
-def inspect_network(
-    network: str, timeout_sec: int
-) -> tuple[CommandResult, dict[str, Any] | None]:
+def inspect_network(network: str, timeout_sec: int) -> Inspection:
     return runtime_inspect_network(network, timeout_sec)
 
 

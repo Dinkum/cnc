@@ -139,14 +139,6 @@ def _create_output_progress_plan_for_apply(
     *,
     desired: object | None = None,
 ) -> dict[str, object]:
-    """Which progress steps this save will show.
-
-    Derived from the output and the desired state, not from a prediction of
-    which apply slices will change. The slice prediction is gone: convergence
-    decides what to do by reading the host, so nothing here can know in advance
-    what will be touched, and guessing produced a card that omitted steps the
-    apply then ran.
-    """
     input_kinds = _backend_input_kinds(backend)
     known_app_backends = getattr(desired, "known_app_backends", ()) if desired else ()
     desired_tailnet_paths = getattr(desired, "tailscale_paths", {}) if desired else {}

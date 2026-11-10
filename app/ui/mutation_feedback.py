@@ -1,4 +1,3 @@
-"""Mutation change detection and operator feedback for host-lock contention."""
 
 from __future__ import annotations
 

@@ -186,7 +186,7 @@ class CNCTrustedHostMiddleware:
             trusted_hosts = _trusted_hosts_for_request(
                 settings, allowed_hosts=self.allowed_hosts
             )
-        except Exception:  # pragma: no cover - defensive path
+        except Exception:
             trusted_hosts = self.allowed_hosts
 
         if request_host in trusted_hosts:

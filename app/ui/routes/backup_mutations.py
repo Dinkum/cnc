@@ -7,7 +7,6 @@ from pathlib import Path
 
 from fastapi import (
     APIRouter,
-    BackgroundTasks,
     Depends,
     File,
     Form,
@@ -24,7 +23,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import Settings
-from app.services.config_change import converge_change, output_change
+from app.services.mutation_queue import enqueue_mutation
+from app.services.config_change import ConfigChange, converge_change
 from app.dependencies import (
     db_session_dependency,
     settings_dependency,
@@ -47,8 +47,8 @@ from app.services.inter_app_interfaces import (
     ConcurrentInterfaceUpdateError,
     apply_inbound_inter_app_interface_statuses,
     apply_inter_app_interfaces,
-    clean_interface_direction,
     clean_interface_status,
+    inter_app_interface_peer_names,
     inter_app_interfaces_from_form,
     read_inter_app_interfaces,
     reconcile_inter_app_interface_statuses,
@@ -88,17 +88,6 @@ from app.ui.mutation_feedback import (
     host_mutation_blocked_message,
     host_mutation_preflight_message,
 )
-from app.ui.operations.backups import (
-    _run_backup_operation,
-    _run_clone_operation,
-    _run_delete_backup_operation,
-    _run_import_backup_operation,
-    _run_restore_operation,
-)
-from app.ui.operations.cluster import (
-    _run_replica_setup_operation,
-    _run_transfer_operation,
-)
 from app.ui.operations.common import operation_response as _operation_response
 from app.ui.outputs.context import output_page_context
 from app.ui.progress import _operation_progress_details
@@ -131,7 +120,6 @@ async def _backup_mutation_preflight(
 async def backup_backend_form(
     backend_id: int,
     request: Request,
-    background_tasks: BackgroundTasks,
     settings: Settings = Depends(settings_dependency),
     csrf_token: str = Form(...),
     session: AsyncSession = Depends(db_session_dependency),
@@ -177,8 +165,11 @@ async def backup_backend_form(
                 backend_id=backend.id,
             ),
         )
-        background_tasks.add_task(
-            _run_backup_operation, settings, operation.id, backend.id
+        await enqueue_mutation(
+            settings,
+            operation.id,
+            "backup_backend",
+            backend_id=backend.id,
         )
         response = _operation_response(operation, message="Backup started.")
         return response
@@ -198,7 +189,6 @@ async def backup_backend_form(
 async def restore_backend_form(
     backend_id: int,
     request: Request,
-    background_tasks: BackgroundTasks,
     settings: Settings = Depends(settings_dependency),
     csrf_token: str = Form(...),
     backup_id: int | None = Form(None),
@@ -245,12 +235,12 @@ async def restore_backend_form(
                 backup_id=resolved_backup_id,
             ),
         )
-        background_tasks.add_task(
-            _run_restore_operation,
+        await enqueue_mutation(
             settings,
             operation.id,
-            backend.id,
-            resolved_backup_id,
+            "restore_backend",
+            backend_id=backend.id,
+            backup_id=resolved_backup_id,
         )
         response = _operation_response(operation, message="Restore started.")
         return response
@@ -305,7 +295,6 @@ async def delete_backup_form(
     backend_id: int,
     backup_id: int,
     request: Request,
-    background_tasks: BackgroundTasks,
     settings: Settings = Depends(settings_dependency),
     csrf_token: str = Form(...),
     session: AsyncSession = Depends(db_session_dependency),
@@ -366,8 +355,12 @@ async def delete_backup_form(
                 backup_id=backup_id,
             ),
         )
-        background_tasks.add_task(
-            _run_delete_backup_operation, settings, operation.id, backend.id, backup_id
+        await enqueue_mutation(
+            settings,
+            operation.id,
+            "delete_backend_backup",
+            backend_id=backend.id,
+            backup_id=backup_id,
         )
         return _operation_response(operation, message="Backup delete started.")
 
@@ -388,7 +381,6 @@ async def delete_backup_form(
 async def import_restore_backend_form(
     backend_id: int,
     request: Request,
-    background_tasks: BackgroundTasks,
     settings: Settings = Depends(settings_dependency),
     csrf_token: str = Form(...),
     bundle: UploadFile = File(...),
@@ -459,14 +451,14 @@ async def import_restore_backend_form(
                     filename=bundle.filename,
                 ),
             )
-            background_tasks.add_task(
-                _run_import_backup_operation,
+            await enqueue_mutation(
                 settings,
                 operation.id,
-                backend.id,
-                str(temp_path),
-                bundle.filename,
-                str(temp_dir),
+                "import_backend_backup",
+                backend_id=backend.id,
+                temp_path=str(temp_path),
+                original_name=bundle.filename,
+                temp_dir=str(temp_dir),
             )
             response = _operation_response(operation, message="Import started.")
             return response
@@ -512,7 +504,6 @@ async def import_restore_backend_form(
 async def clone_backend_form(
     backend_id: int,
     request: Request,
-    background_tasks: BackgroundTasks,
     settings: Settings = Depends(settings_dependency),
     csrf_token: str = Form(...),
     name: str = Form(""),
@@ -555,8 +546,13 @@ async def clone_backend_form(
                     clone_name=payload.name,
                 ),
             )
-            background_tasks.add_task(
-                _run_clone_operation, settings, operation.id, backend.id, name, port
+            await enqueue_mutation(
+                settings,
+                operation.id,
+                "clone_backend",
+                backend_id=backend.id,
+                name=name,
+                port=port,
             )
             response = _operation_response(operation, message="Clone started.")
             return response
@@ -606,16 +602,22 @@ async def clone_backend_form(
 async def transfer_backend_form(
     backend_id: int,
     request: Request,
-    background_tasks: BackgroundTasks,
     settings: Settings = Depends(settings_dependency),
     csrf_token: str = Form(...),
     target_node: str = Form(""),
+    transfer_mode: str = Form("pause"),
     session: AsyncSession = Depends(db_session_dependency),
 ) -> JSONResponse:
     enforce_csrf(request, settings, csrf_token)
     if not settings.multi_node_enabled:
         return _operator_error_json(
             "multi node mode is disabled",
+            ErrorCode.UI_ACTION_UNAVAILABLE,
+            status_code=400,
+        )
+    if transfer_mode not in {"pause", "live"}:
+        return _operator_error_json(
+            "transfer mode must be pause or live",
             ErrorCode.UI_ACTION_UNAVAILABLE,
             status_code=400,
         )
@@ -653,14 +655,16 @@ async def transfer_backend_form(
             phase="Confirm transfer",
             substate="Reading transfer request",
             target_node=target_node,
+            transfer_mode=transfer_mode,
         ),
     )
-    background_tasks.add_task(
-        _run_transfer_operation,
+    await enqueue_mutation(
         settings,
         operation.id,
-        backend.id,
-        target_node,
+        "transfer_backend",
+        backend_id=backend.id,
+        target_node=target_node,
+        pause_source=transfer_mode == "pause",
     )
     return _operation_response(operation, message="Transfer started.")
 
@@ -669,7 +673,6 @@ async def transfer_backend_form(
 async def setup_backend_replica_form(
     backend_id: int,
     request: Request,
-    background_tasks: BackgroundTasks,
     settings: Settings = Depends(settings_dependency),
     csrf_token: str = Form(...),
     target_node: str = Form(""),
@@ -727,13 +730,13 @@ async def setup_backend_replica_form(
             setup_mode=normalized_mode,
         ),
     )
-    background_tasks.add_task(
-        _run_replica_setup_operation,
+    await enqueue_mutation(
         settings,
         operation.id,
-        backend.id,
-        target_node,
-        normalized_mode,
+        "setup_backend_replica",
+        backend_id=backend.id,
+        target_node=target_node,
+        setup_mode=normalized_mode,
     )
     return _operation_response(operation, message="Replica setup started.")
 
@@ -819,9 +822,6 @@ async def update_backend_placement_form(
     interface_targets = [
         str(value) for value in form.getlist("inter_app_interface_targets")
     ]
-    interface_directions = [
-        str(value) for value in form.getlist("inter_app_interface_directions")
-    ]
     inbound_interface_source_ids = [
         str(value) for value in form.getlist("inter_app_interface_inbound_source_ids")
     ]
@@ -839,7 +839,6 @@ async def update_backend_placement_form(
             inter_app_interfaces_from_form(
                 interface_names,
                 interface_targets,
-                interface_directions,
             )
             if enabled
             else ()
@@ -848,6 +847,7 @@ async def update_backend_placement_form(
             read_inter_app_interfaces(backend),
             submitted_inter_app_interfaces,
         )
+        interface_peers = await inter_app_interface_peer_names(session, backend.id)
         await validate_backend_placement_nodes(
             session,
             selected_node_uids=selected_node_uids if enabled else (active_node_uid,),
@@ -880,11 +880,13 @@ async def update_backend_placement_form(
                 names=inbound_interface_names,
                 statuses=inbound_interface_statuses,
             )
+        interface_peers |= await inter_app_interface_peer_names(session, backend.id)
         mutation = await converge_change(
             session,
             settings,
-            change=output_change(
-                "ui.backend.placement", str(backend.name or "")
+            change=ConfigChange(
+                kind="ui.backend.placement",
+                outputs=frozenset({str(backend.name or ""), *interface_peers}),
             ),
             apply_runner=run_apply,
         )
@@ -906,7 +908,6 @@ async def update_backend_placement_form(
                             "name": item.name,
                             "target_backend_id": item.target_backend_id,
                             "status": clean_interface_status(item.status),
-                            "direction": clean_interface_direction(item.direction),
                         }
                         for item in read_inter_app_interfaces(backend)
                     ],

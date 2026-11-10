@@ -1,4 +1,3 @@
-"""Bounded Cloudflare API requests with redacted errors and explicit mutations."""
 
 from __future__ import annotations
 

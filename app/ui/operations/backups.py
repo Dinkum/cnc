@@ -7,6 +7,7 @@ import shutil
 from app.config import Settings
 from app.logger import get_logger
 from app.services import backend_commands
+from app.services.mutation_queue import mutation_runner
 from app.services.backend_backup_service import (
     create_backend_backup,
     delete_backend_backup,
@@ -32,6 +33,7 @@ from app.ui.view_models import _format_bytes
 logger = get_logger("ui")
 
 
+@mutation_runner("backup_backend")
 async def _run_backup_operation(
     settings: Settings, operation_id: int | None, backend_id: int
 ) -> None:
@@ -148,6 +150,7 @@ async def _run_backup_operation(
         )
 
 
+@mutation_runner("restore_backend")
 async def _run_restore_operation(
     settings: Settings,
     operation_id: int | None,
@@ -284,6 +287,7 @@ async def _run_restore_operation(
         )
 
 
+@mutation_runner("delete_backend_backup")
 async def _run_delete_backup_operation(
     settings: Settings,
     operation_id: int | None,
@@ -385,6 +389,7 @@ async def _run_delete_backup_operation(
         )
 
 
+@mutation_runner("import_backend_backup")
 async def _run_import_backup_operation(
     settings: Settings,
     operation_id: int | None,
@@ -489,6 +494,7 @@ async def _run_import_backup_operation(
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+@mutation_runner("clone_backend")
 async def _run_clone_operation(
     settings: Settings,
     operation_id: int | None,

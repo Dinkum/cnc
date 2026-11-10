@@ -165,14 +165,11 @@ def error_descriptor(error_code: ErrorCode) -> ErrorDescriptor:
 def new_error_instance(width: int = 8) -> str:
     if width < 1:
         raise ValueError("error instance width must be positive")
-    # Crockford base32 uses 5 bits per character. Rejection is unnecessary
-    # because the random integer is bounded to exactly the requested width.
     value = secrets.randbits(width * 5)
     return _encode_crockford(value, width=width)
 
 
 class CNCError(RuntimeError):
-    """One classified failure shared by logs, state, UI, and notifications."""
 
     def __init__(
         self,

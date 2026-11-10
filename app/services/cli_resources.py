@@ -1,4 +1,3 @@
-"""Shared CLI resource operations using the same validation and apply path as HTTP."""
 
 from __future__ import annotations
 
@@ -119,7 +118,6 @@ async def mutate_resource(
     reference: str | None = None,
 ) -> dict[str, object]:
     kind = f"cli.{resource}.{action}"
-    # Acquire before reading the graph, not merely before applying its replacement.
     async with host_mutation_operation(
         settings, kind=kind, actor="cli", phase="configure"
     ) as operation:
@@ -151,9 +149,6 @@ async def mutate_resource(
                     config_changed = session.is_modified(
                         item, include_collections=True
                     )
-            # The edited row is known here, so the scope is real. An output
-            # edit concerns that output; an input edit concerns the outputs it
-            # attaches. Neither is a reason to reconcile the fleet.
             if resource == "output":
                 change = output_change(kind, str(item.name or ""))
             else:
@@ -183,9 +178,6 @@ async def mutate_resource(
             return {
                 resource: payload,
                 "operation_id": operation.id,
-                # The request may change durable config, repair host drift, or
-                # both. Only when neither occurred is it an observed no-op.
-                # A runner without a host outcome gets the conservative answer.
                 "changed": config_changed
                 or (True if host_changed is None else host_changed),
             }
@@ -250,7 +242,6 @@ async def change_route(
                     settings,
                     change=output_change(kind, str(output.name or "")),
                     operation_handle=operation,
-                    # Attaching or detaching a route concerns that output.
                 )
                 if not result.applied:
                     raise ValueError(

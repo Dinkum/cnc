@@ -56,7 +56,6 @@
     form.dispatchEvent(new Event("output-attach-dirtycheck"));
   };
 
-  // --- output/input attach/detach ---
   document.querySelectorAll("[data-output-attach-form]").forEach((scope) => {
     const form = scope.closest("form");
     const tagsWrap = scope.querySelector("[data-output-tags]");
@@ -305,6 +304,10 @@
   const deleteBackupCopy = deleteBackupModal?.querySelector("[data-delete-backup-copy]");
   const deleteBackupAccept = deleteBackupModal?.querySelector("[data-delete-backup-accept]");
   const deleteBackupCancel = deleteBackupModal?.querySelector("[data-delete-backup-cancel]");
+  const restoreBackupModal = document.getElementById("restore-backup-modal");
+  const restoreBackupCopy = restoreBackupModal?.querySelector("[data-restore-backup-copy]");
+  const restoreBackupAccept = restoreBackupModal?.querySelector("[data-restore-backup-accept]");
+  const restoreBackupCancel = restoreBackupModal?.querySelector("[data-restore-backup-cancel]");
   const outputEnabledChip = document.querySelector(".output-page-badges .stat-chip");
   const operationProgressTrackers = new Map();
   let clonePending = false;
@@ -316,12 +319,10 @@
   let applyInboundInterfaceOperationResult = () => {};
   let deleteFinishedRedirect = "";
   let activeDeleteBackupForm = null;
+  let activeRestoreBackupForm = null;
   let backupPending = false;
   let backupSignalsRequestId = 0;
 
-  // Every progress dialog drives the same markup contract through the shared
-  // surface, so these four are the only per-dialog code left: a default label
-  // and, at terminal states, an explicit tone.
   const deleteSurface = window.CNCProgress.dialog(deleteModal);
 
   const setDeleteMode = (mode) => deleteSurface?.setState(mode);
@@ -540,8 +541,6 @@
 
   const cloneSurface = window.CNCProgress.dialog(cloneModal);
 
-  // The success state carries its own actions, so it no longer also shows the
-  // progress group's Close button.
   const setCloneMode = (mode) => cloneSurface?.setState(mode);
 
   const setCloneProgress = (percent, label, note, tone = "running") => {
@@ -594,9 +593,6 @@
     if (mode !== "target") setTransferTargetOpen(false);
   };
 
-  // Minimising a transfer hands it to the card stack rather than to a bespoke
-  // bottom bar. The card's own dismissal rule then applies, so a finished or
-  // failed transfer can no longer strand at 100% with nothing to close it.
   const TRANSFER_CARD_KEY = "transfer";
   let transferMinimised = false;
   let transferLastFrame = null;
@@ -761,8 +757,6 @@
   });
 
   transferClose?.addEventListener("click", () => {
-    // Closing a running transfer minimises it to the card stack; closing a
-    // finished one just dismisses the dialog.
     if (transferPending) {
       minimiseTransfer();
       return;
@@ -828,9 +822,6 @@
     flashBlock.innerHTML = text ? `<section class="banner ${normalizedKind}">${escapeHtml(text)}</section>` : "";
   };
 
-  // A settings section reports its own save state inline (CNCOutputSettings
-  // renders "Saving…" / "Saved" next to the buttons), so the page must not
-  // also raise a banner for it.
   const hasLocalOutputSaveProgress = (form) => (
     Boolean(form?.matches?.("[data-output-settings-section]"))
   );
@@ -841,8 +832,6 @@
     window.CNCProgress.card.dismiss(OUTPUT_SAVE_CARD_KEY);
   };
 
-  // Saving an output is work the reader can walk away from, so it reports in
-  // the card stack rather than pinning a progress banner to the top of the page.
   const renderOutputSaveProgress = ({ kind = "success", title = "Saving output", step = "", note = "", progress = 8 }) => {
     const tone = kind === "error" ? "error" : kind === "success" ? "success" : "running";
     const headline = String(title || "Saving output").trim();
@@ -887,9 +876,6 @@
     return firstProgress;
   };
 
-  // Every section form carries [data-output-settings-section], so the settings
-  // module owns this feedback: it renders "Saving…" / "Saved" as text rather
-  // than a bar, which is the right affordance for a dirty-state form.
   const renderInlineOutputSaveProgress = (form, { kind = "running", step = "" }) => {
     window.CNCOutputSettings?.render(form, { kind, step });
   };
@@ -957,8 +943,6 @@
     return token;
   };
 
-  // Backups are work the reader can walk away from, so the bar reports in the
-  // card stack. The narrative log stays on the page as a record.
   const BACKUP_CARD_KEY = "backup";
 
   const setBackupProgress = (percent, label, note, tone = "running") => {
@@ -1095,10 +1079,10 @@
       form.dataset.outputSaveFallback = enabled ? "Output disabled." : "Output enabled.";
       form.dataset.outputSaveErrorFallback = enabled ? "Disable failed." : "Enable failed.";
     }
-    if (outputKind === "app" && outputEnabled) {
+    if (outputHasRuntimeSignals()) {
       refreshRuntimeSignals({ force: true }).catch(() => {});
       scheduleRuntimeRefresh();
-    } else if (outputKind === "app") {
+    } else if (outputKind === "app" || outputKind === "shield") {
       if (runtimeRefreshTimer !== null) window.clearTimeout(runtimeRefreshTimer);
       runtimeRefreshTimer = null;
       runtimeRefreshAbortController?.abort();
@@ -1127,7 +1111,8 @@
 
   const renderOutputSaveOperationResult = (form, title, operation, submitButton, fallbackMessage) => {
     const progress = operationProgress(operation, 100, "outputSave");
-    const failed = String(operation?.status || "").toLowerCase() !== "success";
+    const failed = window.CNCOperations.normalizeStatus(operation) !== "success";
+    const recovery = String(operation?.presentation?.recovery_detail || "").trim();
     if (!failed) window.CNCOutputSettings?.acceptValues(form, progress.details?.saved_values);
     const message = failed
       ? (progress.flashError || progress.message || fallbackMessage || "Save failed.")
@@ -1136,7 +1121,7 @@
       kind: failed ? "error" : "success",
       title: failed ? "Save failed" : title,
       step: message,
-      note: failed ? "Review the error before retrying." : "Done.",
+      note: failed ? "Review the error before retrying." : (recovery || "Done."),
       progress: 100,
     });
     renderInlineOutputSaveProgress(form, {
@@ -1801,7 +1786,10 @@
   const metricsLoading = document.getElementById("output-metrics-loading");
   const outputKind = document.body.dataset.outputKind || "";
   let outputEnabled = document.body.dataset.outputEnabled === "true";
-  const outputHasRuntimeSignals = () => outputKind === "app" && outputEnabled;
+  const outputHasRuntimeSignals = () => (
+    (outputKind === "app" || outputKind === "shield")
+    && (outputEnabled || Boolean(document.getElementById("output-shield-form")))
+  );
   const outputHasMetrics = () => outputKind === "app" || outputKind === "shield";
   const hardeningCard = document.querySelector("[data-hardening-card]");
   const hardeningPhaseOneRun = document.querySelector("[data-hardening-phase-one-run]");
@@ -2255,7 +2243,22 @@
     if (!payload || typeof payload !== "object" || payload.error) return false;
     const label = String(payload.runtime_health_label || "").trim().toLowerCase();
     const summary = String(payload.runtime_health_summary || "").trim().toLowerCase();
-    return Boolean(label && label !== "unknown" && summary !== "unknown" && Array.isArray(payload.output_signal_cards));
+    return Boolean(label && summary && Array.isArray(payload.output_signal_cards));
+  };
+
+  const renderShieldReadiness = (status) => {
+    if (!status || typeof status !== "object") return;
+    const form = document.getElementById("output-shield-form");
+    const checkbox = form?.querySelector("[name='shield_enabled']");
+    const note = form?.querySelector("[data-shield-prerequisite]");
+    const ready = status.server_enabled === true && status.ready === true;
+    if (checkbox) checkbox.disabled = !ready && !checkbox.checked;
+    if (note) {
+      note.hidden = ready;
+      note.textContent = status.config_ready && status.output_state === "unknown"
+        ? "Checking Shield availability."
+        : "Shield is not ready. Check its status in Settings.";
+    }
   };
 
   const renderRuntimeSignals = (payload) => {
@@ -2310,6 +2313,7 @@
       });
       const payload = await response.json();
       if (!response.ok) throw new Error(`runtime signals request failed: ${response.status}`);
+      renderShieldReadiness(payload.shield_status);
       if (payload?.pending === true) {
         renderPendingRuntimeState();
         runtimeRefreshFailures = 0;
@@ -2476,7 +2480,6 @@
         payload,
       }));
     } catch {
-      // Browser storage can be unavailable in private contexts; metric hydration still works without it.
     }
   };
 
@@ -2616,7 +2619,6 @@
     const xMin = Number.isFinite(selectedRangeStart) ? selectedRangeStart : avgPoints[0].x;
     const xMax = Number.isFinite(selectedRangeEnd) ? selectedRangeEnd : avgPoints[avgPoints.length - 1].x;
 
-    // Dynamic y range: zoom to data with headroom, optionally capped by limit
     const chartValuePoints = metricKey === "network" && hasDirectionalNetwork
       ? [...downPoints, ...upPoints]
       : metricKey === "network"
@@ -2918,7 +2920,6 @@
       },
     };
     if (chartInstance) {
-      // Keep the canvas mounted; fresh callbacks and plugins use this payload's limits.
       chartInstance.data = config.data;
       chartInstance.options = config.options;
       chartInstance.config.plugins.splice(0, chartInstance.config.plugins.length, ...config.plugins);
@@ -3056,61 +3057,6 @@
       const option = select?.options?.[select.selectedIndex];
       return String(option?.textContent || "target").trim() || "target";
     };
-    const interfaceDirectionValue = (select) => {
-      const value = String(select?.value || "out").trim().toLowerCase();
-      return ["out", "in", "bidirectional"].includes(value) ? value : "out";
-    };
-    const interfacePathParts = ({ current, other, direction, inbound = false }) => {
-      const normalized = interfaceDirectionValue({ value: direction });
-      if (normalized === "bidirectional") {
-        return {
-          left: inbound ? other : current,
-          right: inbound ? current : other,
-          label: "BIDIRECTIONAL <->",
-        };
-      }
-      if (inbound) {
-        return normalized === "in"
-          ? { left: current, right: other, label: "OUTBOUND ->" }
-          : { left: other, right: current, label: "INBOUND ->" };
-      }
-      return normalized === "in"
-        ? { left: other, right: current, label: "INBOUND ->" }
-        : { left: current, right: other, label: "OUTBOUND ->" };
-    };
-    const updateDirectionOptionLabels = (select, parts) => {
-      if (!select || !parts) return;
-      const selectedOption = select.options?.[select.selectedIndex];
-      if (selectedOption) selectedOption.textContent = parts.label;
-    };
-    const updateInterfaceMeta = (row) => {
-      const left = row?.querySelector("[data-placement-interface-path-left]");
-      const select = row?.querySelector("[data-placement-interface-target]");
-      const direction = row?.querySelector("[data-placement-interface-direction]");
-      if (!left) return;
-      const parts = interfacePathParts({
-        current: backendName,
-        other: interfaceTargetLabel(select),
-        direction: interfaceDirectionValue(direction),
-      });
-      left.textContent = parts.left;
-      updateDirectionOptionLabels(direction, parts);
-    };
-    const updateInboundInterfaceMeta = (row, statusLabel) => {
-      const left = row?.querySelector("[data-placement-interface-inbound-path-left]");
-      const right = row?.querySelector("[data-placement-interface-inbound-path-right]");
-      const direction = row?.querySelector("[data-placement-interface-inbound-direction]");
-      if (!left || !right) return;
-      const parts = interfacePathParts({
-        current: String(row?.dataset.inboundTargetName || backendName),
-        other: String(row?.dataset.inboundSourceName || "source"),
-        direction: interfaceDirectionValue(direction),
-        inbound: true,
-      });
-      left.textContent = parts.left;
-      right.textContent = parts.right;
-      updateDirectionOptionLabels(direction, parts);
-    };
     const setInboundRowBusy = (row, busy) => {
       row?.querySelectorAll("[data-placement-interface-inbound-action]").forEach((button) => {
         button.disabled = Boolean(busy);
@@ -3129,7 +3075,6 @@
       removeButton.textContent = "Delete";
       removeButton.addEventListener("click", () => submitInboundInterfaceAction(row, "rejected"));
       actions.append(removeButton);
-      updateInboundInterfaceMeta(row);
     };
     applyInboundInterfaceOperationResult = (operation) => {
       const details = operation?.details && typeof operation.details === "object" ? operation.details : {};
@@ -3158,7 +3103,6 @@
       formData.set("source_backend_id", sourceId);
       formData.set("interface_name", interfaceName);
       formData.set("status", status);
-      formData.set("direction", interfaceDirectionValue(row.querySelector("[data-placement-interface-inbound-direction]")));
       const requestPath = `/ui/backends/${backendId}/interfaces/inbound`;
       try {
         let response = await fetch(requestPath, {
@@ -3266,23 +3210,14 @@
       const endpoint = document.createElement("span");
       endpoint.className = "placement-interface-endpoint";
       endpoint.dataset.placementInterfacePathLeft = "";
+      endpoint.textContent = backendName;
       path.append(endpoint);
 
-      const direction = document.createElement("select");
-      direction.name = "inter_app_interface_directions";
-      direction.dataset.placementInterfaceDirection = "";
-      direction.setAttribute("aria-label", `${name} direction`);
-      [
-        ["out", "OUTBOUND ->"],
-        ["in", "INBOUND ->"],
-        ["bidirectional", "BIDIRECTIONAL <->"],
-      ].forEach(([value, labelText]) => {
-        const option = document.createElement("option");
-        option.value = value;
-        option.textContent = labelText;
-        direction.append(option);
-      });
-      path.append(direction);
+      const arrow = document.createElement("span");
+      arrow.className = "placement-interface-arrow";
+      arrow.setAttribute("aria-hidden", "true");
+      arrow.textContent = "->";
+      path.append(arrow);
 
       const select = document.createElement("select");
       select.className = "placement-interface-target-select";
@@ -3305,9 +3240,6 @@
       }
       path.append(select);
       row.append(path);
-      direction.addEventListener("change", () => updateInterfaceMeta(row));
-      select.addEventListener("change", () => updateInterfaceMeta(row));
-      updateInterfaceMeta(row);
 
       const removeButton = document.createElement("button");
       removeButton.type = "button";
@@ -3641,16 +3573,8 @@
     interfaceAddButton?.addEventListener("click", addInterfaceRow);
     interfaceRows().forEach((row) => {
       row.querySelector("[data-placement-interface-remove]")?.addEventListener("click", () => removeInterfaceRow(row));
-      row.querySelector("[data-placement-interface-direction]")?.addEventListener("change", () => updateInterfaceMeta(row));
-      row.querySelector("[data-placement-interface-target]")?.addEventListener("change", () => updateInterfaceMeta(row));
     });
     inboundRows().forEach((row) => {
-      row.querySelector("[data-placement-interface-inbound-direction]")?.addEventListener("change", () => {
-        updateInboundInterfaceMeta(row);
-        if (row.dataset.inboundStatus === "accepted") {
-          submitInboundInterfaceAction(row, "accepted");
-        }
-      });
       row.querySelectorAll("[data-placement-interface-inbound-action]").forEach((button) => {
         button.addEventListener("click", () => submitInboundInterfaceAction(row, button.dataset.placementInterfaceInboundAction));
       });
@@ -3684,7 +3608,6 @@
 
     form.addEventListener('output-section-restored', () => {
       setMode(mode()); renderPlacementNodes();
-      interfaceRows().forEach(updateInterfaceMeta);
     });
     setMode(mode());
     renderPlacementNodes();
@@ -3756,10 +3679,10 @@
                   <td class="mono">${escapeHtml(item.bundle)}</td>
                   <td>
                     <div class="backup-action-buttons">
-                      <form method="post" action="/ui/backends/${backendId}/restore" data-restore-form>
+                      <form method="post" action="/ui/backends/${backendId}/restore" data-restore-form data-backup-label="#${escapeHtml(item.id)}" data-backup-created="${escapeHtml(item.created_at_raw || item.created_at)}">
                         <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
                         <input type="hidden" name="backup_id" value="${escapeHtml(item.id)}">
-                        <button type="submit" class="ghost"${item.restorable ? "" : " disabled"}>Restore</button>
+                        <button type="button" class="ghost" data-restore-backup-trigger${item.restorable ? "" : " disabled"}>Restore</button>
                       </form>
                       <form method="post" action="/ui/backends/${backendId}/backups/${escapeHtml(item.id)}/delete" data-delete-backup-form data-backup-id="${escapeHtml(item.id)}" data-backup-label="#${escapeHtml(item.id)}" data-backup-file="${escapeHtml(item.bundle)}">
                         <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
@@ -3815,19 +3738,53 @@
     });
   }
 
-  document.addEventListener("submit", async (event) => {
-    const form = event.target;
-    if (!(form instanceof HTMLFormElement) || !form.matches("[data-restore-form]")) return;
-    event.preventDefault();
-    const submitter = event.submitter || form.querySelector("button[type='submit']");
+  const openRestoreBackupModal = (form) => {
+    if (backupPending || typeof restoreBackupModal?.showModal !== "function") return;
+    activeRestoreBackupForm = form;
+    const backupLabel = form.dataset.backupLabel || `#${form.querySelector("[name='backup_id']")?.value || ""}`;
+    const created = formatLocalTimestamp(form.dataset.backupCreated) || form.dataset.backupCreated || "unknown date";
+    if (restoreBackupCopy) restoreBackupCopy.textContent = `Restore ${backendName} from backup ${backupLabel}, created ${created}?`;
+    restoreBackupModal.showModal();
+  };
+
+  restoreBackupCancel?.addEventListener("click", () => {
+    activeRestoreBackupForm = null;
+    restoreBackupModal.close("cancel");
+  });
+  restoreBackupModal?.addEventListener("cancel", () => {
+    activeRestoreBackupForm = null;
+  });
+  restoreBackupModal?.addEventListener("close", () => {
+    activeRestoreBackupForm = null;
+  });
+  restoreBackupAccept?.addEventListener("click", async () => {
+    if (!activeRestoreBackupForm || backupPending) return;
+    const form = activeRestoreBackupForm;
+    activeRestoreBackupForm = null;
+    restoreBackupModal.close("restore");
     await startBackupLikeOperation({
       form,
-      submitter,
+      submitter: form.querySelector("[data-restore-backup-trigger]"),
       label: "Restoring backup",
       startedMessage: "Starting restore.",
       failedMessage: "Restore failed.",
       pipeline: "restore",
     });
+  });
+
+  document.addEventListener("click", (event) => {
+    const trigger = event.target instanceof Element ? event.target.closest("[data-restore-backup-trigger]") : null;
+    const form = trigger?.closest("[data-restore-form]");
+    if (!(form instanceof HTMLFormElement)) return;
+    event.preventDefault();
+    openRestoreBackupModal(form);
+  });
+
+  document.addEventListener("submit", (event) => {
+    const form = event.target;
+    if (!(form instanceof HTMLFormElement) || !form.matches("[data-restore-form]")) return;
+    event.preventDefault();
+    openRestoreBackupModal(form);
   });
 
   document.addEventListener("click", (event) => {

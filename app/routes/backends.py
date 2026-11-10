@@ -24,6 +24,7 @@ from app.schemas.backends import (
 )
 from app.services import backend_commands
 from app.services.config_change import converge_change, output_change
+from app.services.operations import host_mutation_operation
 from app.services.status_service import invalidate_status_cache
 from app.services.validators import ValidationError
 
@@ -64,12 +65,18 @@ async def create_backend(
         port=payload.port,
     )
     try:
-        backend = await backend_commands.create_backend(session, payload, commit=False)
-        result = await converge_change(
-            session,
-            settings,
-            change=output_change("api.backend.create", backend.name),
-        )
+        async with host_mutation_operation(
+            settings, kind="api.backend.create", actor="api", phase="configure"
+        ) as operation:
+            backend = await backend_commands.create_backend(
+                session, payload, commit=False
+            )
+            result = await converge_change(
+                session,
+                settings,
+                change=output_change("api.backend.create", backend.name),
+                operation_handle=operation,
+            )
         if not result.applied:
             raise_apply_failure(result.apply_response.details)
         backend = await backend_commands.require_backend(session, backend.id)
@@ -118,14 +125,22 @@ async def update_backend(
     _csrf: None = Depends(csrf_api_dependency),
 ) -> Backend:
     try:
-        backend = await backend_commands.update_backend(
-            session, backend_id, payload, commit=False
-        )
-        result = await converge_change(
-            session,
+        async with host_mutation_operation(
             settings,
-            change=output_change("api.backend.update", backend.name),
-        )
+            kind="api.backend.update",
+            actor="api",
+            backend_id=backend_id,
+            phase="configure",
+        ) as operation:
+            backend = await backend_commands.update_backend(
+                session, backend_id, payload, commit=False
+            )
+            result = await converge_change(
+                session,
+                settings,
+                change=output_change("api.backend.update", backend.name),
+                operation_handle=operation,
+            )
         if not result.applied:
             raise_apply_failure(result.apply_response.details)
         backend = await backend_commands.require_backend(session, backend.id)
@@ -181,17 +196,25 @@ async def toggle_backend(
                 enabled=backend.enabled,
             )
             return backend
-        backend = await backend_commands.update_backend(
-            session,
-            backend_id,
-            BackendUpdate(enabled=payload.enabled),
-            commit=False,
-        )
-        result = await converge_change(
-            session,
+        async with host_mutation_operation(
             settings,
-            change=output_change("api.backend.toggle", backend.name),
-        )
+            kind="api.backend.toggle",
+            actor="api",
+            backend_id=backend_id,
+            phase="configure",
+        ) as operation:
+            backend = await backend_commands.update_backend(
+                session,
+                backend_id,
+                BackendUpdate(enabled=payload.enabled),
+                commit=False,
+            )
+            result = await converge_change(
+                session,
+                settings,
+                change=output_change("api.backend.toggle", backend.name),
+                operation_handle=operation,
+            )
         if not result.applied:
             raise_apply_failure(result.apply_response.details)
         backend = await backend_commands.require_backend(session, backend.id)

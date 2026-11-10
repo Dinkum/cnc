@@ -1,4 +1,3 @@
-"""Named, output-scoped SSH access. Private keys live only in the create response."""
 
 from __future__ import annotations
 
@@ -44,7 +43,6 @@ def generate_backend_ssh_keypair(backend_name: str) -> tuple[str, str]:
 
 
 def parse_public_key(value: str) -> tuple[str, str]:
-    """Accept one bare Ed25519 key, never authorized_keys options or extra lines."""
     value = value.strip()
     parts = value.split()
     if (
@@ -59,7 +57,6 @@ def parse_public_key(value: str) -> tuple[str, str]:
         blob = base64.b64decode(parts[1], validate=True)
     except ValueError as exc:
         raise ValueError("The public key is not valid base64.") from exc
-    # OpenSSH Ed25519 wire format: algorithm string, then exactly 32 key bytes.
     prefix = b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20"
     if not blob.startswith(prefix) or len(blob) != len(prefix) + 32:
         raise ValueError("The public key is not a valid Ed25519 key.")
@@ -118,7 +115,6 @@ async def _mutate_key(
     public_key: str | None = None,
     revoke_id: str | None = None,
 ) -> dict[str, object]:
-    # The operation writer opens its own connection; release any page read first.
     await session.rollback()
     async with host_mutation_operation(
         settings,
@@ -197,8 +193,6 @@ async def _mutate_key(
             await session.commit()
         except BaseException:
             await session.rollback()
-            # Re-read committed state: a commit exception can occur after SQLite
-            # accepted the commit, so blindly restoring the old keys could regrant access.
             if applied:
                 persisted = list(
                     (
@@ -226,7 +220,6 @@ async def mutate_backend_ssh_key(
     public_key: str | None = None,
     revoke_id: str | None = None,
 ) -> dict[str, object]:
-    # Finish reconciliation/commit (or rollback) before cancellation releases the lock.
     task = asyncio.create_task(
         _mutate_key(
             session,

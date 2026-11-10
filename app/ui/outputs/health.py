@@ -1,10 +1,30 @@
-"""Project runtime diagnostics and cached metrics into output health views."""
 
 from __future__ import annotations
 
 from app.models.entities import Backend
 from app.services.renderers import container_name
 from app.services.shield_runtime import SHIELD_CONTAINER_SERVICE
+
+UNKNOWN_RUNTIME_DIAGNOSES = frozenset(
+    {
+        "backend_observation_deferred",
+        "backend_observation_unavailable",
+        "sandbox_observation_unavailable",
+    }
+)
+
+
+def service_map_from_status_payload(
+    payload: dict[str, object] | None,
+) -> dict[str, dict[str, object]]:
+    services = (payload or {}).get("services")
+    if not isinstance(services, list):
+        return {}
+    return {
+        str(service["service"]): service
+        for service in services
+        if isinstance(service, dict) and service.get("service")
+    }
 
 
 def _humanize_diagnostic_code(value: str | None) -> str:
@@ -174,10 +194,7 @@ def runtime_health_view(
             "health_target": health_target,
         }
 
-    if diagnosis in {
-        "backend_observation_deferred",
-        "backend_observation_unavailable",
-    }:
+    if diagnosis in UNKNOWN_RUNTIME_DIAGNOSES:
         return {
             "label": "UNKNOWN",
             "tone": "warn",

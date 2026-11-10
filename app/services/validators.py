@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 import json
 import posixpath
 import re
@@ -299,6 +300,36 @@ def _ensure_path_is_not_reserved_in_container(value: str, *, field_name: str) ->
                 f"{field_name} cannot overlap cnc-reserved container path {protected}: {value}"
             )
     return normalized
+
+
+def ensure_host_paths_not_nested(paths: Iterable[str], *, field_name: str) -> None:
+    """Reject a path that sits inside another one in the same set.
+
+    Backups archive and restore each host path as its own unit. A nested one
+    is staged inside its parent and swapped away with it, so a backup of the
+    pair can never be restored.
+    """
+    normalized = sorted({_normalize_posix_absolute_path(path) for path in paths})
+    for index, parent in enumerate(normalized):
+        prefix = parent.rstrip("/") + "/"
+        for child in normalized[index + 1 :]:
+            if child.startswith(prefix):
+                raise ValidationError(
+                    f"{field_name} cannot be nested: {child} is inside {parent}"
+                )
+
+
+def ensure_volume_sources_not_nested(backend: Backend) -> None:
+    sources = [
+        binding.source
+        for binding in map(
+            parse_volume_binding, parse_volumes_json(backend.volumes_json)
+        )
+        if binding.source.startswith("/")
+    ]
+    ensure_host_paths_not_nested(
+        sources, field_name=f"volume source paths for {backend.name}"
+    )
 
 
 def _validate_backend_mount_boundaries(backend: Backend, *, settings: Settings) -> None:

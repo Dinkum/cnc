@@ -43,12 +43,15 @@ async def create_input(
 ) -> Input:
     if payload.https_enabled and payload.kind != "domain":
         raise ValidationError("HTTPS can only be enabled on domain inputs")
+    if payload.connection == "cloudflare_tunnel" and payload.kind != "domain":
+        raise ValidationError("Cloudflare Tunnel is available for domain inputs only")
     value = ensure_input_value(payload.kind, payload.value)
     item = Input(
         kind=payload.kind,
         hostname=value,
         enabled=payload.enabled,
         https_enabled=payload.https_enabled,
+        connection=payload.connection,
         shield_enabled=payload.shield_enabled,
         shield_code_hash=payload.shield_code_hash,
         shield_access_code=payload.shield_access_code,
@@ -75,6 +78,11 @@ async def update_input(
     next_kind = str(values.get("kind") or item.kind or "domain")
     if values.get("https_enabled", item.https_enabled) and next_kind != "domain":
         raise ValidationError("HTTPS can only be enabled on domain inputs")
+    next_connection = values.get("connection") or item.connection or "public_ip"
+    if next_connection == "cloudflare_tunnel" and next_kind != "domain":
+        raise ValidationError("Cloudflare Tunnel is available for domain inputs only")
+    if next_connection != item.connection and item.cloudflare_dns_enabled:
+        raise ValidationError("Review the domain's Cloudflare changes before switching its managed DNS connection")
     if "value" in values or "kind" in values:
         item.hostname = ensure_input_value(
             next_kind, str(values.pop("value", item.hostname))

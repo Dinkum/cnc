@@ -176,6 +176,9 @@
                 <div class="picker-empty">No outputs yet &#x2014; add one first.</div>
               {% endif %}
             </div>
+            {% if cloudflare_tunnel.configured %}
+            <label class="field-span-2" data-input-connection-control>Connection<select name="connection"><option value="public_ip">Public IP</option><option value="cloudflare_tunnel" {% if not cloudflare_tunnel.connected %}disabled{% endif %}>Cloudflare Tunnel{{ ' · unavailable' if not cloudflare_tunnel.connected else '' }}</option></select></label>
+            {% endif %}
             <label class="toggle field-span-2" data-input-https-control>
               <input name="https_enabled" type="checkbox">
               <span>Enable HTTPS</span>
@@ -203,7 +206,7 @@
         {% endif %}
 
         <div class="table-wrap">
-          <table>
+          <table class="inputs-table">
             <thead>
               <tr>
                 <th>Value</th><th>Output</th><th>State</th><th class="th-chevron"></th>
@@ -216,6 +219,7 @@
                   <td>
                     <div class="table-primary">
                       <span class="mono">{{ detail.get("value", item.hostname) }}</span>
+                      {% if item.connection == 'cloudflare_tunnel' %}<span class="subtle">Tunnel</span>{% endif %}
                       {% if detail.get("change_state") == "new" %}
                         <span class="pill new">new</span>
                       {% endif %}
@@ -264,7 +268,7 @@
                           </div>
                         </div>
                         {% if detail.get("kind") == "domain" %}
-                        <div class="field-span-2 input-shield-card">
+                        <div class="field-span-2 input-shield-card" data-input-origin-https {% if item.connection == 'cloudflare_tunnel' %}hidden{% endif %}>
                           <label class="toggle">
                             <input name="https_enabled" type="checkbox" {% if detail.get("https_enabled") %}checked{% endif %}>
                             <span>Enable HTTPS</span>
@@ -1234,5 +1238,6 @@
   <script src="/static/js/dashboard.js?v={{ asset_version }}"></script>
   <script src="/static/js/operation-history.js?v={{ asset_version }}"></script>
   <script src="/static/js/cloudflare.js?v={{ asset_version }}"></script>
+  <script src="/static/js/cloudflare-tunnel.js?v={{ asset_version }}"></script>
 </body>
 </html>

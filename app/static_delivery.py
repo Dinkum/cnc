@@ -28,7 +28,6 @@ def stylesheet_asset_version(static_files_dir: Path) -> str:
 
 
 class StaticAssetCacheMiddleware:
-    """Cache only explicitly versioned static URLs without risking stale assets."""
 
     def __init__(self, app) -> None:
         self.app = app
@@ -59,7 +58,6 @@ class StaticAssetCacheMiddleware:
 
 
 class StaticCompressionMiddleware:
-    """Compress ordinary static responses while preserving byte-range semantics."""
 
     def __init__(self, app) -> None:
         self.app = app

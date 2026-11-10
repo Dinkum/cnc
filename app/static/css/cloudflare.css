@@ -29,3 +29,21 @@
 .cf-domain-fields [hidden] { display: none; }
 
 .cf-dialog a { color: var(--accent, #7cd8ff); text-underline-offset: 3px; }
+
+.cf-api-heading { margin: 16px 0 10px; font-size: 14px; font-weight: 500; }
+[data-cf-domain-form] { display: grid; gap: 12px; }
+[data-cf-domain-form] code, #cloudflare-tunnel-setup code { overflow-wrap: anywhere; }
+
+.cf-domain-card a { color: var(--accent, #7cd8ff); text-underline-offset: 3px; }
+@media (max-width: 600px) {
+  .inputs-table { min-width: 0; table-layout: fixed; }
+  .inputs-table th:first-child { width: 40%; }
+  .inputs-table th:nth-child(2) { width: 27%; }
+  .inputs-table th:nth-child(3) { width: 23%; }
+  .inputs-table th:last-child { width: 10%; }
+  .inputs-table td { overflow-wrap: anywhere; white-space: normal; }
+  .inputs-table .detail-card { padding: 12px; }
+  .inputs-table .detail-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+[data-cf-connection], [data-input-connection-control] select { appearance: auto; }

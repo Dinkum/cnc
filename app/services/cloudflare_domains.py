@@ -1,5 +1,3 @@
-"""Reviewable domain changes and background Cloudflare reconciliation."""
-
 from __future__ import annotations
 
 import asyncio
@@ -29,6 +27,11 @@ from app.services.cloudflare_connection import (
     token_fingerprint,
 )
 from app.services.cloudflare_dns import apply_dns_plan, dns_plan, ipv4_address
+from app.services.cloudflare_tunnel import (
+    connector_ready,
+    tunnel_identity,
+    tunnel_summary,
+)
 from app.services.host_state import LockedStateSectionTransaction
 from app.services.operations import (
     OperationHandle,
@@ -44,12 +47,21 @@ def domain_status(settings: Settings, item: Input) -> dict[str, Any]:
     if state.get("hostname") != item.hostname:
         state = {}
     summary = connection_summary(settings)
+    tunnel = tunnel_summary(settings)
     zone = matching_zone(settings, item.hostname, require_connected=False)
     configured = item.https_provider == "cloudflare_origin" or bool(
         item.cloudflare_dns_enabled
     )
     return {
-        "visible": bool(zone and summary["connected"]) or configured,
+        "visible": bool(zone and summary["connected"])
+        or configured
+        or tunnel["configured"]
+        or item.connection == "cloudflare_tunnel",
+        "connection": item.connection or "public_ip",
+        "tunnel": tunnel,
+        "hostname_status": "Not verified"
+        if item.connection == "cloudflare_tunnel"
+        else "",
         "available": bool(zone and summary["connected"]),
         "zone": zone["name"] if zone else "",
         "provider": item.https_provider or "self_signed",
@@ -84,6 +96,7 @@ def input_signature(item: Input) -> str:
         "kind": item.kind,
         "enabled": item.enabled,
         "https_enabled": item.https_enabled,
+        "connection": item.connection or "public_ip",
         "provider": item.https_provider,
         "dns_enabled": item.cloudflare_dns_enabled,
         "ipv4": item.cloudflare_dns_ipv4,
@@ -93,21 +106,52 @@ def input_signature(item: Input) -> str:
 
 
 def build_domain_preview(
-    settings: Settings, item: Input, *, provider: str, manage_dns: bool, ipv4: str
+    settings: Settings,
+    item: Input,
+    *,
+    provider: str,
+    manage_dns: bool,
+    ipv4: str,
+    connection: str | None = None,
+    route_confirmed: bool = False,
 ) -> dict[str, Any]:
     if item.kind != "domain":
         raise CloudflareError(
             "Cloudflare options are available for domain Inputs only."
         )
+    connection = connection or item.connection or "public_ip"
+    if connection not in {"public_ip", "cloudflare_tunnel"}:
+        raise CloudflareError("Choose Public IP or Cloudflare Tunnel.")
+    tunnel_id = ""
+    if connection == "cloudflare_tunnel":
+        summary = tunnel_summary(settings)
+        if not summary["connected"] or not connector_ready():
+            raise CloudflareError(
+                "The Tunnel connector is unavailable. Retest it in Settings first."
+            )
+        tunnel_id = tunnel_identity(settings.cloudflare_tunnel_token)
+        if manage_dns and not route_confirmed:
+            raise CloudflareError(
+                "Confirm that this hostname is configured in your Cloudflare Tunnel before managing DNS."
+            )
+        provider = item.https_provider or "self_signed"
     if provider not in {"self_signed", "cloudflare_origin"}:
         raise CloudflareError("Choose a supported certificate type.")
     zone = matching_zone(settings, item.hostname)
     if (
         manage_dns
-        or (provider == "cloudflare_origin" and item.https_provider != provider)
+        or (
+            connection == "public_ip"
+            and provider == "cloudflare_origin"
+            and item.https_provider != provider
+        )
     ) and not zone:
         raise CloudflareError("Connect Cloudflare with access to this domain first.")
-    if provider == "cloudflare_origin" and (not item.enabled or not item.backends):
+    if (
+        connection == "public_ip"
+        and provider == "cloudflare_origin"
+        and (not item.enabled or not item.backends)
+    ):
         raise CloudflareError(
             "Enable this Input and attach an Output before requesting an Origin CA certificate."
         )
@@ -126,7 +170,8 @@ def build_domain_preview(
             CloudflareClient(settings.cloudflare_api_token),
             zone_id=zone["id"],
             hostname=item.hostname,
-            ipv4=ipv4_address(ipv4),
+            ipv4="" if tunnel_id else ipv4_address(ipv4),
+            tunnel_id=tunnel_id,
             owned_record_id=owned,
         )
         if manage_dns
@@ -136,12 +181,19 @@ def build_domain_preview(
         "input_id": item.id,
         "hostname": item.hostname,
         "provider": provider,
+        "connection": connection,
+        "tunnel_fingerprint": token_fingerprint(settings.cloudflare_tunnel_token)
+        if tunnel_id
+        else "",
+        "tunnel_id": tunnel_id,
         "manage_dns": manage_dns,
         "ipv4": plan["ipv4"] if plan else "",
         "zone_id": zone["id"] if zone else "",
         "signature": input_signature(item),
         "token_fingerprint": token_fingerprint(settings.cloudflare_api_token),
-        "certificate": "Cloudflare Origin CA · enables HTTPS · supports Full (strict)"
+        "certificate": "Cloudflare Tunnel · hostname configured in Cloudflare"
+        if tunnel_id
+        else "Cloudflare Origin CA · enables HTTPS · supports Full (strict)"
         if provider == "cloudflare_origin"
         else "Self-signed · supports Full",
         "dns": plan,
@@ -183,6 +235,10 @@ def consume_preview(settings: Settings, item: Input, preview_id: str) -> dict[st
             raise CloudflareError(
                 "The Input or Cloudflare connection changed. Preview again."
             )
+        if preview.get("tunnel_fingerprint") and preview[
+            "tunnel_fingerprint"
+        ] != token_fingerprint(settings.cloudflare_tunnel_token):
+            raise CloudflareError("The Tunnel changed. Preview again.")
         state.value.pop(preview_id)
         state.mark_dirty()
     return preview
@@ -202,7 +258,6 @@ async def apply_domain_preview(
         if state.get("hostname") == item.hostname
         else ""
     )
-    # Revalidate remote state before provisioning or changing any local settings.
     if dns:
         live = await asyncio.to_thread(
             dns_plan,
@@ -210,16 +265,35 @@ async def apply_domain_preview(
             zone_id=preview["zone_id"],
             hostname=item.hostname,
             ipv4=preview["ipv4"],
+            tunnel_id=preview.get("tunnel_id", ""),
             owned_record_id=owned,
         )
         if live["fingerprint"] != dns["fingerprint"] or live["conflict"]:
             raise CloudflareError("DNS changed after the preview. Preview again.")
-    # Allocate the child before flush acquires SQLite's writer lock. Its deferred
-    # completion must not finish the outer operation before DNS has succeeded.
     apply_operation = await create_operation(
         settings, kind="apply_host", actor="ui", phase="Preparing HTTPS"
     )
-    if preview["provider"] == "cloudflare_origin":
+    previous_connection = (
+        state.get("previous_connection")
+        if state.get("pending_dns")
+        else item.connection
+    )
+    previous_connection = previous_connection or "public_ip"
+    next_connection = preview.get("connection", "public_ip")
+    if dns:
+        save_domain_status(
+            settings,
+            item,
+            pending_dns=True,
+            previous_connection=previous_connection,
+            keep_previous_connection=previous_connection != next_connection,
+            status="Needs attention",
+            error="Finish this domain's DNS review before automatic DNS updates resume.",
+        )
+    elif state.get("pending_dns"):
+        save_domain_status(settings, item, keep_previous_connection=False)
+    item.connection = next_connection
+    if item.connection == "public_ip" and preview["provider"] == "cloudflare_origin":
         allow_certificate_retry(settings, item.hostname)
         item.https_enabled = True
     item.https_provider = preview["provider"]
@@ -229,7 +303,6 @@ async def apply_domain_preview(
         settings,
         change=full_reconcile("cloudflare.domain.https"),
         operation_handle=apply_operation,
-        # Origin HTTPS rewrites shared ingress for every affected output.
     )
     if not mutation.applied:
         raise CloudflareError(
@@ -250,12 +323,42 @@ async def apply_domain_preview(
             owned_record_id=owned,
         )
         save_domain_status(
-            settings, item, record_id=record_id, zone_id=preview["zone_id"]
+            settings,
+            item,
+            record_id=record_id,
+            zone_id=preview["zone_id"],
+            confirmed_tunnel_id=preview.get("tunnel_id", ""),
+            keep_previous_connection=False,
         )
     item.cloudflare_dns_enabled = preview["manage_dns"]
     item.cloudflare_dns_ipv4 = preview["ipv4"] or None
     await session.commit()
-    save_domain_status(settings, item, status="Ready", error="")
+    if dns and previous_connection != next_connection:
+        cleanup_operation = await create_operation(
+            settings, kind="apply_host", actor="ui", phase="Finishing connection"
+        )
+        cleanup = await converge_change(
+            session,
+            settings,
+            change=full_reconcile("cloudflare.domain.connection"),
+            operation_handle=cleanup_operation,
+        )
+        if not cleanup.applied:
+            raise CloudflareError(
+                "DNS was updated, but the previous connection could not be retired. Review this domain again."
+            )
+    save_domain_status(
+        settings,
+        item,
+        pending_dns=False,
+        keep_previous_connection=False,
+        status="DNS managed · hostname not verified"
+        if item.connection == "cloudflare_tunnel" and item.cloudflare_dns_enabled
+        else "Hostname not verified"
+        if item.connection == "cloudflare_tunnel"
+        else "Ready",
+        error="",
+    )
 
 
 async def sync_cloudflare_domains(
@@ -290,7 +393,6 @@ async def sync_cloudflare_domains(
             for path in settings.nginx_generated_dir.glob("cnc-*.conf")
         }
         active_origins = set(origin_hosts(active_files, settings.app_control_dir))
-        # Reconcile only domains explicitly selected by the operator.
         for item in inputs:
             if not item.backends:
                 continue
@@ -299,6 +401,25 @@ async def sync_cloudflare_domains(
             ):
                 continue
             try:
+                state = section(settings, "cloudflare_domains").get(str(item.id), {})
+                if state.get("hostname") == item.hostname and state.get("pending_dns"):
+                    raise CloudflareError(
+                        "The previous DNS change did not finish. Review this domain again to resume DNS management."
+                    )
+                if item.connection == "cloudflare_tunnel":
+                    if not item.cloudflare_dns_enabled:
+                        continue
+                    confirmed = (
+                        state.get("confirmed_tunnel_id")
+                        if state.get("hostname") == item.hostname
+                        else None
+                    )
+                    if not confirmed or confirmed != tunnel_identity(
+                        settings.cloudflare_tunnel_token
+                    ):
+                        raise CloudflareError(
+                            "The Tunnel changed. Review this domain and confirm its hostname route before updating DNS."
+                        )
                 if item.hostname in active_origins:
                     files = {
                         name: content
@@ -335,7 +456,12 @@ async def sync_cloudflare_domains(
                         client,
                         zone_id=zone["id"],
                         hostname=item.hostname,
-                        ipv4=ipv4_address(item.cloudflare_dns_ipv4 or ""),
+                        ipv4=""
+                        if item.connection == "cloudflare_tunnel"
+                        else ipv4_address(item.cloudflare_dns_ipv4 or ""),
+                        tunnel_id=tunnel_identity(settings.cloudflare_tunnel_token)
+                        if item.connection == "cloudflare_tunnel"
+                        else "",
                         owned_record_id=owned,
                     )
                     record_id = await asyncio.to_thread(
@@ -348,7 +474,14 @@ async def sync_cloudflare_domains(
                     save_domain_status(
                         settings, item, record_id=record_id, zone_id=zone["id"]
                     )
-                save_domain_status(settings, item, status="Ready", error="")
+                save_domain_status(
+                    settings,
+                    item,
+                    status="DNS managed · hostname not verified"
+                    if item.connection == "cloudflare_tunnel"
+                    else "Ready",
+                    error="",
+                )
                 results.append({"hostname": item.hostname, "ok": True})
             except (
                 CloudflareError,

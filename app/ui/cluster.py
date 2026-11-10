@@ -1,4 +1,3 @@
-"""Cluster node queries and placement presentation for dashboard and output pages."""
 
 from __future__ import annotations
 
@@ -19,12 +18,9 @@ from app.services.cluster_nodes import (
     list_cluster_nodes,
 )
 from app.services.inter_app_interfaces import (
-    INTERFACE_DIRECTION_BIDIRECTIONAL,
-    INTERFACE_DIRECTION_IN,
     INTERFACE_STATUS_ACCEPTED,
     INTERFACE_STATUS_PENDING,
     INTERFACE_STATUS_REJECTED,
-    clean_interface_direction,
     clean_interface_status,
     inbound_inter_app_interfaces,
     read_inter_app_interfaces,
@@ -263,45 +259,6 @@ def _interface_status_label(status: str) -> str:
     return "pending"
 
 
-def _interface_path_view(
-    *,
-    current_backend: str,
-    other_backend: str,
-    direction: str,
-    inbound: bool,
-) -> dict[str, str]:
-    normalized = clean_interface_direction(direction)
-    if normalized == INTERFACE_DIRECTION_BIDIRECTIONAL:
-        return {
-            "left": other_backend if inbound else current_backend,
-            "right": current_backend if inbound else other_backend,
-            "direction_label": "BIDIRECTIONAL <->",
-        }
-    if inbound:
-        if normalized == INTERFACE_DIRECTION_IN:
-            return {
-                "left": current_backend,
-                "right": other_backend,
-                "direction_label": "OUTBOUND ->",
-            }
-        return {
-            "left": other_backend,
-            "right": current_backend,
-            "direction_label": "INBOUND ->",
-        }
-    if normalized == INTERFACE_DIRECTION_IN:
-        return {
-            "left": other_backend,
-            "right": current_backend,
-            "direction_label": "INBOUND ->",
-        }
-    return {
-        "left": current_backend,
-        "right": other_backend,
-        "direction_label": "OUTBOUND ->",
-    }
-
-
 def build_output_placement_card(
     backend: Backend,
     cluster_nodes: list[dict[str, str]],
@@ -376,13 +333,10 @@ def build_output_placement_card(
             "target_backend_id": item.target_backend_id,
             "target_backend_name": targets_by_id[item.target_backend_id],
             "status": clean_interface_status(item.status),
-            "direction": clean_interface_direction(item.direction),
-            **_interface_path_view(
-                current_backend=backend.name,
-                other_backend=targets_by_id[item.target_backend_id],
-                direction=item.direction,
-                inbound=False,
-            ),
+            # The source receives the target's URL; that is the only role
+            # an interface has, so the path always reads source -> target.
+            "left": backend.name,
+            "right": targets_by_id[item.target_backend_id],
             "status_label": _interface_status_label(
                 clean_interface_status(item.status)
             ),
@@ -396,13 +350,8 @@ def build_output_placement_card(
             "source_backend_id": item.source_backend_id,
             "source_backend_name": item.source_backend_name,
             "status": clean_interface_status(item.status),
-            "direction": clean_interface_direction(item.direction),
-            **_interface_path_view(
-                current_backend=backend.name,
-                other_backend=item.source_backend_name,
-                direction=item.direction,
-                inbound=True,
-            ),
+            "left": item.source_backend_name,
+            "right": backend.name,
         }
         for item in inbound_inter_app_interfaces(backend, all_backends)
         if clean_interface_status(item.status) != INTERFACE_STATUS_REJECTED

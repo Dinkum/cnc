@@ -29,9 +29,6 @@ def uses_shared_host_state_lock(path: Path) -> bool:
 
 def host_state_lock_path(path: Path) -> Path:
     normalized = path.expanduser()
-    # Protected system paths like /etc may be readable but not writable by the
-    # admin process. Keep those locks in CNC-owned state storage instead of
-    # trying to create sibling lock files next to the managed file itself.
     if uses_shared_host_state_lock(normalized):
         return shared_lock_path(normalized)
     return lock_path(normalized)
@@ -98,9 +95,6 @@ def write_text_atomic(path: Path, content: str, *, encoding: str = "utf-8") -> N
                 path=str(path),
                 error=str(exc),
             )
-            # Some hardened units expose an individual file through ReadWritePaths
-            # while keeping its parent directory read-only. Preserve that fallback
-            # only when sibling temp-file promotion is unavailable.
             _write_text_in_place(path, content, encoding=encoding)
             return
     _write_text_via_replace(path, content, encoding=encoding)

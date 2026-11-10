@@ -25,11 +25,8 @@
       controller.abort(new DOMException("Request timed out", "TimeoutError"));
     }, timeoutMs);
     try {
-      // Include body consumption: receiving headers does not finish a request.
       return await request(controller.signal);
     } catch (error) {
-      // Body readers may report AbortError even for a deadline. Preserve the
-      // reason so pollers distinguish timeouts from deliberate cancellation.
       throw controller.signal.aborted ? controller.signal.reason || error : error;
     } finally {
       window.clearTimeout(timer);
@@ -91,8 +88,6 @@
     const unit = payload.metric.unit_kind === "rate" ? "bytes_per_second" : payload.metric.unit_kind;
     const cell = (value) => {
       let text = String(value ?? "");
-      // Keep text cells inert in spreadsheet applications; numeric negatives
-      // remain numeric and retain their exact value.
       if (typeof value === "string" && /^[=+@\-\t\r]/.test(text)) text = `'${text}`;
       return `"${text.replaceAll('"', '""')}"`;
     };

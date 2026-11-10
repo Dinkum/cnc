@@ -31,11 +31,11 @@ from app.services.bootstrap_state import (
 from app.services.cgroup_diagnostics import collect_container_cgroup_diagnostics
 from app.services.commands import run_command
 from app.services.container_runtime import (
-    container_exists,
-    inspect_result_reports_missing,
+    container_presence,
     list_external_containers,
     list_mounted_containers,
 )
+from app.services.observation import Observation, Present, Unknown
 from app.services.guest_exec import (
     EXEC_CIRCUIT_OPEN_RETURN_CODE,
     EXEC_GUARD_BUSY_RETURN_CODE,
@@ -47,10 +47,13 @@ from app.services.renderers import container_name, network_name, safe_slug
 from app.services.sandbox_profiles import app_sandbox_rootfs_path
 
 
+ContainerListing = Observation[list[dict[str, Any]]]
+
+
 @dataclass(frozen=True)
 class AppDiagnosticsSnapshot:
-    external_containers: list[dict[str, Any]]
-    mounted_containers: list[dict[str, Any]]
+    external_containers: ContainerListing
+    mounted_containers: ContainerListing
 
 
 def collect_app_diagnostics_snapshot(settings: Settings) -> AppDiagnosticsSnapshot:
@@ -60,15 +63,15 @@ def collect_app_diagnostics_snapshot(settings: Settings) -> AppDiagnosticsSnapsh
     )
 
 
-def _load_external_containers(settings: Settings) -> list[dict[str, Any]]:
+def _load_external_containers(settings: Settings) -> ContainerListing:
     return list_external_containers(settings.command_timeout_status_sec)
 
 
-def _container_name_registered(container: str, settings: Settings) -> bool:
-    return container_exists(container, settings.command_timeout_status_sec)
+def _container_name_registered(container: str, settings: Settings) -> Observation[str]:
+    return container_presence(container, settings.command_timeout_status_sec)
 
 
-def _load_mounted_containers(settings: Settings) -> list[dict[str, Any]]:
+def _load_mounted_containers(settings: Settings) -> ContainerListing:
     return list_mounted_containers(settings.command_timeout_status_sec)
 
 
@@ -301,18 +304,20 @@ def collect_app_backend_diagnostics(
 ) -> dict[str, Any]:
     container = container_name(backend.name)
     network = network_name(backend.name)
-    inspect_result, inspect_payload = inspect_container(
+    container_observation = inspect_container(
         container, settings.command_timeout_status_sec
     )
-    network_result, network_payload = inspect_network(
-        network, settings.command_timeout_status_sec
+    network_observation = inspect_network(network, settings.command_timeout_status_sec)
+    inspect_payload = (
+        container_observation.value
+        if isinstance(container_observation, Present)
+        else None
     )
-    container_observation_available = bool(
-        inspect_payload is not None or inspect_result_reports_missing(inspect_result)
+    network_payload = (
+        network_observation.value if isinstance(network_observation, Present) else None
     )
-    network_observation_available = bool(
-        network_payload is not None or inspect_result_reports_missing(network_result)
-    )
+    container_observation_available = not isinstance(container_observation, Unknown)
+    network_observation_available = not isinstance(network_observation, Unknown)
     runtime_observation_available = (
         container_observation_available and network_observation_available
     )
@@ -329,16 +334,22 @@ def collect_app_backend_diagnostics(
     bootstrap_state = read_bootstrap_state(settings, backend.name)
     failure_artifact = read_failure_artifact(settings, backend.name)
     bootstrap_lock_active = bootstrap_lock_is_held(settings, backend.name)
-    external_containers = (
+    external_listing = (
         snapshot.external_containers
         if snapshot is not None
         else _load_external_containers(settings)
     )
-    mounted_containers = (
+    mounted_listing = (
         snapshot.mounted_containers
         if snapshot is not None
         else _load_mounted_containers(settings)
     )
+    # Repair unmounts only what the mounted listing names, so both listings must be known.
+    storage_listing_available = isinstance(external_listing, Present) and isinstance(
+        mounted_listing, Present
+    )
+    external_containers = external_listing.value if storage_listing_available else []
+    mounted_containers = mounted_listing.value if storage_listing_available else []
     external_entries = [
         entry for entry in external_containers if container in _entry_names(entry)
     ]
@@ -351,15 +362,15 @@ def collect_app_backend_diagnostics(
         if _entry_id(entry) in mounted_entries_by_id
     ]
     state_payload = container_state_payload(container, inspect_payload)
-    name_registered = (
-        True
-        if inspect_payload is not None
-        else (
-            _container_name_registered(container, settings)
-            if container_observation_available
-            else False
-        )
-    )
+    name_registration_available = True
+    if inspect_payload is not None:
+        name_registered = True
+    elif not container_observation_available:
+        name_registered = False
+    else:
+        registration = _container_name_registered(container, settings)
+        name_registered = isinstance(registration, Present)
+        name_registration_available = not isinstance(registration, Unknown)
     target_ip = (
         container_ipv4_address(backend, inspect_payload)
         if container_running is True
@@ -515,6 +526,10 @@ def collect_app_backend_diagnostics(
         observation_issues.append("container_state_unavailable")
     if not network_observation_available:
         observation_issues.append("network_inspect_unavailable")
+    if not storage_listing_available:
+        observation_issues.append("storage_listing_unavailable")
+    if not name_registration_available:
+        observation_issues.append("name_registration_unavailable")
     if container_missing and saved_spec is not None:
         issues.append("container_missing")
     if container_missing and external_entries:
@@ -683,7 +698,7 @@ def collect_app_backend_diagnostics(
         and target_ip is not None
         and (not healthcheck_enabled or private_ok)
         and (not healthcheck_enabled or backend.port is None or loopback_ok),
-        "inspect_error": (inspect_result.stderr or inspect_result.stdout)
-        if not inspect_result.ok
+        "inspect_error": container_observation.describe()
+        if isinstance(container_observation, Unknown)
         else "",
     }

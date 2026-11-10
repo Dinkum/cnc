@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from app.services import cloudflare_ingress
+from app.services.cloudflare_tunnel import TUNNEL_ORIGIN_PORT
 
 SHIELD_BACKEND_NAME = "shield"
 SHIELD_PROFILE = "shield"
@@ -39,19 +40,96 @@ def _cloudflare_acl_lines(enabled: bool, cloudflare_ips: tuple[str, ...]) -> lis
     return cloudflare_ingress.render_cloudflare_nginx_acl(policy)
 
 
+def _shield_location_lines(
+    shield_upstream: str, *, shield_output_key: str, cloudflare_only: bool
+) -> list[str]:
+    # Shield limits guesses per client, so the client must be named by nginx,
+    # never by the request. Behind the Cloudflare-only ACL every peer is a
+    # Cloudflare edge, which overwrites CF-Connecting-IP; anywhere else that
+    # header is client-supplied and the peer address is the only fact.
+    client_ip = "$http_cf_connecting_ip" if cloudflare_only else "$remote_addr"
+    forwarded = [
+        f"        proxy_set_header X-Shield-Output {shield_output_key};",
+        f"        proxy_set_header X-CNC-Client-IP {client_ip};",
+        "        proxy_set_header X-Real-IP $remote_addr;",
+        "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
+        "        proxy_set_header X-Forwarded-Proto $scheme;",
+    ]
+    return [
+        f"    location = {SHIELD_AUTH_PATH} {{",
+        "        internal;",
+        f"        proxy_pass http://{shield_upstream}/check;",
+        "        proxy_pass_request_body off;",
+        '        proxy_set_header Content-Length "";',
+        "        proxy_set_header X-Original-URI $request_uri;",
+        "        proxy_set_header X-Original-Host $host;",
+        *forwarded,
+        "    }",
+        "",
+        "    location @cnc_shield_login {",
+        f"        return 302 {SHIELD_PUBLIC_PATH_PREFIX}/access?next=$request_uri;",
+        "    }",
+        "",
+        f"    location {SHIELD_PUBLIC_PATH_PREFIX}/ {{",
+        "        proxy_http_version 1.1;",
+        '        proxy_set_header Connection "";',
+        f"        proxy_pass http://{shield_upstream}/;",
+        "        proxy_set_header Host $host;",
+        *forwarded,
+        "    }",
+        "",
+    ]
+
+
+def _tunnel_scheme_map(hostname: str) -> list[str]:
+    variable = f"$cnc_tunnel_proto_{safe_slug(hostname).replace('-', '_')}"
+    return [
+        f"map $http_x_forwarded_proto {variable} {{",
+        "    default https;",
+        "    http http;",
+        "    https https;",
+        "}",
+        "",
+    ]
+
+
+def _tunnel_headers(config: str, hostname: str) -> str:
+    variable = f"$cnc_tunnel_proto_{safe_slug(hostname).replace('-', '_')}"
+    return (
+        config.replace("X-Forwarded-Proto $scheme", f"X-Forwarded-Proto {variable}")
+        .replace(
+            "X-Forwarded-For $proxy_add_x_forwarded_for", "X-Forwarded-For $remote_addr"
+        )
+        .replace(
+            "proxy_set_header X-Real-IP $remote_addr;",
+            'proxy_set_header Forwarded "";\n        proxy_set_header X-Real-IP $remote_addr;',
+        )
+    )
+
+
+def _tunnel_client_ip() -> list[str]:
+    return [
+        "    set_real_ip_from 127.0.0.1;",
+        "    real_ip_header CF-Connecting-IP;",
+        "",
+    ]
+
+
 def render_nginx_http(
     hostname: str,
     ports: int | str | list[int | str],
     *,
     cloudflare_only: bool = False,
     cloudflare_ips: tuple[str, ...] = (),
+    tunnel: bool = False,
+    upstream_suffix: str = "",
     tls_certificate: str | None = None,
     shield_enabled: bool = False,
     shield_port: int = SHIELD_PORT,
     shield_target: int | str | None = None,
     shield_output_key: str = "global",
 ) -> str:
-    upstream = upstream_name(hostname)
+    upstream = upstream_name(hostname) + upstream_suffix
     if isinstance(ports, int | str):
         upstream_servers = [_nginx_upstream_server(ports)]
     else:
@@ -84,13 +162,19 @@ def render_nginx_http(
     lines.extend(
         [
             "server {",
-            "    listen 80;",
+            f"    listen 127.0.0.1:{TUNNEL_ORIGIN_PORT};"
+            if tunnel
+            else "    listen 80;",
             f"    server_name {hostname};",
             "",
         ]
     )
-    lines.extend(_cloudflare_acl_lines(cloudflare_only, cloudflare_ips))
-    if tls_certificate:
+    lines.extend(
+        _tunnel_client_ip()
+        if tunnel
+        else _cloudflare_acl_lines(cloudflare_only, cloudflare_ips)
+    )
+    if tls_certificate and not tunnel:
         lines.extend(
             [
                 "    listen 443 ssl;",
@@ -101,36 +185,11 @@ def render_nginx_http(
         )
     if shield_enabled:
         lines.extend(
-            [
-                f"    location = {SHIELD_AUTH_PATH} {{",
-                "        internal;",
-                f"        proxy_pass http://{shield_upstream}/check;",
-                "        proxy_pass_request_body off;",
-                '        proxy_set_header Content-Length "";',
-                "        proxy_set_header X-Original-URI $request_uri;",
-                "        proxy_set_header X-Original-Host $host;",
-                f"        proxy_set_header X-Shield-Output {shield_output_key};",
-                "        proxy_set_header X-Real-IP $remote_addr;",
-                "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
-                "        proxy_set_header X-Forwarded-Proto $scheme;",
-                "    }",
-                "",
-                "    location @cnc_shield_login {",
-                f"        return 302 {SHIELD_PUBLIC_PATH_PREFIX}/access?next=$request_uri;",
-                "    }",
-                "",
-                f"    location {SHIELD_PUBLIC_PATH_PREFIX}/ {{",
-                "        proxy_http_version 1.1;",
-                '        proxy_set_header Connection "";',
-                f"        proxy_pass http://{shield_upstream}/;",
-                "        proxy_set_header Host $host;",
-                f"        proxy_set_header X-Shield-Output {shield_output_key};",
-                "        proxy_set_header X-Real-IP $remote_addr;",
-                "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
-                "        proxy_set_header X-Forwarded-Proto $scheme;",
-                "    }",
-                "",
-            ]
+            _shield_location_lines(
+                shield_upstream,
+                shield_output_key=shield_output_key,
+                cloudflare_only=cloudflare_only,
+            )
         )
     lines.extend(
         [
@@ -155,7 +214,8 @@ def render_nginx_http(
             "",
         ]
     )
-    return "\n".join(lines)
+    config = "\n".join((_tunnel_scheme_map(hostname) if tunnel else []) + lines)
+    return _tunnel_headers(config, hostname) if tunnel else config
 
 
 def _nginx_upstream_server(value: int | str) -> str:
@@ -202,13 +262,15 @@ def render_nginx_static(
     *,
     cloudflare_only: bool = False,
     cloudflare_ips: tuple[str, ...] = (),
+    tunnel: bool = False,
+    upstream_suffix: str = "",
     tls_certificate: str | None = None,
     shield_enabled: bool = False,
     shield_port: int = SHIELD_PORT,
     shield_target: int | str | None = None,
     shield_output_key: str = "global",
 ) -> str:
-    upstream = upstream_name(hostname)
+    upstream = upstream_name(hostname) + upstream_suffix
     shield_upstream = f"{upstream}_shield"
     lines: list[str] = []
     if shield_enabled:
@@ -227,15 +289,21 @@ def render_nginx_static(
     lines.extend(
         [
             "server {",
-            "    listen 80;",
+            f"    listen 127.0.0.1:{TUNNEL_ORIGIN_PORT};"
+            if tunnel
+            else "    listen 80;",
             f"    server_name {hostname};",
             f"    root {static_root};",
             "    index index.html;",
             "",
         ]
     )
-    lines.extend(_cloudflare_acl_lines(cloudflare_only, cloudflare_ips))
-    if tls_certificate:
+    lines.extend(
+        _tunnel_client_ip()
+        if tunnel
+        else _cloudflare_acl_lines(cloudflare_only, cloudflare_ips)
+    )
+    if tls_certificate and not tunnel:
         lines.extend(
             [
                 "    listen 443 ssl;",
@@ -246,36 +314,11 @@ def render_nginx_static(
         )
     if shield_enabled:
         lines.extend(
-            [
-                f"    location = {SHIELD_AUTH_PATH} {{",
-                "        internal;",
-                f"        proxy_pass http://{shield_upstream}/check;",
-                "        proxy_pass_request_body off;",
-                '        proxy_set_header Content-Length "";',
-                "        proxy_set_header X-Original-URI $request_uri;",
-                "        proxy_set_header X-Original-Host $host;",
-                f"        proxy_set_header X-Shield-Output {shield_output_key};",
-                "        proxy_set_header X-Real-IP $remote_addr;",
-                "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
-                "        proxy_set_header X-Forwarded-Proto $scheme;",
-                "    }",
-                "",
-                "    location @cnc_shield_login {",
-                f"        return 302 {SHIELD_PUBLIC_PATH_PREFIX}/access?next=$request_uri;",
-                "    }",
-                "",
-                f"    location {SHIELD_PUBLIC_PATH_PREFIX}/ {{",
-                "        proxy_http_version 1.1;",
-                '        proxy_set_header Connection "";',
-                f"        proxy_pass http://{shield_upstream}/;",
-                "        proxy_set_header Host $host;",
-                f"        proxy_set_header X-Shield-Output {shield_output_key};",
-                "        proxy_set_header X-Real-IP $remote_addr;",
-                "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
-                "        proxy_set_header X-Forwarded-Proto $scheme;",
-                "    }",
-                "",
-            ]
+            _shield_location_lines(
+                shield_upstream,
+                shield_output_key=shield_output_key,
+                cloudflare_only=cloudflare_only,
+            )
         )
     lines.extend(
         [
@@ -294,7 +337,8 @@ def render_nginx_static(
             "",
         ]
     )
-    return "\n".join(lines)
+    config = "\n".join((_tunnel_scheme_map(hostname) if tunnel else []) + lines)
+    return _tunnel_headers(config, hostname) if tunnel else config
 
 
 def render_follower_admin_proxy(
@@ -343,7 +387,6 @@ def render_follower_admin_proxy(
 def render_nginx_https_default(
     *, cloudflare_only: bool = False, cloudflare_ips: tuple[str, ...] = ()
 ) -> str:
-    # Reject unknown/disabled SNI names rather than serving the first HTTPS app.
     lines = [
         "server {",
         "    listen 443 ssl default_server;",

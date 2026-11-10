@@ -118,7 +118,7 @@ def current_tailscale_admin_hostnames(settings: Settings) -> tuple[str, ...]:
         if funnel_result.ok:
             mappings.extend(_parse_status_mappings(funnel_result.stdout, mode="funnel"))
         hostnames = _admin_mapping_hostnames(mappings)
-    except Exception as exc:  # pragma: no cover - defensive path
+    except Exception as exc:
         logger.warning("tailscale.admin.hostnames.failed", error=str(exc))
         hostnames = ()
 

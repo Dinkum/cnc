@@ -1,14 +1,3 @@
-"""tailscale: private ingress over the tailnet.
-
-Serve paths and Services, plus the admin-exposure precheck that proves CNC's
-own interface is still reachable after they change.
-
-The state file is why this tool keeps a record rather than only reading the
-box. ``tailscale serve status`` is awkward to diff against a desired map, so
-CNC writes down what it set. That is a legitimate stand-in for state you cannot
-cheaply read back, and it stays honest because a missing or malformed file
-falls through to reconciling rather than to assuming the box is fine.
-"""
 
 from __future__ import annotations
 
@@ -36,29 +25,16 @@ TAILSCALE_SERVICE_TAG_REQUIRED_MESSAGE = (
 )
 
 tool_name = "tailscale"
-#: Phase strings this tool owns. Published to clients in apply details and
-#: matched by the progress card, so they keep their existing spelling.
 phases = ("tailscale_paths", "tailscale_services")
 
 
 def _default_services() -> Any:
-    """Fall back to the standard apply services when a caller omits them.
-
-    Imported lazily: apply_service imports this module, so a module-level
-    import would be circular.
-    """
     from app.services.apply_service import default_apply_services
 
     return default_apply_services()
 
 
 async def tailscale(plan: Plan) -> bool:
-    """Converge Serve paths and Services against the tailnet.
-
-    Reads CNC's own record of what it set and compares. When it already
-    matches, nothing runs, which is the common case for a save that did not
-    touch routing.
-    """
     if converged(plan.desired, plan.settings, services=plan.services):
         plan.details["tailscale_paths"] = [
             {"path": path, "target": target}
@@ -89,20 +65,9 @@ async def tailscale(plan: Plan) -> bool:
 def converged(
     desired: DesiredState, settings: Settings, *, services: Any = None
 ) -> bool:
-    """Whether the tailnet is already serving what desired state asks for.
-
-    The record CNC wrote is checked first because it is free, but it is never
-    the answer on its own: it says what CNC last asked for, not what Tailscale
-    is doing now. Anything that changes Serve outside CNC leaves the record
-    correct and the routing wrong, so the live state has the final say.
-    """
     state_path = settings.tailscale_serve_state_path
     owned = read_tailscale_state(state_path) or read_tailscale_service_state(state_path)
     if not desired.tailscale_paths and not desired.tailscale_services and not owned:
-        # CNC publishes nothing here and has never published anything here, so
-        # there is no route of ours to withdraw and nothing to inspect. Saying
-        # "converged" is the honest answer, and it keeps an unrelated save from
-        # touching the tailnet at all.
         return True
     record_matches = (
         read_tailscale_state(state_path) == desired.tailscale_paths
@@ -112,8 +77,6 @@ def converged(
         return False
     live = observe_serve(settings, services=services)
     if live is None:
-        # Could not read the tailnet. Reconciling is the safe answer, because
-        # the alternative is trusting a record we cannot confirm.
         return False
     live_paths, live_services = live
     return live_paths == dict(desired.tailscale_paths) and live_services == dict(
@@ -124,7 +87,6 @@ def converged(
 def observe_serve_paths(
     settings: Settings, *, services: Any = None
 ) -> dict[str, str] | None:
-    """What Serve paths the tailnet is publishing, or None if unreadable."""
     observed = observe_serve(settings, services=services)
     return None if observed is None else observed[0]
 
@@ -132,12 +94,6 @@ def observe_serve_paths(
 def observe_serve(
     settings: Settings, *, services: Any = None
 ) -> tuple[dict[str, str], dict[str, str]] | None:
-    """Live Serve paths and Services, or None when the tailnet is unreadable.
-
-    Both halves matter. Checking only paths let a desired Service sit in the
-    record while the tailnet published nothing, and the tool called that
-    converged.
-    """
     runner = getattr(
         getattr(services, "runtime_services", None), "run_command", run_command
     )
@@ -172,17 +128,6 @@ def _serve_paths(payload: dict[str, Any]) -> dict[str, str]:
 
 
 def _serve_services(payload: dict[str, Any]) -> dict[str, str]:
-    """Published Tailscale Services, keyed the way desired state names them.
-
-    Follows ``ipn.ServeConfig``: ``Services`` maps a ``svc:``-prefixed name to a
-    ``ServiceConfig`` whose ``Web`` maps a host:port to a ``WebServerConfig``,
-    whose ``Handlers`` map a path to an ``HTTPHandler`` carrying ``Proxy``.
-    Desired state names services without the ``svc:`` prefix, so it is stripped
-    here rather than leaking the wire spelling into the comparison.
-
-    An earlier version looked for ``Proxy`` directly under the service and so
-    reported every correctly configured Service as absent.
-    """
     services_payload = payload.get("Services")
     if not isinstance(services_payload, dict):
         return {}
@@ -198,12 +143,6 @@ def _serve_services(payload: dict[str, Any]) -> dict[str, str]:
 
 
 def _first_web_proxy(entry: Any) -> str:
-    """The proxy target a ServiceConfig publishes, if it publishes one.
-
-    CNC publishes one target per Service at the root path, so the first proxy
-    handler is the whole answer. Ordered so the result is stable when a Service
-    somehow carries more than one.
-    """
     if not isinstance(entry, dict):
         return ""
     web = entry.get("Web")

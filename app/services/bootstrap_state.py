@@ -395,8 +395,6 @@ def bootstrap_lock_is_held(settings: Settings, backend_name: str) -> bool:
 def bootstrap_state_age_seconds(payload: dict[str, Any] | None) -> int | None:
     if not isinstance(payload, dict):
         return None
-    # Staleness is lack of progress, not total operation age. Writers refresh
-    # updated_at on each meaningful bootstrap state transition or heartbeat.
     raw_started_at = payload.get("updated_at") or payload.get("started_at")
     if not isinstance(raw_started_at, str) or not raw_started_at.strip():
         return None

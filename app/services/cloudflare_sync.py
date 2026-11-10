@@ -467,8 +467,6 @@ async def _run_apply_for_sync(settings: Settings) -> tuple[dict[str, Any], bool]
         response = await run_apply(
             session,
             settings,
-            # The CIDR list is host-wide ingress policy, so its convergence
-            # legitimately covers every output.
             scope=full_reconcile("timer.cloudflare.sync").scope(),
         )
     return json.loads(response.model_dump_json()), response.status == "success"
@@ -693,7 +691,6 @@ async def run_cloudflare_sync(settings: Settings) -> dict[str, Any]:
             )
             return payload
 
-        # Context entry can defer before yielding, so the gate owns its own phase.
         current_phase = "mutation_gate"
         if fetched_cidrs != settings.cloudflare_ip_list:
             payload["changed"] = True

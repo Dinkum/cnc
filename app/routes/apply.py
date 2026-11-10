@@ -24,7 +24,6 @@ async def apply_all(
     _csrf: None = Depends(csrf_api_dependency),
 ) -> ApplyResponse:
     logger.info("apply.api.requested")
-    # The apply endpoint is the explicit whole-host reconcile.
     response = await run_apply(
         session, settings, scope=full_reconcile("api.host.apply").scope()
     )

@@ -1,4 +1,3 @@
-"""Present output event history without losing diagnostic detail."""
 
 from __future__ import annotations
 

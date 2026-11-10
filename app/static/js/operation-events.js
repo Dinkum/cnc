@@ -1,6 +1,6 @@
 (() => {
   const RUNNING_STATUSES = new Set(["queued", "running"]);
-  const TERMINAL_STATUSES = new Set(["success", "failed", "partial", "cancelled"]);
+  const TERMINAL_STATUSES = new Set(["success", "failed", "unknown"]);
 
   const operationUrl = (operationId) => `/api/operations/${encodeURIComponent(operationId)}`;
   const operationEventsUrl = (operationId) => `/api/operations/${encodeURIComponent(operationId)}/events`;
@@ -14,10 +14,8 @@
   };
 
   const normalizeStatus = (payload) => {
-    const presented = String(payload?.presentation?.status_label || "").toLowerCase();
-    if (presented === "saved") return "success";
-    if (presented === "failed") return "failed";
-    return String(payload?.status || "").toLowerCase();
+    const state = String(payload?.presentation?.state || "").toLowerCase();
+    return RUNNING_STATUSES.has(state) || TERMINAL_STATUSES.has(state) ? state : "unknown";
   };
 
   const responseError = async (response) => {
@@ -28,7 +26,6 @@
   const dispatchPayload = async (payload, handlers, settle) => {
     if (settle.isTerminal()) return true;
     const status = normalizeStatus(payload);
-    // EOF can arrive while a terminal callback awaits its page refresh.
     if (TERMINAL_STATUSES.has(status)) settle.beginTerminal();
     if (RUNNING_STATUSES.has(status)) {
       await handlers.onProgress?.(payload);
@@ -210,6 +207,7 @@
 
   window.CNCOperations = {
     activeOperations,
+    normalizeStatus,
     watchOperation,
   };
 })();

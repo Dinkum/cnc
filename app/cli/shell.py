@@ -46,8 +46,6 @@ def _format_exec_text(payload: dict) -> str:
 
 def _exec_options(args: argparse.Namespace) -> list[str]:
     values = list(args.exec_args)
-    # REMAINDER preserves arbitrary application flags. CNC options after OUTPUT
-    # are parsed only before an explicit --, never from the guest command itself.
     if "--" in values:
         boundary = values.index("--")
         options, values = values[:boundary], values[boundary + 1 :]
@@ -60,7 +58,6 @@ def _exec_options(args: argparse.Namespace) -> list[str]:
         )
         parsed, unknown = parser.parse_known_args(options)
         if unknown:
-            # Existing `exec OUTPUT command -- flags` remains a raw command.
             if options and not options[0].startswith("--"):
                 return list(args.exec_args)
             raise ValueError(

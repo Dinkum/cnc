@@ -46,7 +46,6 @@ def collect_app_backend_logs(
 def collect_saved_app_logs(
     backend_name: str, settings: Settings, *, lines: int = 200
 ) -> dict[str, Any] | None:
-    """Read retained failure evidence after a create transaction rolls back."""
     try:
         backend_name = ensure_backend_name(backend_name)
     except ValidationError:

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from fastapi import (
     APIRouter,
-    BackgroundTasks,
     Depends,
     Form,
     Request,
@@ -26,7 +25,8 @@ from app.logger import get_logger
 from app.models.entities import Backend
 from app.security import enforce_csrf
 from app.services import backend_commands
-from app.services.app_runtime import remove_deleted_app_filesystem_artifacts
+from app.services.mutation_queue import enqueue_mutation
+from app.ui.operations.output_lifecycle import converge_output_delete
 from app.services.apply_service import (
     default_apply_services,
     run_apply,
@@ -38,7 +38,6 @@ from app.services.error_reporting import (
 from app.services.inter_app_interfaces import (
     INTERFACE_STATUS_ACCEPTED,
     INTERFACE_STATUS_REJECTED,
-    clean_interface_direction,
     clean_interface_status,
 )
 from app.services.config_change import converge_change, output_change
@@ -52,7 +51,7 @@ from app.services.operations import (
     create_operation,
 )
 from app.services.shield_service import make_code_hash
-from app.services.ssh_access import deferred_backend_ssh_reconcile, remove_backend_ssh_access
+from app.services.ssh_access import deferred_backend_ssh_reconcile
 from app.services.validators import ValidationError
 from app.ui.dashboard.context import cached_dashboard_context
 from app.ui.errors import operator_action_error as _operator_action_error
@@ -81,16 +80,6 @@ from app.ui.mutation_feedback import (
     host_mutation_preflight_message,
 )
 from app.ui.operations.common import operation_response as _operation_response
-from app.ui.operations.output_lifecycle import (
-    _run_create_backend_operation,
-    _run_delete_operation,
-)
-from app.ui.operations.output_save import (
-    _run_update_backend_inputs_operation,
-    _run_update_backend_interface_operation,
-    _run_update_backend_operation,
-    _run_update_backend_state_operation,
-)
 from app.ui.outputs.context import output_page_context
 from app.ui.outputs.settings import backend_section_payload
 from app.ui.progress import (
@@ -132,7 +121,6 @@ async def _output_host_mutation_preflight(
 @router.post("/ui/backends")
 async def create_backend_form(
     request: Request,
-    background_tasks: BackgroundTasks,
     settings: Settings = Depends(settings_dependency),
     csrf_token: str = Form(...),
     name: str = Form(...),
@@ -233,8 +221,12 @@ async def create_backend_form(
                     "backend_kind": payload.kind,
                 },
             )
-            background_tasks.add_task(
-                _run_create_backend_operation, settings, operation.id, payload
+            await enqueue_mutation(
+                settings,
+                operation.id,
+                "create_backend",
+                payload=payload.model_copy(update={"shield_access_code": None}),
+                secret_kwargs={"shield_access_code": payload.shield_access_code},
             )
             return _operation_response(operation, message="Creating output.")
         backend = await backend_commands.create_backend(session, payload, commit=False)
@@ -411,13 +403,12 @@ async def update_backend_form(
                 backend_name=backend.name,
             ),
         )
-        background_tasks = BackgroundTasks()
-        background_tasks.add_task(
-            _run_update_backend_operation,
+        await enqueue_mutation(
             settings,
             operation.id,
-            backend.id,
-            {
+            "update_backend",
+            backend_id=backend.id,
+            form_values={
                 "name": name,
                 "kind": kind,
                 "port": port,
@@ -438,11 +429,10 @@ async def update_backend_form(
                 "drop_capabilities": drop_capabilities,
                 "notes": notes,
                 "shield_enabled": shield_enabled,
-                "shield_access_code": shield_access_code,
             },
+            secret_kwargs={"shield_access_code": shield_access_code},
         )
         response = _operation_response(operation, message="Output save started.")
-        response.background = background_tasks
         return response
     current_enabled = bool(backend.enabled)
     try:
@@ -584,16 +574,18 @@ async def update_backend_section_form(
             section=section,
         ),
     )
-    tasks = BackgroundTasks()
-    tasks.add_task(
-        _run_update_backend_operation,
+    await enqueue_mutation(
         settings,
         operation.id,
-        backend_id,
-        {"section": section, "values": values},
+        "update_backend",
+        backend_id=backend_id,
+        form_values={
+            "section": section,
+            "values": {k: v for k, v in values.items() if k != "shield_access_code"},
+        },
+        secret_kwargs={"shield_access_code": values.get("shield_access_code", "")},
     )
     response = _operation_response(operation, message="Output save started.")
-    response.background = tasks
     return response
 
 
@@ -653,18 +645,16 @@ async def update_backend_inputs_form(
                 backend_name=backend.name,
             ),
         )
-        background_tasks = BackgroundTasks()
-        background_tasks.add_task(
-            _run_update_backend_inputs_operation,
+        await enqueue_mutation(
             settings,
             operation.id,
-            backend.id,
-            [str(item) for item in form.getlist("input_ids")],
+            "update_backend_inputs",
+            backend_id=backend.id,
+            input_ids=[str(item) for item in form.getlist("input_ids")],
         )
         response = _operation_response(
             operation, message="Attached inputs save started."
         )
-        response.background = background_tasks
         return response
     try:
         payload = _backend_inputs_payload_from_form(input_ids=form.getlist("input_ids"))
@@ -724,13 +714,11 @@ async def update_backend_inputs_form(
 async def update_backend_inbound_interface_form(
     backend_id: int,
     request: Request,
-    background_tasks: BackgroundTasks,
     settings: Settings = Depends(settings_dependency),
     csrf_token: str = Form(...),
     source_backend_id: int = Form(...),
     interface_name: str = Form(...),
     status: str = Form(...),
-    direction: str = Form(""),
     session: AsyncSession = Depends(db_session_dependency),
 ) -> Response:
     enforce_csrf(request, settings, csrf_token)
@@ -770,7 +758,6 @@ async def update_backend_inbound_interface_form(
         )
 
     next_status = clean_interface_status(status)
-    next_direction = clean_interface_direction(direction)
     if next_status not in {INTERFACE_STATUS_ACCEPTED, INTERFACE_STATUS_REJECTED}:
         return _operator_error_json(
             "interface action is invalid",
@@ -796,18 +783,16 @@ async def update_backend_inbound_interface_form(
                 source_backend_id=source_backend_id,
                 interface_name=interface_name,
                 status=next_status,
-                direction=next_direction,
             ),
         )
-        background_tasks.add_task(
-            _run_update_backend_interface_operation,
+        await enqueue_mutation(
             settings,
             operation.id,
-            backend.id,
+            "update_backend_interface",
+            backend_id=backend.id,
             source_backend_id=source_backend_id,
             interface_name=interface_name,
             status=next_status,
-            direction=next_direction,
         )
         return _operation_response(operation, message="Interface action started.")
     except Exception as exc:
@@ -915,16 +900,14 @@ async def update_backend_state_form(
                 enabled=target_enabled,
             ),
         )
-        background_tasks = BackgroundTasks()
-        background_tasks.add_task(
-            _run_update_backend_state_operation,
+        await enqueue_mutation(
             settings,
             operation.id,
-            backend.id,
-            target_enabled,
+            "update_backend_state",
+            backend_id=backend.id,
+            target_enabled=target_enabled,
         )
         response = _operation_response(operation, message="Output state save started.")
-        response.background = background_tasks
         return response
     try:
         backend = await backend_commands.set_backend_enabled(
@@ -1064,12 +1047,13 @@ async def delete_backend_form(
             operation_id=operation.id,
             request_mode="async",
         )
-        background_tasks = BackgroundTasks()
-        background_tasks.add_task(
-            _run_delete_operation, settings, operation.id, backend.id
+        await enqueue_mutation(
+            settings,
+            operation.id,
+            "delete_backend",
+            backend_id=backend.id,
         )
         response = _operation_response(operation, message="Delete started.")
-        response.background = background_tasks
         return response
 
     deleted_backend_name = str(backend.name or "").strip()
@@ -1078,58 +1062,31 @@ async def delete_backend_form(
         services = default_apply_services()
         services.reconcile_backend_ssh_access = deferred_backend_ssh_reconcile
         services.cleanup_deleted_app_filesystem = False
-        mutation = await converge_change(
+        outcome = await converge_output_delete(
             session,
             settings,
-            change=output_change(
-                "ui.backend.delete", deleted_backend_name
-            ),
-            apply_runner=run_apply,
+            deleted_backend_name,
+            backend_id=backend_id,
             apply_services=services,
         )
-        logger.info(
-            "ui.backend.delete.deleted",
-            backend_id=backend_id,
-            backend_name=deleted_backend_name,
-            mutation_state=mutation.state,
-            apply_status=mutation.apply_response.status,
-            run_id=mutation.apply_response.run_id,
-            request_mode=ui_request_mode(request),
-        )
-        apply_response = mutation.apply_response
-        filesystem_cleanup_error: str | None = None
-        if apply_response.status == "success" and deleted_backend_name:
-            try:
-                await remove_deleted_app_filesystem_artifacts(
-                    {deleted_backend_name}, settings
-                )
-            except Exception as exc:
-                filesystem_cleanup_error = str(exc)
-                logger.exception(
-                    "ui.backend.delete.filesystem_cleanup_failed",
-                    backend_id=backend_id,
-                    backend=deleted_backend_name,
-                    error=filesystem_cleanup_error,
-                )
-            try:
-                await remove_backend_ssh_access([deleted_backend_name], settings)
-            except Exception as exc:
-                logger.warning(
-                    "ui.backend.delete.ssh_cleanup_failed",
-                    backend_id=backend_id,
-                    backend=deleted_backend_name,
-                    error=str(exc),
-                )
+        apply_response = outcome.apply_response
         success_flash, error_flash = _save_apply_feedback(
             apply_response,
             success_message="Output deleted.",
             failure_prefix="Output deleted",
         )
-        if filesystem_cleanup_error:
+        if outcome.filesystem_cleanup_error:
             success_flash = None
             error_flash = _operator_action_error(
                 "Output delete",
                 "the output was deleted, but its persistent filesystem cleanup did not finish. The retained files are recoverable; check server logs and retry cleanup.",
+                error_context(ErrorCode.OUTPUT_DELETE_FAILED),
+            )
+        elif outcome.ssh_cleanup_error:
+            success_flash = None
+            error_flash = _operator_action_error(
+                "Output delete",
+                "the output was deleted, but removing its host SSH account did not finish. The account is still on the host; check server logs and rerun a save to reconcile it.",
                 error_context(ErrorCode.OUTPUT_DELETE_FAILED),
             )
         return dashboard_redirect(

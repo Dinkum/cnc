@@ -1,4 +1,3 @@
-"""Assemble dashboard and host-help contexts from feature data and presentation."""
 
 from __future__ import annotations
 
@@ -64,7 +63,6 @@ async def host_llm_help_context(
     session: AsyncSession,
     settings: Settings,
 ) -> dict[str, object]:
-    """Build only the output state used by the host-level LLM help document."""
     rows = await load_dashboard_rows(session, scope=dashboard_scope("outputs"))
     status = peek_cached_status() or empty_dashboard_status()
     service_map, _services_ok = build_service_cards(status.get("services", []))

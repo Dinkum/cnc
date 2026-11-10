@@ -62,8 +62,6 @@
     if (kind === 'error') {
       state.busy = false; state.pending = null; state.error = step || 'Save failed.';
     } else if (kind === 'success') {
-      // A submitted snapshot is the saved baseline. Edits made while it was
-      // running remain dirty rather than being falsely reported as saved.
       state.saved = state.pending || state.saved;
       state.pending = null; state.busy = false; state.error = ''; state.result = 'saved';
       if (form.dataset.outputSettingsSection === 'shield' && form.querySelector('[name="shield_access_code"]')?.value.trim()) form.dataset.shieldCodeConfigured = 'true';
@@ -79,7 +77,6 @@
       const changed = () => { conditionalFields(form); sync(form); };
       form.addEventListener('input', changed);
       form.addEventListener('change', changed);
-      // Tag pickers and placement controls also mutate hidden inputs.
       form.addEventListener('click', () => queueMicrotask(changed));
       form.querySelector('[data-section-cancel]')?.addEventListener('click', () => {
         const state = stateFor(form);

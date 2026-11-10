@@ -25,6 +25,7 @@ from app.services.renderers import SHIELD_PUBLIC_PATH_PREFIX
 from app.services.shield_service import (
     SESSION_COOKIE_NAME,
     SESSION_TTL_SEC,
+    CODE_HASH_PREFIX,
     ShieldStore,
 )
 
@@ -104,6 +105,8 @@ def create_app(config: ShieldAppConfig | None = None) -> Starlette:
             store.session_is_valid,
             secret_key=active_config.secret_key,
             session_token=request.cookies.get(SESSION_COOKIE_NAME),
+            expected_code_hash=_access_code_hash_for_output(active_config, output_key),
+            global_code_hash=active_config.access_code_hash,
             output_key=output_key,
         ):
             return Response(status_code=204)
@@ -142,12 +145,12 @@ async def _safe_form(request: Request) -> FormData:
 
 
 def _identity_key(request: Request) -> str:
-    cf_ip = request.headers.get("cf-connecting-ip", "").strip()
-    if cf_ip:
-        return f"ip:{cf_ip}"
-    forwarded_for = request.headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
-    if forwarded_for:
-        return f"ip:{forwarded_for}"
+    # nginx overwrites X-CNC-Client-IP on every proxied request; headers the
+    # client controls, such as CF-Connecting-IP or X-Forwarded-For, never
+    # choose which guess budget a request draws from.
+    client_ip = request.headers.get("x-cnc-client-ip", "").strip()
+    if client_ip:
+        return f"ip:{client_ip}"
     client = request.client.host if request.client else "unknown"
     return f"ip:{client}"
 
@@ -163,18 +166,22 @@ def _access_code_hash_for_output(config: ShieldAppConfig, output_key: str) -> st
     try:
         payload = json.loads(config.config_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return config.access_code_hash
+        return ""
+    if not isinstance(payload, dict):
+        return ""
     outputs = payload.get("outputs")
     if not isinstance(outputs, dict):
+        return ""
+    if output_key not in outputs:
         return config.access_code_hash
-    output = outputs.get(output_key)
+    output = outputs[output_key]
     if not isinstance(output, dict):
-        return config.access_code_hash
+        return ""
     code_hash = output.get("code_hash")
     return (
         code_hash
-        if isinstance(code_hash, str) and code_hash
-        else config.access_code_hash
+        if isinstance(code_hash, str) and code_hash.startswith(CODE_HASH_PREFIX)
+        else ""
     )
 
 

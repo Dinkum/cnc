@@ -19,7 +19,6 @@ from app.services.validators import ValidationError
 
 
 def format_resource_text(payload: dict[str, object]) -> str:
-    # A compact key/value object remains useful for full configuration inspection.
     return json.dumps(payload, indent=2, sort_keys=True)
 
 
@@ -121,7 +120,6 @@ def configuration(
         if "backend_ids" in data:
             raise ValueError("use only output_ids for input connections")
         data["backend_ids"] = data.pop("output_ids")
-    # Reject typos instead of letting Pydantic's HTTP-compatible extra policy ignore them.
     unknown = set(data) - set(schema.model_fields)
     if unknown:
         raise ValueError("unknown configuration fields: " + ", ".join(sorted(unknown)))
@@ -148,7 +146,6 @@ def configuration(
     try:
         return schema.model_validate(data)
     except SchemaValidationError as exc:
-        # Validation errors must not repeat supplied access codes or other secret values.
         errors = "; ".join(
             f"{'.'.join(str(part) for part in item['loc'])}: {item['msg']}"
             for item in exc.errors(include_input=False)

@@ -5,14 +5,26 @@
   const endpoint = `/api/backends/${config.backendId}/ssh-keys`;
   let keys = [], mode = 'create', pendingRevoke = null, connection = null, busy = false;
 
+  const { withRequestDeadline } = window.CNCUI;
+  const checkKeys = 'Check the key list before trying again.';
+
+  // The deadline covers the body read too: a stalled request must release the
+  // busy dialog, after which the key list is reloaded to show what happened.
   async function request(url, fields) {
-    const response = await fetch(url, fields ? {
-      method: 'POST', credentials: 'same-origin', cache: 'no-store',
-      body: new URLSearchParams({csrf_token: config.csrfToken, ...fields})
-    } : {credentials: 'same-origin', cache: 'no-store'});
-    const payload = await response.json();
-    if (!response.ok) throw new Error(typeof payload.detail === 'string' ? payload.detail : 'SSH access update failed. Check the key list before trying again.');
-    return payload;
+    try {
+      return await withRequestDeadline(async signal => {
+        const response = await fetch(url, fields ? {
+          method: 'POST', credentials: 'same-origin', cache: 'no-store', signal,
+          body: new URLSearchParams({csrf_token: config.csrfToken, ...fields})
+        } : {credentials: 'same-origin', cache: 'no-store', signal});
+        const payload = await response.json();
+        if (!response.ok) throw new Error(typeof payload.detail === 'string' ? payload.detail : `SSH access update failed. ${checkKeys}`);
+        return payload;
+      });
+    } catch (error) {
+      if (error?.name === 'TimeoutError') throw new Error(`SSH access request timed out. ${checkKeys}`);
+      throw error;
+    }
   }
 
   function renderKeys() {
@@ -73,7 +85,6 @@
       }
     } catch (error) {
       showError('form-error', error);
-      // A lost response may follow a completed create. Never retry it automatically.
       refreshKeys().catch(() => {});
     } finally { busy = false; $('submit-key').disabled = false; }
   };
@@ -85,12 +96,13 @@
       await request(`${endpoint}/${pendingRevoke.id}/revoke`, {});
       keys = keys.filter(key => key.id !== pendingRevoke.id); renderKeys();
       $('notice').textContent = `${pendingRevoke.name} revoked.`; $('revoke-dialog').close();
-    } catch (error) { showError('revoke-error', error); }
-    finally { busy = false; $('revoke-confirm').disabled = false; }
+    } catch (error) {
+      showError('revoke-error', error);
+      refreshKeys().catch(() => {});
+    } finally { busy = false; $('revoke-confirm').disabled = false; }
   };
 
-  // Quote editable paths as shell arguments while allowing a leading ~/ shortcut.
-  function keyPathArgument(value) {
+  function quoteKeyPathWithHomeExpansion(value) {
     const quote = text => "'" + text.replaceAll("'", "'\\''") + "'";
     if (/^~\/[a-zA-Z0-9_./-]+$/.test(value)) return value;
     if (value.startsWith('~/')) return '~/' + quote(value.slice(2));
@@ -100,12 +112,11 @@
     if (!connection) return;
     const location = $('key-location').value.trim();
     const installedKey = `~/.ssh/${connection.filename}`;
-    // Config directives and the heredoc must never receive arbitrary host/name text.
     if (!/^[a-zA-Z0-9][a-zA-Z0-9.:-]*$/.test(config.sshHost) || !/^[a-zA-Z0-9_-]+$/.test(config.backendName)) {
       $('connect-feedback').textContent = 'Configure a valid SSH hostname to show connection instructions.'; return;
     }
     const directConnection = `ssh -i ${installedKey} ${config.backendName}@${config.sshHost}`;
-    $('key-command').textContent = location ? `mkdir -p ~/.ssh &&\ncp -- ${keyPathArgument(location)} ${installedKey} &&\nchmod 600 ${installedKey}` : 'Enter the downloaded key file location above.';
+    $('key-command').textContent = location ? `mkdir -p ~/.ssh &&\ncp -- ${quoteKeyPathWithHomeExpansion(location)} ${installedKey} &&\nchmod 600 ${installedKey}` : 'Enter the downloaded key file location above.';
     $('shortcut-command').textContent = `cat >> ~/.ssh/config <<'EOF'
 
 Host ${connection.alias}

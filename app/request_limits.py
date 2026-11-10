@@ -21,7 +21,6 @@ class _RequestBodyTooLarge(Exception):
 
 
 class RequestBodyLimitMiddleware:
-    """Enforce small limits on selected request paths without buffering bodies."""
 
     def __init__(self, app, *, limits: Mapping[str, int]) -> None:
         self.app = app
@@ -80,7 +79,7 @@ class RequestBodyLimitMiddleware:
         try:
             await self.app(scope, limited_receive, tracked_send)
         except _RequestBodyTooLarge:
-            if response_started:  # pragma: no cover - selected handlers read first
+            if response_started:
                 raise
             await self._reject(scope, receive, send)
 

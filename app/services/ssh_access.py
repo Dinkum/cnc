@@ -23,9 +23,6 @@ from app.services.file_locks import FileLock
 from app.services.retry import retry_async_call
 
 
-# Host account databases can be locked by apt, cloud-init, login tooling, or
-# another admin action. Output creation should wait out that short contention
-# instead of failing the whole save on the first useradd/usermod attempt.
 SSH_ACCOUNT_MUTATION_MIN_ATTEMPTS = 7
 SSH_ACCOUNT_MUTATION_LOCK_NAME = "ssh-account-mutation.lock"
 SSH_BACKEND_WRAPPER_TEMPLATE_PATH = (
@@ -52,9 +49,6 @@ def _account_mutation_lock_path(settings: Settings) -> Path:
 async def _host_account_mutation_lock(settings: Settings):
     lock_path = _account_mutation_lock_path(settings)
     lock = FileLock(lock_path, blocking=False, lock_path=lock_path)
-    # Keep ownership on the event-loop thread. Separate to_thread calls can
-    # reuse an owning worker and falsely appear reentrant, or abandon a waiter
-    # on cancellation. Nonblocking attempts preserve the cross-process lock.
     while True:
         try:
             lock.__enter__()
@@ -206,15 +200,6 @@ async def deferred_backend_ssh_reconcile(
     *,
     scoped_to: set[str] | None = None,
 ) -> dict[str, object]:
-    """Report the desired accounts without touching the host.
-
-    Deletion defers its SSH work until after the durable commit, so this
-    stands in for the real reconciler during convergence. It takes the same
-    ``scoped_to`` the tool passes every reconciler and records it, rather
-    than applying it: ``scoped_to`` narrows which accounts a reconciler may
-    change, and this one changes none. Refusing the argument instead failed
-    the whole delete, which is what happened before it was accepted here.
-    """
     desired = backend_ssh_names(backends)
     return {
         "ssh_backends": desired,
@@ -306,8 +291,6 @@ def _sshd_config(settings: Settings) -> str:
 def _sudoers_config(settings: Settings) -> str:
     wrapper = settings.ssh_backend_root_wrapper_path
     group = settings.ssh_backend_group
-    # Ubuntu does not require a TTY by default. Avoid the legacy requiretty
-    # option, which sudo-rs rejects instead of ignoring.
     return (
         "# Managed by CNC\n"
         f"%{group} ALL=(root) NOPASSWD: {wrapper}\n"
@@ -425,8 +408,6 @@ async def _ensure_backend_user(backend: str, settings: Settings) -> None:
             raise RuntimeError(
                 f"backend ssh user collides with existing host account: {backend}"
             )
-        # Existing managed backend users should be a no-op during apply unless
-        # host account drift actually needs correction.
         if gid != desired_gid or shell != "/bin/bash":
             await _run_retryable_account_command(
                 [
@@ -499,18 +480,6 @@ async def reconcile_backend_ssh_access(
     *,
     scoped_to: set[str] | None = None,
 ) -> dict[str, object]:
-    """Converge host accounts to the enabled app outputs.
-
-    ``scoped_to`` limits which accounts this call may create, re-key or delete.
-    A scoped save passes the outputs it concerns, so editing one output cannot
-    also create, rewrite or remove another output's account. ``None`` means
-    every account, which is what an explicit full reconcile wants.
-
-    The shared files stay whole either way. ``authorized_keys``, the sshd
-    drop-in and the sudoers file are single artifacts rendered from every
-    enabled output, exactly like nginx's generated tree, so they are always
-    written in full. What scope limits is per-account mutation.
-    """
     async with _host_account_mutation_lock(settings):
         desired_access = _coerce_backend_access(backends)
         desired = [entry.name for entry in desired_access]
@@ -552,8 +521,6 @@ async def reconcile_backend_ssh_access(
             out_of_scope: list[str] = []
             for access in desired_access:
                 if scoped_to is not None and access.name not in scoped_to:
-                    # Another output's account. If it needs work that is a real
-                    # problem, but it is not this change's to fix.
                     if not _backend_user_exists(access.name):
                         out_of_scope.append(access.name)
                     continue
@@ -615,9 +582,6 @@ async def reconcile_backend_ssh_access(
         result: dict[str, object] = {
             "ssh_backends": desired,
             "ssh_aliases_enabled": bool(desired),
-            # Whether anything on the host actually moved. Callers use this to
-            # decide clean versus partial, so it has to be reported rather
-            # than inferred from the fact that this ran.
             "ssh_changed": changed,
         }
         if out_of_scope:

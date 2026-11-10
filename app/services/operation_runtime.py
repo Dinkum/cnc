@@ -617,8 +617,6 @@ OPERATION_PROGRESS_TREES: dict[str, tuple[ProgressState, ...]] = {
     ),
 }
 
-# These exported views stay derived from weighted state/substate trees; adding
-# separate absolute point catalogs would create a second progress source of truth.
 INPUT_PROGRESS_PIPELINES = INPUT_PROGRESS_TREES
 OPERATION_PROGRESS_PIPELINES = OPERATION_PROGRESS_TREES
 

@@ -23,6 +23,7 @@ from app.services.app_containers import app_sandbox_dir
 from app.services.apply_service import invalidate_apply_convergence, run_apply
 from app.services.cgroup_diagnostics import collect_container_cgroup_diagnostics
 from app.services.container_runtime import inspect_container, read_container_stats
+from app.services.observation import present_value
 from app.services.control_events import emit_control_event
 from app.services.resource_profile import (
     backend_resource_profile,
@@ -267,10 +268,6 @@ async def run_auto_size_tick(
             change_count=len(changed),
         )
         with session.no_autoflush:
-            # Resizing moves the weighted memory denominator, so every
-            # automatic backend can be affected. This is a real full
-            # reconcile, but its commit and recovery still belong to the same
-            # configuration-change boundary as UI, API and CLI saves.
             mutation = await converge_change(
                 session,
                 settings,
@@ -312,9 +309,6 @@ async def run_auto_size_tick(
                 status=apply_response.status,
                 run_id=apply_response.run_id,
             )
-            # The shared boundary may prove that commit() raised only after the
-            # rows became durable. Do not prepare a retry over a change the
-            # database and host already carry.
             commit_outcome = str(apply_response.details.get("commit_outcome") or "")
             retry_prepared = False
             if commit_outcome != "persisted":
@@ -508,10 +502,12 @@ async def _collect_lightweight_backend_metrics(
                 resource_profile.host_cpu_count,
             )
 
-        _inspect_result, inspect_payload = await asyncio.to_thread(
-            inspect_container,
-            container_name(backend.name),
-            settings.command_timeout_status_sec,
+        inspect_payload = present_value(
+            await asyncio.to_thread(
+                inspect_container,
+                container_name(backend.name),
+                settings.command_timeout_status_sec,
+            )
         )
         cgroup = await asyncio.to_thread(
             collect_container_cgroup_diagnostics,
@@ -747,8 +743,6 @@ async def _load_previous_samples(
 ) -> dict[int, BackendResourceSample]:
     if not backend_ids:
         return {}
-    # Seek once per backend through its unique (backend_id, bucket_start) index,
-    # rather than grouping the full retained history or loading bucket products.
     latest_id = (
         select(BackendResourceSample.id)
         .where(
@@ -1599,13 +1593,9 @@ def _counter_delta(current: int | None, previous: Any) -> int:
         return 0
     previous_value = _nonnegative_int(previous)
     if previous_value is None:
-        # A missing predecessor is a baseline, not evidence that the current
-        # cgroup generation produced every historical event this minute.
         return 0
     if current >= previous_value:
         return current - previous_value
-    # A recreated cgroup resets cumulative counters; any non-zero value belongs
-    # to the new payload and must not be hidden by the previous generation.
     return current
 
 

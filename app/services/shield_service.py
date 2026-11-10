@@ -69,9 +69,11 @@ def verify_code_hash(secret_key: str, access_code: str, expected_hash: str) -> b
     return hmac.compare_digest(actual, expected)
 
 
-def _session_hash(secret_key: str, session_token: str) -> str:
+def _session_hash(secret_key: str, session_token: str, code_hash: str) -> str:
     return hmac.new(
-        secret_key.encode("utf-8"), session_token.encode("utf-8"), hashlib.sha256
+        secret_key.encode("utf-8"),
+        f"shield-session:v2:{code_hash}:{session_token}".encode("utf-8"),
+        hashlib.sha256,
     ).hexdigest()
 
 
@@ -166,7 +168,7 @@ class ShieldStore:
                 conn.commit()
                 return AuthAttemptResult(ok=False)
             token = secrets.token_urlsafe(32)
-            token_hash = _session_hash(secret_key, token)
+            token_hash = _session_hash(secret_key, token, expected_code_hash)
             conn.execute(
                 """
                 INSERT INTO shield_session(id, output_key, session_hash, created_at, expires_at, last_seen_at)
@@ -190,26 +192,32 @@ class ShieldStore:
         *,
         secret_key: str,
         session_token: str | None,
+        expected_code_hash: str,
+        global_code_hash: str = "",
         output_key: str = "global",
         now: int | None = None,
     ) -> bool:
-        if not session_token:
+        if not session_token or not expected_code_hash:
             return False
         timestamp = int(time.time()) if now is None else now
-        token_hash = _session_hash(secret_key, session_token)
+        token_hash = _session_hash(secret_key, session_token, expected_code_hash)
+        global_token_hash = (
+            _session_hash(secret_key, session_token, global_code_hash)
+            if global_code_hash
+            else ""
+        )
         try:
-            # Nginx calls this for every protected request, so validation cannot prune or refresh rows.
             with self._connect(read_only=True) as conn:
                 row = conn.execute(
                     """
                     SELECT 1
                     FROM shield_session
-                    WHERE session_hash = ?
-                      AND expires_at > ?
-                      AND output_key IN (?, 'global')
+                    WHERE expires_at > ?
+                      AND ((session_hash = ? AND output_key = ?)
+                           OR (session_hash = ? AND output_key = 'global'))
                     LIMIT 1
                     """,
-                    (token_hash, timestamp, output_key),
+                    (timestamp, token_hash, output_key, global_token_hash),
                 ).fetchone()
         except sqlite3.OperationalError:
             return False
@@ -260,8 +268,6 @@ class ShieldStore:
             bucket_count = int(
                 conn.execute("SELECT COUNT(*) FROM rate_limit_bucket").fetchone()[0]
             )
-            # Capacity exhaustion fails closed instead of weakening rate limits by
-            # evicting live identities to make room for an attacker.
             if bucket_count + missing_bucket_count > self.rate_limit_bucket_max_rows:
                 return False
         for key, tokens, updated_at in updates:

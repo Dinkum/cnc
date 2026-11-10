@@ -16,6 +16,7 @@ from app.services.app_containers import (
     inspect_container,
     inspect_network,
 )
+from app.services.thread_workers import run_to_completion
 from app.services.tools import TOOLS
 from app.services.tools.core import (
     Plan,
@@ -89,6 +90,7 @@ APPLY_PHASE_ORDER = (
     "sync_files",
     "nginx_validate",
     "nginx_reload",
+    "cloudflare_tunnel",
     "cluster_followers",
     "tailscale_paths",
     "tailscale_services",
@@ -158,14 +160,6 @@ async def _emit_apply_progress(
 async def _emit_apply_progress_plan(
     services: ApplyServices, desired: DesiredState
 ) -> None:
-    """Rebuild the operator's progress card once desired state is known.
-
-    It used to also take a predicted apply plan and hide the steps that plan
-    said would not change. Nothing produced such a plan any more, because
-    convergence decides what to do by reading the host, so the argument was
-    always None and every step was shown. Passing desired state alone says the
-    same thing without implying a prediction exists.
-    """
     if services.progress_plan_callback is None:
         return
     try:
@@ -204,13 +198,6 @@ class DesiredStateRecord:
 def _apply_output_event_details(
     desired: DesiredState, apply_details: dict[str, Any] | None = None
 ) -> dict[str, object]:
-    """Summarize which outputs moved, from what the podman tool actually did.
-
-    Previously derived by comparing this apply's slice hashes against the
-    previous successful apply's. It now reads the selection the tool reports,
-    so the summary describes work that happened rather than a difference
-    between two database snapshots.
-    """
     details = apply_details or {}
     selected = [str(name) for name in details.get("podman_selected") or []]
     created = [str(name) for name in details.get("podman_created") or []]
@@ -351,12 +338,6 @@ async def _record_last_applied_state(
 
 
 async def invalidate_apply_convergence(session: AsyncSession) -> bool:
-    """Clear the convergence marker after live state may have drifted.
-
-    Durable, unlike the in-process unwind stack: a process killed mid-apply
-    leaves this cleared, so the next apply has no trusted baseline and every
-    tool re-observes the host.
-    """
     row = await session.get(HostApplyState, 1)
     if row is None:
         return False
@@ -387,10 +368,6 @@ async def run_apply(
     recovery: list[Any] | None = None,
 ) -> ApplyResponse:
     services = services or default_apply_services()
-    # Owned here even when the caller did not ask for it, so a failure between
-    # convergence and the durable record can still put the host back. The
-    # caller's list, when given, is the same object so recovery survives out to
-    # the commit boundary.
     if recovery is None:
         recovery = []
     apply_operation = (
@@ -408,6 +385,7 @@ async def run_apply(
         ) as operation:
             desired_record: DesiredStateRecord | None = None
             live_apply_completed = False
+            committed_response: ApplyResponse | None = None
             async with logger.operation("apply.run") as log_operation:
                 try:
                     await _emit_apply_progress(
@@ -534,6 +512,16 @@ async def run_apply(
                     await prune_control_plane_history(session)
                     if commit_on_success:
                         await session.commit()
+                        # From here the apply is durable. A reporting failure
+                        # below must not unwind the host or record a failure.
+                        committed_response = ApplyResponse(
+                            status="success",
+                            message=success_message,
+                            details=response_details,
+                            host_changed=response_details["host_changed"],
+                            created_at=run.created_at,
+                            run_id=run.id,
+                        )
                     else:
                         await session.flush()
                     invalidate_status_cache(settings, prefill=False)
@@ -612,6 +600,16 @@ async def run_apply(
                         run_id=run.id,
                     )
                 except Exception as exc:
+                    if committed_response is not None:
+                        logger.exception(
+                            "apply.post_commit_reporting_failed",
+                            run_id=committed_response.run_id,
+                            error=str(exc),
+                        )
+                        committed_response.details["post_commit_reporting_error"] = (
+                            str(exc)
+                        )
+                        return committed_response
                     await session.rollback()
                     if isinstance(exc, ApplyFailed):
                         details = exc.as_details()
@@ -637,12 +635,6 @@ async def run_apply(
                     else:
                         details = {"error": str(exc), "phase": "unknown"}
                     if live_apply_completed:
-                        # Convergence finished and something after it failed.
-                        # The change is being rejected, so the reversible host
-                        # effects come back rather than being reported as a
-                        # partial and left in place. Whether that leaves
-                        # anything for an operator is the unwind's answer, not
-                        # an assumption made here.
                         restored = await unwind_recovery(recovery)
                         details = {**details, **restored}
                         if restored.get("manual_review_required"):
@@ -955,14 +947,8 @@ async def _apply_desired_state(
         )
         details.update(tool_plan.scope.as_details())
         if recovery is not None:
-            # Published so the commit boundary can still put the host back if
-            # the database commit fails after every tool succeeded.
             recovery.append(tool_plan)
 
-        # The whole host convergence: walk the tools in order, each one
-        # reading the box and closing its own gap. Phase bookkeeping and
-        # clean-versus-partial classification are driven from what the tools
-        # declare, not from anything written out here.
         details["changed_tools"] = await converge(
             TOOLS, tool_plan, progress=progress
         )
@@ -1007,11 +993,10 @@ async def _apply_desired_state(
                 ) from exc
         progress.completed("control_plane_self_audit")
         details.update(progress.as_details())
+    except asyncio.CancelledError:
+        await run_to_completion(unwind_plan(tool_plan))
+        raise
     except Exception as exc:
-        # The undo stack outlives converge on purpose. Admin verification and
-        # the control-plane self-audit run after every tool has finished, and a
-        # failure there means the change is being rejected just as surely as a
-        # tool failure, so the reversible host effects have to come back.
         failure = progress.failure(exc)
         unwound, unwind_errors = await unwind_plan(tool_plan)
         record_unwind_outcome(failure, unwound, unwind_errors, tool_plan.touched)

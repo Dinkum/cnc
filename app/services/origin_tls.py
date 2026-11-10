@@ -1,4 +1,3 @@
-"""Node-local self-signed origin TLS, also executable on standalone followers."""
 
 from __future__ import annotations
 
@@ -65,8 +64,7 @@ def _write_atomic(path: Path, content: bytes) -> None:
     staged.replace(path)
 
 
-def ensure_certificate(path: Path) -> bool:
-    """Caller holds certificate_lock; keep the key/certificate pair atomic."""
+def _ensure_certificate_locked(path: Path) -> bool:
     if certificate_valid(path):
         path.chmod(0o600)
         activated = path.with_suffix(".activated")
@@ -77,8 +75,6 @@ def ensure_certificate(path: Path) -> bool:
     with tempfile.TemporaryDirectory(dir=path.parent) as directory:
         key = Path(directory) / "key.pem"
         cert = Path(directory) / "cert.pem"
-        # Full does not validate hostname or trust. Each node owns its own key;
-        # no secret is copied in cluster routing bundles or config snapshots.
         _openssl(
             "req",
             "-x509",
@@ -112,11 +108,10 @@ def certificate_activated(path: Path, fingerprint: str | None = None) -> None:
 
 
 def prepare_certificate(files: dict[str, str], path: Path) -> str | None:
-    """Return the fingerprint needing reload; acknowledge only that generation."""
     if not any(f'ssl_certificate "{path}";' in content for content in files.values()):
         return None
     with certificate_lock(path):
-        return certificate_fingerprint(path) if ensure_certificate(path) else None
+        return certificate_fingerprint(path) if _ensure_certificate_locked(path) else None
 
 
 def renew_active_certificate(nginx_dir: Path, path: Path) -> bool:
@@ -125,7 +120,7 @@ def renew_active_certificate(nginx_dir: Path, path: Path) -> bool:
         return False
     with certificate_lock(path):
         previous = path.read_bytes() if path.exists() else None
-        if not ensure_certificate(path):
+        if not _ensure_certificate_locked(path):
             return False
         try:
             subprocess.run(["nginx", "-t"], check=True, capture_output=True, timeout=30)

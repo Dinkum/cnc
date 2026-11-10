@@ -7,6 +7,7 @@ from sqlalchemy.exc import IntegrityError
 from app.config import Settings
 from app.logger import get_logger
 from app.services import input_commands
+from app.services.mutation_queue import mutation_runner
 from app.services.apply_service import run_apply
 from app.services.error_reporting import ErrorCode
 from app.services.operation_runtime import delete_input_progress_plan
@@ -96,6 +97,7 @@ CREATE_INPUT = Action(
 )
 
 
+@mutation_runner("create_input")
 async def _run_create_input_operation(
     settings: Settings,
     operation_id: int | None,
@@ -111,6 +113,7 @@ async def _run_create_input_operation(
             backend_ids=[str(item) for item in form_values.get("backend_ids") or []],
             enabled=bool(form_values.get("enabled")),
             https_enabled=bool(form_values.get("https_enabled")),
+            connection=str(form_values.get("connection") or "public_ip"),
         )
         report = _input_reporter(action, None, payload.value, None)
         await report.step(
@@ -186,11 +189,6 @@ UPDATE_INPUT = Action(
 
 
 def _shield_fields(item, settings: Settings, form_values: dict[str, object]):
-    """Resolve the Shield code and toggle for an input update.
-
-    Shield only applies to domain inputs, and enabling it without a code is a
-    validation error rather than a silent no-op.
-    """
     code_hash = item.shield_code_hash
     display = str(getattr(item, "shield_access_code", "") or "").strip()
     submitted = str(form_values.get("shield_access_code") or "").strip()
@@ -205,12 +203,16 @@ def _shield_fields(item, settings: Settings, form_values: dict[str, object]):
     return enabled, code_hash, display
 
 
+@mutation_runner("update_input")
 async def _run_update_input_operation(
     settings: Settings,
     operation_id: int | None,
     input_id: int,
     form_values: dict[str, object],
+    shield_access_code: str = "",
 ) -> None:
+    if shield_access_code:
+        form_values = {**form_values, "shield_access_code": shield_access_code}
     action = UPDATE_INPUT
 
     async def mutate(session, operation, item, _report):
@@ -245,8 +247,6 @@ async def _run_update_input_operation(
             session, input_id, payload, commit=False
         )
         attached = [backend.id for backend in updated.backends]
-        # Both sides of the edit: an output that just lost this route needs
-        # its ingress rewritten as much as one that just gained it.
         attached_names = was_attached | {
             str(backend.name) for backend in updated.backends
         }
@@ -301,11 +301,6 @@ def _input_reporter(
     input_value: str,
     plan: dict[str, object] | None,
 ) -> Reporter:
-    """A reporter shaped the way the input progress card expects.
-
-    Inputs narrate through a planned pipeline while outputs do not, and this is
-    the only place that difference lives.
-    """
     return Reporter(
         action,
         Subject(id=input_id, name=input_value),
@@ -328,7 +323,6 @@ async def _converge_input(
     backend_ids: list[int] | None = None,
     output_names: set[str] | None = None,
 ) -> SaveResult:
-    """Commit the edited rows only if the host converged, narrating as it goes."""
     services = apply_services_with(
         _input_apply_progress_reporter(
             operation,
@@ -353,8 +347,6 @@ async def _converge_input(
         services=services,
         apply_runner=run_apply,
         committer=converge_change,
-        # A routing edit concerns the outputs it attaches or detaches, and no
-        # others. With none attached it touches no runtime at all.
         scope=route_change(action.kind, output_names or set()).scope(),
     )
     return SaveResult(
@@ -399,6 +391,7 @@ DELETE_INPUT = Action(
 )
 
 
+@mutation_runner("delete_input")
 async def _run_delete_input_operation(
     settings: Settings,
     operation_id: int | None,

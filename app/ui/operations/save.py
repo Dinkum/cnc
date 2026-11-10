@@ -1,27 +1,3 @@
-"""One save path for every config change.
-
-Creating an output, deleting one, renaming it, attaching an input, deleting an
-input: all the same operation. Change some rows, converge the host, tell the
-operator how it went. The only things that differ are which rows change and
-what to call the action, so those are the only things a caller supplies.
-
-The durable operation record keeps exact recovery states such as ``partial``.
-User-facing surfaces resolve those facts separately to Saved or Failed; a
-commit proven durable is Saved even if final confirmation reporting raised,
-while an unknown commit remains a Failed save with explicit recovery guidance.
-
-Before this there were nine runners doing it nine times, and the differences
-between them were where the bugs lived. Delete output swapped the SSH
-reconciler out for a stub and cleaned up afterwards in a handler that swallowed
-its own errors, so a failure there reported "Output deleted." while the host
-account stayed behind. That kind of divergence has nowhere to live now.
-
-The pieces:
-
-``Action``  what the user asked for, and the words to report it with.
-``Subject`` which row the operation is about, and how to load it.
-``run_save`` the path itself.
-"""
 
 from __future__ import annotations
 
@@ -46,17 +22,11 @@ logger = get_logger("ui.save")
 
 @dataclass(frozen=True)
 class Subject:
-    """The row a save is about, and the identity to report it under.
-
-    ``load`` is None for a create, where there is nothing to load yet.
-    """
-
     id: int | None = None
     name: str = ""
     load: Callable[[AsyncSession], Awaitable[Any]] | None = None
 
     def keys(self, action: Action) -> dict[str, Any]:
-        """Identity fields for the operation payload the front end reads."""
         payload: dict[str, Any] = {}
         if self.id is not None:
             payload[action.id_key] = self.id
@@ -67,12 +37,6 @@ class Subject:
 
 @dataclass(frozen=True)
 class ErrorRule:
-    """A failure this save reports differently from the generic one.
-
-    Creating an input hits a uniqueness conflict often enough to deserve its
-    own error code and its own wording, and that is a property of the action
-    rather than a reason for it to keep a whole runner of its own.
-    """
 
     exception: type[BaseException]
     error_code: Any
@@ -82,29 +46,18 @@ class ErrorRule:
 
 @dataclass
 class SaveResult:
-    """What the mutation did, beyond converging the host."""
 
     apply_response: ApplyResponse
     name: str = ""
     extra_details: dict[str, Any] = field(default_factory=dict)
 
 
-#: Change the rows and converge. The only part that differs between saves.
-#: Receives the reporter so a save with its own narration ("Checking route
-#: shape", "Resolving attached outputs") can emit its steps without the shared
-#: path needing to know they exist.
 Mutate = Callable[
     [AsyncSession, OperationHandle, Any, "Reporter"], Awaitable[SaveResult]
 ]
 
 
 class Reporter:
-    """How this save narrates itself to the progress card.
-
-    Outputs and inputs shape their progress payloads differently, so the
-    difference lives here rather than being threaded through the save path as
-    a pile of optional arguments.
-    """
 
     def __init__(
         self,
@@ -122,7 +75,6 @@ class Reporter:
         self._extra = extra or {}
 
     def with_name(self, name: str) -> "Reporter":
-        """A reporter that also carries the row's name, once it is known."""
         clone = Reporter(
             self.action,
             Subject(id=self.subject.id, name=name or self.subject.name),
@@ -163,19 +115,12 @@ async def run_save(
     subject: Subject,
     mutate: Mutate,
     reporter: Reporter | None = None,
-    complete: Callable[..., Awaitable[None]],
+    complete: Callable[..., Awaitable[None]] | None = None,
     first_step: tuple[str, str] | None = None,
     session_factory: Callable[[Settings], Any],
     rules: tuple[ErrorRule, ...] = (),
     operation: OperationHandle | None = None,
 ) -> None:
-    """Change rows, converge the host, report the outcome.
-
-    Every phase and substate string is derived from ``action`` rather than
-    passed in, so there is one place a word can be wrong instead of eight.
-    """
-    # A caller may supply its own handle when it wraps one, as create output
-    # does to record progress high-water marks.
     operation = operation or OperationHandle(
         id=operation_id, kind=action.kind, settings=settings
     )
@@ -197,7 +142,8 @@ async def run_save(
                 substate="Saving desired state",
             )
             result = await mutate(session, operation, row, report)
-            await complete(operation, result)
+            if complete is not None:
+                await complete(operation, result)
     except ValidationError as exc:
         await _fail(operation, action, report, str(exc), validation=True)
     except Exception as exc:
@@ -262,7 +208,6 @@ async def _fail(
 
 
 def apply_services_with(progress_callback: Any) -> Any:
-    """Standard apply services wired to this operation's progress reporter."""
     services = default_apply_services()
     services.progress_callback = progress_callback
     return services
@@ -279,13 +224,6 @@ async def commit_and_converge(
     committer: Any = None,
     scope: Any = None,
 ) -> ApplyResponse:
-    """Commit the edited rows only if the host converged.
-
-    Goes through ``converge_change`` like every other path, so scope, logging
-    and the commit boundary are decided in one place. ``apply_runner`` and
-    ``committer`` let a caller pass the functions its own module exposes, so
-    the seams tests and the timing harness patch stay where they expect.
-    """
     commit = committer or converge_change
     mutation = await commit(
         session,

@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Generate or check the hashed deployment manifest from the project lock."""
 
 import argparse
 from pathlib import Path
@@ -7,7 +6,9 @@ import subprocess
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description="Generate or check the hashed deployment manifest from the project lock."
+    )
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]

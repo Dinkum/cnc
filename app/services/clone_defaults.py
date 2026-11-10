@@ -41,8 +41,6 @@ async def next_clone_port(
     start, end = settings.port_range_start, settings.port_range_end
     first = max(start, source_port + 1) if source_port is not None else start
     first = min(first, end + 1)
-    # A suggested port is not a reservation; mutation-time preflight still owns
-    # the final availability check. Prefer the next port, then reuse lower gaps.
     for port in chain(range(first, end + 1), range(start, first)):
         if port not in used_ports and is_loopback_port_free(port):
             return port

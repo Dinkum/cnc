@@ -41,7 +41,6 @@ async def prune_control_plane_history(
     now: datetime | None = None,
     policy: HistoryRetentionPolicy = DEFAULT_HISTORY_RETENTION,
 ) -> None:
-    """Bound durable history while preserving live recovery references."""
     timestamp = now or datetime.now(UTC)
     apply_cutoff = timestamp - timedelta(days=policy.apply_summary_days)
     operation_cutoff = timestamp - timedelta(days=policy.operation_days)

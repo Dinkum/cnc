@@ -198,8 +198,6 @@ async def operation_status_payload(
     if operation.kind == "output_exec":
         from app.services.command_jobs import get_job
 
-        # Polling consumes durable completion evidence without entering the guest
-        # or multiplying Podman observations across UI/event-stream subscribers.
         await get_job(settings, operation_id, observe=False)
         await session.refresh(operation)
     return operation_payload(operation, settings)

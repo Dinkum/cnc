@@ -559,8 +559,6 @@ def _nearest_rank_percentile(sorted_values: list[float], percentile: float) -> f
 
 
 def _latency_sample_prune_due(now: datetime) -> bool:
-    # Heartbeats arrive every minute; hourly pruning keeps retention bounded without
-    # adding an extra DELETE to every follower check-in.
     return now.minute == 0
 
 

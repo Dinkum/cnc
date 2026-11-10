@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -18,13 +19,16 @@ from app.services.apply_service import (
 )
 from app.services.control_events import emit_control_event
 from app.services.error_reporting import ErrorCode, ensure_cnc_error
+from app.services.host_journal import durable_row_exists
 from app.services.operations import (
     OperationHandle,
     host_mutation_lock,
+    host_mutation_operation,
     validate_operation_handle_contract,
 )
 from app.services.outcome_presentation import present_mutation_outcome
 from app.services.status_service import invalidate_status_cache
+from app.services.thread_workers import run_to_completion
 from app.services.tools.core import unwind_recovery
 
 
@@ -57,26 +61,67 @@ async def commit_and_apply(
     operation_handle: OperationHandle | None = None,
     scope: object | None = None,
 ) -> MutationApplyResult:
-    """Converge the host, then make the edited rows durable if it converged.
-
-    The lock is held across the whole sequence rather than only across
-    convergence. Between the last tool and the commit there is verification,
-    the durable record, and the commit itself, and a failure at any of them
-    unwinds the host. A competing mutation arriving in that window would be
-    restored over. Reentrant, so an apply that takes the lock internally is
-    unaffected.
-    """
     async with host_mutation_lock(settings):
-        return await _apply_then_commit(
-            session,
-            settings,
-            operation=operation,
-            actor=actor,
-            apply_runner=apply_runner,
-            apply_services=apply_services,
-            operation_handle=operation_handle,
-            scope=scope,
+        if operation_handle is not None:
+            return await _apply_then_commit(
+                session,
+                settings,
+                operation=operation,
+                actor=actor,
+                apply_runner=apply_runner,
+                apply_services=apply_services,
+                operation_handle=operation_handle,
+                scope=scope,
+            )
+        async with host_mutation_operation(
+            settings, kind=operation, actor=actor, phase="apply"
+        ) as owned_operation:
+            result = await _apply_then_commit(
+                session,
+                settings,
+                operation=operation,
+                actor=actor,
+                apply_runner=apply_runner,
+                apply_services=apply_services,
+                operation_handle=owned_operation,
+                scope=scope,
+            )
+            if not owned_operation.completed:
+                await _complete_owned_operation(owned_operation, result)
+            return result
+
+
+async def _complete_owned_operation(
+    operation: OperationHandle, result: MutationApplyResult
+) -> None:
+    response = result.apply_response
+    details = response.details
+    if result.applied:
+        await operation.complete(
+            "success",
+            phase="completed",
+            details={
+                "apply_run_id": response.run_id,
+                "status": "success",
+                "app_healthcheck_status": details.get("app_healthcheck_status"),
+            },
         )
+        return
+    await operation.complete(
+        "partial" if details.get("failure_mode") == "partial" else "failed",
+        phase=str(details.get("phase") or "apply"),
+        error=str(details.get("error") or response.message or "apply failed"),
+        details={
+            key: details[key]
+            for key in (
+                "phase",
+                "failure_mode",
+                "commit_outcome",
+                "manual_review_required",
+            )
+            if key in details
+        },
+    )
 
 
 async def _apply_then_commit(
@@ -87,20 +132,17 @@ async def _apply_then_commit(
     actor: str,
     apply_runner: ApplyRunner,
     apply_services: ApplyServices | None,
-    operation_handle: OperationHandle | None,
+    operation_handle: OperationHandle,
     scope: object | None,
 ) -> MutationApplyResult:
     await session.flush()
-    # Collects the converged plan so its rollback is still available if the
-    # database commit fails after every tool succeeded.
     recovery: list[Any] = []
     state_history: tuple[MutationApplyState, ...] = ("pending",)
     logger.info("mutation_apply.pending", operation=operation, state="pending")
     state_history = (*state_history, "applying")
     logger.info("mutation_apply.applying", operation=operation, state="applying")
     try:
-        if operation_handle is not None:
-            validate_operation_handle_contract(operation_handle)
+        validate_operation_handle_contract(operation_handle)
         apply_response = await _run_apply_runner(
             apply_runner,
             session,
@@ -112,6 +154,11 @@ async def _apply_then_commit(
             scope=scope,
             recovery=recovery,
         )
+    except asyncio.CancelledError:
+        # The edited rows were never committed, so the host goes back too.
+        await run_to_completion(unwind_recovery(recovery))
+        await run_to_completion(_rollback_quietly(session))
+        raise
     except Exception as exc:
         classified = ensure_cnc_error(exc, ErrorCode.APPLY_FAILED)
         error_fields = classified.log_context()
@@ -132,10 +179,6 @@ async def _apply_then_commit(
             },
             run_id=None,
         )
-        # The runner raised rather than returning a failure, so it did not get
-        # to unwind its own plan. The rows roll back below, so anything the
-        # host still holds is a change nothing describes. Already-unwound
-        # plans have an empty stack and cost nothing here.
         apply_response.details.update(await unwind_recovery(recovery))
     state: MutationApplyState = (
         "applied" if apply_response.status == "success" else "apply_failed"
@@ -144,13 +187,6 @@ async def _apply_then_commit(
         try:
             await session.commit()
         except Exception as exc:
-            # Nothing between here and the durable-outcome resolution may
-            # raise. An `after_commit` handler that throws is the case this
-            # exists for: the transaction is already committed, and SQLAlchemy
-            # then leaves the session in a state where `rollback()` can throw
-            # too. If that escaped, the one step that establishes what the
-            # database actually kept would be skipped, and the caller would see
-            # a bare exception instead of a resolved outcome.
             rollback_error = await _rollback_quietly(session)
             _log_quietly(
                 "mutation_apply.commit_failed_after_apply",
@@ -158,20 +194,11 @@ async def _apply_then_commit(
                 apply_run_id=apply_response.run_id,
                 error=str(exc),
             )
-            # A raised commit does not prove the transaction was discarded.
-            # An after-commit callback can throw over a write that is already
-            # durable. Resolve what the database actually holds before touching
-            # the host: restoring over a commit that succeeded is the same
-            # disagreement in the opposite direction.
             try:
                 unwind_details = await _resolve_commit_then_unwind(
                     settings, apply_response, recovery
                 )
             except Exception as resolve_error:
-                # The resolution is already written to swallow its own parts.
-                # This is the outer guard: if it fails anyway, the caller still
-                # gets a resolved-looking failure rather than an exception, and
-                # the host is left alone because nothing is known about it.
                 _log_quietly(
                     "mutation_apply.commit_outcome_resolution_failed",
                     operation=operation,
@@ -199,8 +226,6 @@ async def _apply_then_commit(
                     resolution_details=unwind_details,
                 )
             except Exception as record_error:
-                # Recording the failure is reporting, not resolution. Losing it
-                # must not lose the outcome we just established.
                 _log_quietly(
                     "mutation_apply.commit_failure_record_failed",
                     operation=operation,
@@ -210,11 +235,6 @@ async def _apply_then_commit(
             apply_response.details.update(unwind_details)
             state = "apply_failed"
         else:
-            await _complete_deferred_apply_operation(
-                settings,
-                apply_response,
-                operation_handle=operation_handle,
-            )
             await _emit_deferred_apply_completed_event(settings, apply_response)
     else:
         await session.rollback()
@@ -237,12 +257,6 @@ async def _apply_then_commit(
 
 
 async def _rollback_quietly(session: AsyncSession) -> str | None:
-    """Roll back without letting the rollback replace the original failure.
-
-    After an `after_commit` handler raises, the transaction is already
-    committed and the session can refuse to roll back. That is information to
-    record, not a reason to abandon durable-outcome resolution.
-    """
     try:
         await session.rollback()
     except Exception as exc:
@@ -251,10 +265,9 @@ async def _rollback_quietly(session: AsyncSession) -> str | None:
 
 
 def _log_quietly(event: str, **fields: Any) -> None:
-    """Logging must never be the thing that skips the resolution below it."""
     try:
         logger.exception(event, **fields)
-    except Exception:  # pragma: no cover - a logger that throws is not fatal
+    except Exception:
         pass
 
 
@@ -263,20 +276,6 @@ async def _resolve_commit_then_unwind(
     apply_response: ApplyResponse,
     recovery: list[Any],
 ) -> dict[str, Any]:
-    """Decide what the database actually holds, then act on that.
-
-    Three outcomes, and only one restores the host:
-
-    ``rolled_back``
-        The durable record does not carry this apply, so the reversible host
-        effects come back with it.
-    ``persisted``
-        The record carries this apply despite the exception. The database
-        describes the new configuration, so the host is left matching it.
-    ``unknown``
-        The resolving read itself failed. Restoring blind could revert a change
-        the database kept, so nothing is touched and the operator is told.
-    """
     outcome = await _durable_commit_outcome(settings, apply_response)
     if outcome == "persisted":
         return {
@@ -304,22 +303,9 @@ async def _resolve_commit_then_unwind(
 async def _durable_commit_outcome(
     settings: Settings, apply_response: ApplyResponse
 ) -> str:
-    """Whether this apply's row survived, read on a connection of its own."""
-    run_id = apply_response.run_id
-    if run_id is None:
+    if apply_response.run_id is None:
         return "rolled_back"
-    try:
-        engine = create_configured_async_engine(settings.database_url)
-        try:
-            maker = async_sessionmaker(bind=engine, expire_on_commit=False)
-            async with maker() as probe:
-                found = await probe.get(ApplyRun, run_id)
-                return "persisted" if found is not None else "rolled_back"
-        finally:
-            await engine.dispose()
-    except Exception as exc:
-        logger.warning("mutation_apply.commit_outcome_unresolved", error=str(exc))
-        return "unknown"
+    return await durable_row_exists(settings, ApplyRun, apply_response.run_id)
 
 
 async def _run_apply_runner(
@@ -334,9 +320,6 @@ async def _run_apply_runner(
     scope: object | None = None,
     recovery: list[Any] | None = None,
 ) -> ApplyResponse:
-    # No signature introspection. Every caller passes a runner with the apply
-    # contract, so the arguments are simply passed; a runner that cannot accept
-    # them is a bug to surface rather than silently work around.
     return await apply_runner(
         session,
         settings,
@@ -351,40 +334,12 @@ async def _run_apply_runner(
     )
 
 
-async def _complete_deferred_apply_operation(
-    settings: Settings,
-    apply_response: ApplyResponse,
-    *,
-    operation_handle: OperationHandle | None,
-) -> None:
-    if operation_handle is not None:
-        return
-    operation_id = apply_response.details.get("deferred_operation_id")
-    operation_kind = str(
-        apply_response.details.get("deferred_operation_kind") or "apply_host"
-    )
-    if not isinstance(operation_id, int):
-        return
-    operation = OperationHandle(id=operation_id, kind=operation_kind, settings=settings)
-    await operation.complete(
-        "success",
-        phase="completed",
-        details={
-            "apply_run_id": apply_response.run_id,
-            "status": "success",
-            "app_healthcheck_status": apply_response.details.get(
-                "app_healthcheck_status"
-            ),
-        },
-    )
-
-
 async def _record_deferred_commit_failure(
     settings: Settings,
     apply_response: ApplyResponse,
     exc: Exception,
     *,
-    operation_handle: OperationHandle | None,
+    operation_handle: OperationHandle,
     resolution_details: dict[str, Any],
 ) -> ApplyResponse:
     convergence_invalidated = False
@@ -410,23 +365,12 @@ async def _record_deferred_commit_failure(
     }
     if convergence_invalidation_error:
         details["convergence_invalidation_error"] = convergence_invalidation_error
-    operation: OperationHandle | None = operation_handle
-    if operation is None:
-        operation_id = apply_response.details.get("deferred_operation_id")
-        operation_kind = str(
-            apply_response.details.get("deferred_operation_kind") or "apply_host"
-        )
-        if isinstance(operation_id, int):
-            operation = OperationHandle(
-                id=operation_id, kind=operation_kind, settings=settings
-            )
-    if operation is not None:
-        await operation.complete(
-            "partial",
-            phase="database_commit",
-            error=str(exc),
-            details=details,
-        )
+    await operation_handle.complete(
+        "partial",
+        phase="database_commit",
+        error=str(exc),
+        details=details,
+    )
     presentation = present_mutation_outcome("partial", details)
     await emit_control_event(
         settings,

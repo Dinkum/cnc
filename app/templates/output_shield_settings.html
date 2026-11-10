@@ -3,7 +3,7 @@
 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 <div class="output-setting-heading"><h3>Shield</h3></div><div class="output-setting-fields"><div class="settings-lines"><div class="settings-line sf-row"><label class="output-checkbox"><input name="shield_enabled" type="checkbox" value="true" {% if selected_backend.shield_enabled %}checked{% endif %} {% if (not shield_status.server_enabled or not shield_status.ready) and not selected_backend.shield_enabled %}disabled{% endif %}>Enable Shield</label></div>
 <div class="settings-line sf-row"><label class="settings-key" for="sf-shield-code">Access code</label><input id="sf-shield-code" name="shield_access_code" type="text" value="{{ selected_output_detail.get('shield_access_code', '') }}" placeholder="{{ 're-enter access code' if selected_backend.shield_code_hash else 'required before enabling' }}" autocomplete="off" spellcheck="false"></div>
-{% if not shield_status.server_enabled or not shield_status.ready %}<p class="subtle">Enable Shield in Settings, create the reserved Shield output, then attach a Shield input to it.</p>{% endif %}</div>
+<p class="subtle" data-shield-prerequisite {% if shield_status.server_enabled and shield_status.ready %}hidden{% endif %}>{{ 'Checking Shield availability.' if shield_status.config_ready and shield_status.output_state == 'unknown' else 'Shield is not ready. Check its status in Settings.' }}</p></div>
 {% set section_key = 'shield' %}{% include 'output_section_footer.html' %}
 </div></form>
 {% endif %}

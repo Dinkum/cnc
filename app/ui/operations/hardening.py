@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from app.config import Settings
 from app.logger import get_logger
+from app.services.mutation_queue import mutation_runner
 from app.services.app_hardening import latest_hardening_summary
 from app.services.hardening_policy import (
     HardeningPolicy,
@@ -16,6 +17,7 @@ from app.ui.progress import _complete_output_save_operation
 logger = get_logger("ui")
 
 
+@mutation_runner("hardening_apply")
 async def run_hardening_apply(
     settings: Settings,
     operation_id: int,

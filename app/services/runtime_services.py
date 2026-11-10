@@ -1,16 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
+from typing import Awaitable, Callable
 
 from app.services import app_containers as app_container_runtime
 from app.services import commands as command_runtime
 from app.services.commands import CommandResult
+from app.services.container_runtime import Inspection
 
 
-InspectPayload = dict[str, Any] | None
-InspectContainerFn = Callable[[str, int], tuple[CommandResult, InspectPayload]]
-InspectNetworkFn = Callable[[str, int], tuple[CommandResult, InspectPayload]]
+InspectContainerFn = Callable[[str, int], Inspection]
+InspectNetworkFn = Callable[[str, int], Inspection]
 RunCommandFn = Callable[[list[str], int], CommandResult]
 RunCommandCheckedAsyncFn = Callable[[list[str], int], Awaitable[CommandResult]]
 

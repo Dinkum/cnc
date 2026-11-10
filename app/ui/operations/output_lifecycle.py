@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 import contextlib
+from dataclasses import dataclass
 
 from sqlalchemy.exc import IntegrityError
 
 from app.config import Settings
 from app.logger import flush_logging_pipeline_async, get_logger
+from app.schemas.apply import ApplyResponse
 from app.services import backend_commands
+from app.schemas.backends import BackendIn
+from app.services.mutation_queue import mutation_runner
 from app.services.app_runtime import remove_deleted_app_filesystem_artifacts
 from app.services.apply_service import default_apply_services, run_apply
 from app.services.error_reporting import ErrorCode, error_context
@@ -18,7 +23,7 @@ from app.services.operation_runtime import (
     operation_progress_plan,
     progress_plan_value,
 )
-from app.services.operations import OperationHandle
+from app.services.operations import OperationHandle, host_mutation_lock
 from app.services.outcome_presentation import mutation_outcome_facts
 from app.services.ssh_access import (
     deferred_backend_ssh_reconcile,
@@ -69,9 +74,15 @@ CREATE_OUTPUT = Action(
 )
 
 
+@mutation_runner("create_backend", payload=BackendIn)
 async def _run_create_backend_operation(
-    settings: Settings, operation_id: int | None, payload
+    settings: Settings,
+    operation_id: int | None,
+    payload: BackendIn,
+    shield_access_code: str = "",
 ) -> None:
+    if shield_access_code:
+        payload = payload.model_copy(update={"shield_access_code": shield_access_code})
     operation = _CreateBackendProgressRecorder(
         OperationHandle(id=operation_id, kind="create_backend", settings=settings)
     )
@@ -81,8 +92,6 @@ async def _run_create_backend_operation(
         return progress_plan
 
     async def mutate(session, operation, _row, _report):
-        # Both are rebound as the real plan becomes known and the heartbeat
-        # starts, and current_progress_plan() closes over the outer name.
         nonlocal progress_plan
         heartbeat_task: asyncio.Task[None] | None = None
         await operation.update(
@@ -231,9 +240,6 @@ async def _run_create_backend_operation(
         )
         return SaveResult(apply_response=apply_response)
 
-    async def already_reported(_operation, _result):
-        """Create completes the operation itself; it narrates its own steps."""
-
     await run_save(
         settings,
         operation_id,
@@ -250,7 +256,6 @@ async def _run_create_backend_operation(
             "Checking ports and health settings",
         ),
         mutate=mutate,
-        complete=already_reported,
         session_factory=background_db_session,
         operation=operation,
         rules=(
@@ -361,6 +366,80 @@ DELETE_OUTPUT = Action(
 )
 
 
+@dataclass(frozen=True)
+class OutputDeleteOutcome:
+    apply_response: ApplyResponse
+    filesystem_cleanup_error: str | None
+    ssh_cleanup_error: str | None
+
+
+async def converge_output_delete(
+    session,
+    settings: Settings,
+    backend_name: str,
+    *,
+    backend_id: int,
+    apply_services,
+    operation_handle: OperationHandle | None = None,
+    before_ssh_cleanup: Callable[[ApplyResponse], Awaitable[None]] | None = None,
+) -> OutputDeleteOutcome:
+    """Converge a pending output deletion, then remove what it left by name.
+
+    Cleanup finds resources by name, so the host lock stays held until it
+    finishes: a same-name replacement cannot be created underneath it.
+    """
+    filesystem_cleanup_error: str | None = None
+    ssh_cleanup_error: str | None = None
+    async with host_mutation_lock(settings):
+        mutation = await converge_change(
+            session,
+            settings,
+            change=output_change("ui.backend.delete", backend_name),
+            apply_runner=run_apply,
+            apply_services=apply_services,
+            operation_handle=operation_handle,
+        )
+        apply_response = mutation.apply_response
+        logger.info(
+            "ui.backend.delete.worker_applied",
+            backend_id=backend_id,
+            backend_name=backend_name,
+            mutation_state=mutation.state,
+            apply_status=apply_response.status,
+            run_id=apply_response.run_id,
+        )
+        await flush_logging_pipeline_async()
+        if apply_response.status == "success" and backend_name:
+            try:
+                await remove_deleted_app_filesystem_artifacts({backend_name}, settings)
+            except Exception as exc:
+                filesystem_cleanup_error = str(exc)
+                logger.exception(
+                    "ui.backend.delete.filesystem_cleanup_failed",
+                    backend_id=backend_id,
+                    backend=backend_name,
+                    error=filesystem_cleanup_error,
+                )
+                await flush_logging_pipeline_async()
+            try:
+                if before_ssh_cleanup is not None:
+                    await before_ssh_cleanup(apply_response)
+                await remove_backend_ssh_access([backend_name], settings)
+            except Exception as exc:
+                ssh_cleanup_error = str(exc)
+                logger.exception(
+                    "ui.backend.delete.ssh_cleanup_failed",
+                    backend_id=backend_id,
+                    backend=backend_name,
+                    error=ssh_cleanup_error,
+                )
+                await flush_logging_pipeline_async()
+    return OutputDeleteOutcome(
+        apply_response, filesystem_cleanup_error, ssh_cleanup_error
+    )
+
+
+@mutation_runner("delete_backend")
 async def _run_delete_operation(
     settings: Settings, operation_id: int | None, backend_id: int
 ) -> None:
@@ -422,73 +501,36 @@ async def _run_delete_operation(
             progress_plan=progress_plan,
             backend_name=deleted_backend_name,
         )
-        mutation = await converge_change(
+
+        async def announce_ssh_cleanup(apply_response) -> None:
+            await operation.update(
+                status="running",
+                phase="Apply host access",
+                details={
+                    **_planned_operation_progress_details(
+                        progress_plan,
+                        0,
+                        "Cleaning backend SSH access.",
+                        phase="Apply host access",
+                        substate="Cleaning backend SSH access",
+                    ),
+                    "backend_name": deleted_backend_name,
+                    "run_id": apply_response.run_id,
+                },
+            )
+
+        outcome = await converge_output_delete(
             session,
             settings,
-            change=output_change("ui.backend.delete", deleted_backend_name),
-            apply_runner=run_apply,
+            deleted_backend_name,
+            backend_id=backend_id,
             apply_services=services,
             operation_handle=operation,
-            # Deleting this output must not repair another one that happens to
-            # have drifted. Scope is the output being deleted, and nothing else.
+            before_ssh_cleanup=announce_ssh_cleanup,
         )
-        apply_response = mutation.apply_response
-        filesystem_cleanup_error: str | None = None
-        ssh_cleanup_error: str | None = None
-        logger.info(
-            "ui.backend.delete.worker_applied",
-            backend_id=backend_id,
-            backend_name=deleted_backend_name,
-            operation_id=operation_id,
-            mutation_state=mutation.state,
-            apply_status=apply_response.status,
-            run_id=apply_response.run_id,
-        )
-        await flush_logging_pipeline_async()
-        if apply_response.status == "success" and deleted_backend_name:
-            try:
-                await remove_deleted_app_filesystem_artifacts(
-                    {deleted_backend_name}, settings
-                )
-            except Exception as exc:
-                filesystem_cleanup_error = str(exc)
-                logger.exception(
-                    "ui.backend.delete.filesystem_cleanup_failed",
-                    backend_id=backend_id,
-                    backend=deleted_backend_name,
-                    error=filesystem_cleanup_error,
-                )
-                await flush_logging_pipeline_async()
-            try:
-                await operation.update(
-                    status="running",
-                    phase="Apply host access",
-                    details={
-                        **_planned_operation_progress_details(
-                            progress_plan,
-                            0,
-                            "Cleaning backend SSH access.",
-                            phase="Apply host access",
-                            substate="Cleaning backend SSH access",
-                        ),
-                        "backend_name": deleted_backend_name,
-                        "run_id": apply_response.run_id,
-                    },
-                )
-                await remove_backend_ssh_access([deleted_backend_name], settings)
-            except Exception as exc:
-                # Reported, not swallowed. This used to log a warning and
-                # still tell the operator "Output deleted." while the host
-                # account, its authorized_keys entry and its sudoers line
-                # stayed behind.
-                ssh_cleanup_error = str(exc)
-                logger.exception(
-                    "ui.backend.delete.ssh_cleanup_failed",
-                    backend_id=backend_id,
-                    backend=deleted_backend_name,
-                    error=ssh_cleanup_error,
-                )
-                await flush_logging_pipeline_async()
+        apply_response = outcome.apply_response
+        filesystem_cleanup_error = outcome.filesystem_cleanup_error
+        ssh_cleanup_error = outcome.ssh_cleanup_error
         success_flash, error_flash = _save_apply_feedback(
             apply_response,
             success_message="Output deleted.",
@@ -554,9 +596,6 @@ async def _run_delete_operation(
         )
         return SaveResult(apply_response=apply_response)
 
-    async def already_reported(_operation, _result):
-        """Delete completes the operation itself; it has cleanup to describe."""
-
     await run_save(
         settings,
         operation_id,
@@ -570,6 +609,5 @@ async def _run_delete_operation(
             extra={"progress_plan": progress_plan},
         ),
         mutate=mutate,
-        complete=already_reported,
         session_factory=background_db_session,
     )

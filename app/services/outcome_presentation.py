@@ -1,14 +1,8 @@
-"""User-facing mutation outcomes derived from durable recovery facts.
-
-Operation and apply records keep their precise internal states, including
-``partial``.  UI cards, history, text output, and notifications use this module
-to answer the narrower operator question: was the requested save retained?
-"""
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 
 OUTCOME_FACT_KEYS = (
@@ -25,8 +19,8 @@ OUTCOME_FACT_KEYS = (
 
 @dataclass(frozen=True)
 class MutationOutcomePresentation:
-    """The terminal label and consequence shown outside diagnostic payloads."""
 
+    state: Literal["queued", "running", "success", "failed", "unknown"]
     status_label: str
     tone: str
     recovery_detail: str = ""
@@ -36,7 +30,6 @@ class MutationOutcomePresentation:
 
 
 def mutation_outcome_facts(details: Mapping[str, Any] | None) -> dict[str, Any]:
-    """Copy only the durable facts needed to reproduce presentation later."""
 
     facts = details or {}
     return {key: facts[key] for key in OUTCOME_FACT_KEYS if key in facts}
@@ -64,7 +57,6 @@ def _explicit_recovery_failure(details: Mapping[str, Any]) -> bool:
 
 
 def mutation_recovery_detail(details: Mapping[str, Any] | None) -> str:
-    """Describe what a failed or interrupted mutation means for the operator."""
 
     facts = details or {}
     commit_outcome = str(facts.get("commit_outcome") or "").strip().lower()
@@ -119,16 +111,15 @@ def present_mutation_outcome(
     status: object,
     details: Mapping[str, Any] | None = None,
 ) -> MutationOutcomePresentation:
-    """Map internal outcome state to the small vocabulary users act on."""
 
     normalized = str(status or "").strip().lower()
     facts = details or {}
     if normalized == "success":
-        return MutationOutcomePresentation("saved", "success")
+        return MutationOutcomePresentation("success", "saved", "success")
     if normalized in {"queued", "pending"}:
-        return MutationOutcomePresentation("queued", "queued")
+        return MutationOutcomePresentation("queued", "queued", "queued")
     if normalized == "running":
-        return MutationOutcomePresentation("running", "queued")
+        return MutationOutcomePresentation("running", "running", "queued")
     if normalized in {"error", "failed", "partial", "cancelled"}:
         recovery_detail = mutation_recovery_detail(facts)
         if (
@@ -136,9 +127,14 @@ def present_mutation_outcome(
             and not _explicit_recovery_failure(facts)
         ):
             return MutationOutcomePresentation(
-                "saved", "success", recovery_detail=recovery_detail
+                "success", "saved", "success", recovery_detail=recovery_detail
             )
         return MutationOutcomePresentation(
-            "failed", "error", recovery_detail=recovery_detail
+            "failed", "failed", "error", recovery_detail=recovery_detail
         )
-    return MutationOutcomePresentation(normalized or "unknown", "inactive")
+    return MutationOutcomePresentation(
+        "unknown",
+        "unknown",
+        "inactive",
+        recovery_detail=mutation_recovery_detail(facts),
+    )

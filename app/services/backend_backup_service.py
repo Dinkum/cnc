@@ -15,13 +15,15 @@ import tarfile
 import tempfile
 import time
 from typing import Any, Callable
+import uuid
 
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
-from app.services.thread_workers import BoundedThreadWorker
+from app.services.thread_workers import BoundedThreadWorker, HostMutationLifecycle
+from app.services.tools.core import unwind_recovery
 from app.config import Settings, get_settings
 from app.services.config_change import full_reconcile
 from app.database import create_configured_async_engine
@@ -35,9 +37,12 @@ from app.services.app_quadlet import (
 from app.services.apply_service import run_apply
 from app.services.cluster_backups import mirror_backend_backup_to_cluster
 from app.services.commands import run_command
-from app.services.container_runtime import container_exists
+from app.services.container_runtime import container_presence
+from app.services.host_journal import HostJournal, journal_action
+from app.services.observation import known
 from app.services.control_events import emit_control_event
 from app.services.error_reporting import CNCError, ErrorCode
+from app.services.inter_app_interfaces import pending_inter_app_interfaces_json
 from app.services.notifications import (
     admin_dashboard_url,
     build_operator_message,
@@ -50,8 +55,10 @@ from app.services.safe_tar import safe_extract_tar, validate_safe_tar
 from app.services.guest_metadata import GuestArchiveView, guest_tar_filter
 from app.services.guest_isolation import validate_guest_volume_paths
 from app.services.validators import (
+    ValidationError,
     ensure_backend_name,
     ensure_healthcheck_host_header,
+    ensure_host_paths_not_nested,
     parse_volume_binding,
     parse_volumes_json,
     validate_backend_collection,
@@ -60,6 +67,10 @@ from app.services.validators import (
 )
 
 BUNDLE_METADATA_NAME = "metadata.json"
+# Upload limits measure compressed bytes. These bound what a bundle may expand
+# to, read from member headers before any payload is decompressed to disk.
+BUNDLE_METADATA_MAX_BYTES = 16 * 1024 * 1024
+BUNDLE_MAX_MEMBERS = 5_000_000
 CONTAINER_SNAPSHOT_NAME = "container-image.tar"
 BUNDLE_FORMAT_VERSION = 1
 GUEST_CONTRACT_VERSION = 1
@@ -69,6 +80,7 @@ BackupProgressCallback = Callable[[int, str], None]
 BACKUP_DESCRIPTION_CACHE_TTL_SEC = 300
 BACKUP_DESCRIPTION_CACHE_MAX = 128
 _description_workers = BoundedThreadWorker(2)
+_runtime_workers = BoundedThreadWorker(2)
 _description_tasks: WeakKeyDictionary[
     asyncio.AbstractEventLoop, dict[tuple[object, ...], asyncio.Task]
 ] = WeakKeyDictionary()
@@ -88,6 +100,16 @@ def _bundle_write_open_kwargs(settings: Settings) -> tuple[str, dict[str, Any]]:
 
 def _timestamp_slug() -> str:
     return datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+
+
+# Access protection travels with the archive: an input recreated by a restore
+# must come back behind the same Shield and HTTPS settings it was saved with.
+_INPUT_PROTECTION_FIELDS = (
+    "https_enabled",
+    "https_provider",
+    "shield_enabled",
+    "shield_code_hash",
+)
 
 
 def _metadata_snapshot(backend: Backend) -> dict[str, Any]:
@@ -111,6 +133,8 @@ def _metadata_snapshot(backend: Backend) -> dict[str, Any]:
             "inter_app_interfaces_json": backend.inter_app_interfaces_json,
             "volumes_json": backend.volumes_json,
             "hardening_config_json": backend.hardening_config_json or "{}",
+            "shield_enabled": backend.shield_enabled,
+            "shield_code_hash": backend.shield_code_hash,
             "enabled": backend.enabled,
             "notes": backend.notes,
         },
@@ -119,6 +143,8 @@ def _metadata_snapshot(backend: Backend) -> dict[str, Any]:
                 "kind": item.kind,
                 "hostname": item.hostname,
                 "enabled": item.enabled,
+                **{field: getattr(item, field) for field in _INPUT_PROTECTION_FIELDS},
+                "connection": item.connection or "public_ip",
             }
             for item in sorted(backend.inputs, key=lambda item: item.id)
         ],
@@ -188,7 +214,6 @@ def _resolved_mount_entries(
                 link_policy="guest",
             )
             try:
-                # A private ancestor outside the bind survives guest chmods.
                 validate_guest_volume_paths([volume])
                 options = volume.split(":", 2)[2:] or [""]
                 if "ro" not in options[0].split(","):
@@ -201,9 +226,22 @@ def _resolved_mount_entries(
 
 def _bundle_metadata(backend: Backend, settings: Settings) -> dict[str, Any]:
     mount_entries = _resolved_mount_entries(backend, settings)
+    ensure_host_paths_not_nested(
+        (entry["host_path"] for entry in mount_entries if entry["exists"]),
+        field_name=f"backup paths for {backend.name}",
+    )
     metadata = _metadata_snapshot(backend)
     metadata["bundle_format_version"] = BUNDLE_FORMAT_VERSION
     metadata["created_at"] = datetime.now(UTC).isoformat()
+    # Files are copied without pausing the app, so a structurally valid bundle
+    # may still hold files from different moments. Say so instead of implying
+    # application consistency.
+    metadata["capture_mode"] = (
+        "offline"
+        if backend.kind == "app"
+        and not _backend_container_exists(backend.name, settings)
+        else "live"
+    )
     metadata["mount_entries"] = mount_entries
     metadata["resolved_host_paths"] = [entry["host_path"] for entry in mount_entries]
     metadata["guest_contract"] = _guest_contract_snapshot(
@@ -756,15 +794,43 @@ def _backup_tar_filter(*, allow_links: bool):
 
 def _load_bundle_metadata(bundle_path: Path) -> dict[str, Any]:
     with tarfile.open(bundle_path, "r:*") as archive:
+        _scan_bundle_members(archive, max_expanded_bytes=None)
         return _metadata_from_open_archive(archive)
 
 
+def _scan_bundle_members(
+    archive: tarfile.TarFile, *, max_expanded_bytes: int | None
+) -> int:
+    """Read every member header within budget; return the expanded byte total.
+
+    Iterating stops at the first header over budget, so an archive that
+    declares millions of members or terabytes of payload is rejected without
+    being decompressed. Extraction writes exactly the sizes these headers
+    declare, so the total is also what a restore will need on disk.
+    """
+    expanded_bytes = 0
+    for count, member in enumerate(archive, start=1):
+        if count > BUNDLE_MAX_MEMBERS:
+            raise RuntimeError(
+                f"backup bundle has more than {BUNDLE_MAX_MEMBERS} members"
+            )
+        if member.isfile():
+            expanded_bytes += member.size
+        if max_expanded_bytes is not None and expanded_bytes > max_expanded_bytes:
+            raise RuntimeError(
+                "backup bundle expands beyond the configured limit of "
+                f"{max_expanded_bytes} bytes"
+            )
+    return expanded_bytes
+
+
 def _metadata_from_open_archive(archive: tarfile.TarFile) -> dict[str, Any]:
-    # getmember preserves the archive's last-entry-wins metadata semantics.
     try:
         member = archive.getmember(BUNDLE_METADATA_NAME)
     except KeyError as exc:
         raise RuntimeError("backup bundle metadata missing") from exc
+    if member.size > BUNDLE_METADATA_MAX_BYTES:
+        raise RuntimeError("backup bundle metadata is too large")
     handle = archive.extractfile(member)
     if handle is None:
         raise RuntimeError("backup bundle metadata missing")
@@ -910,9 +976,17 @@ def _bundle_restore_signals(
         "high_risk": "high risk",
     }[restore_readiness]
 
+    capture_consistency = (
+        "offline" if metadata.get("capture_mode") == "offline" else "live"
+    )
     return {
         "bundle_backend_name": bundle_backend_name,
         "bundle_backend_kind": bundle_backend_kind,
+        "capture_consistency": capture_consistency,
+        "capture_consistency_label": {
+            "offline": "offline copy",
+            "live": "live copy; files changed during the backup may not match each other",
+        }[capture_consistency],
         "restore_readiness": restore_readiness,
         "restore_readiness_label": restore_readiness_label,
         "risk_flags": risk_flags,
@@ -926,6 +1000,7 @@ def _verify_bundle_contents(
     bundle_path: Path,
     *,
     expected_sha256: str | None = None,
+    max_expanded_bytes: int | None = None,
 ) -> dict[str, Any]:
     if not bundle_path.exists():
         raise RuntimeError("backup bundle is missing")
@@ -938,7 +1013,12 @@ def _verify_bundle_contents(
             "backup bundle checksum mismatch",
         )
 
+    if max_expanded_bytes is None:
+        max_expanded_bytes = get_settings().backend_backup_expanded_max_bytes
     with tarfile.open(bundle_path, "r:*") as archive:
+        expanded_bytes = _scan_bundle_members(
+            archive, max_expanded_bytes=max_expanded_bytes
+        )
         metadata = _metadata_from_open_archive(archive)
         backend_payload = metadata.get("backend")
         if not isinstance(backend_payload, dict):
@@ -984,6 +1064,7 @@ def _verify_bundle_contents(
         "bundle_path": str(bundle_path),
         "bundle_sha256": actual_sha256,
         "bundle_size_bytes": bundle_path.stat().st_size,
+        "bundle_expanded_bytes": expanded_bytes,
         "bundle_format_version": bundle_format_version,
         "scope": _bundle_scope(metadata),
         "notes": _bundle_notes(metadata),
@@ -1086,10 +1167,37 @@ def _backend_payload_fields() -> tuple[str, ...]:
         "cpu_quota_override",
         "inter_app_interfaces_json",
         "hardening_config_json",
+        "shield_enabled",
+        "shield_code_hash",
         "volumes_json",
         "enabled",
         "notes",
     )
+
+
+def _input_from_metadata(item: dict[str, Any], *, kind: str, hostname: str) -> Input:
+    recorded = all(field in item for field in _INPUT_PROTECTION_FIELDS)
+    restored = Input(
+        connection=item.get("connection", "public_ip"),
+        kind=kind,
+        hostname=hostname,
+        # An archive from before protection was recorded cannot say whether
+        # this input sat behind Shield or HTTPS. Keep it unpublished until an
+        # operator has reviewed it rather than exposing it unprotected.
+        enabled=bool(item.get("enabled", True)) and recorded,
+    )
+    if recorded:
+        restored.https_enabled = bool(item["https_enabled"])
+        restored.https_provider = str(item["https_provider"] or "self_signed")
+        restored.shield_enabled = bool(item["shield_enabled"])
+        restored.shield_code_hash = item["shield_code_hash"] or None
+    else:
+        logger.warning(
+            "restore.input_protection_unrecorded",
+            hostname=hostname,
+            action="input restored disabled for review",
+        )
+    return restored
 
 
 def _backend_payload_name(metadata: dict[str, Any]) -> str:
@@ -1140,6 +1248,19 @@ def _validate_restore_mount_entries(
     mount_entries = metadata.get("mount_entries")
     if not isinstance(mount_entries, list):
         return
+    try:
+        ensure_host_paths_not_nested(
+            (
+                str(entry["host_path"])
+                for entry in mount_entries
+                if isinstance(entry, dict)
+                and entry.get("exists")
+                and isinstance(entry.get("host_path"), str)
+            ),
+            field_name="backup restore paths",
+        )
+    except ValidationError as exc:
+        raise CNCError(ErrorCode.RESTORE_MOUNT_PATH_MISMATCH, str(exc)) from exc
     seen_targets: set[str] = set()
     for entry in mount_entries:
         if not isinstance(entry, dict) or not entry.get("exists"):
@@ -1367,8 +1488,6 @@ def _clone_bundle_metadata_for_new_backend(
                         f"{target_host_path}:{binding.target}{options_suffix}"
                     )
                 else:
-                    # The persistent guest sandbox dir is cloned alongside declared volumes,
-                    # but it is not itself a user-authored host:target volume binding.
                     rewritten_entry["declared"] = target_host_path
             else:
                 rewritten_entry["declared"] = target_host_path
@@ -1383,6 +1502,9 @@ def _clone_bundle_metadata_for_new_backend(
     backend_payload["name"] = target_backend_name
     backend_payload["port"] = target_port
     backend_payload["enabled"] = False
+    backend_payload["inter_app_interfaces_json"] = pending_inter_app_interfaces_json(
+        str(backend_payload.get("inter_app_interfaces_json") or "[]")
+    )
     source_inputs = [
         item for item in clone_metadata.get("inputs", []) if isinstance(item, dict)
     ]
@@ -1580,11 +1702,20 @@ def _extract_bundle_entries(
     if not allowed_prefixes:
         return
 
+    include = _bundle_restore_member_include(allowed_prefixes)
     with tarfile.open(bundle_path, "r:*") as archive:
+        _ensure_free_space(
+            destination_dir,
+            sum(
+                member.size
+                for member in archive.getmembers()
+                if member.isfile() and include(member)
+            ),
+        )
         safe_extract_tar(
             archive,
             destination_dir,
-            include=_bundle_restore_member_include(allowed_prefixes),
+            include=include,
             allow_relative_symlinks=True,
             guest_symlink_roots=guest_symlink_roots,
             guest_metadata_roots={
@@ -1598,6 +1729,18 @@ def _extract_bundle_entries(
         )
 
 
+def _ensure_free_space(path: Path, required_bytes: int) -> None:
+    existing = next(
+        candidate for candidate in (path, *path.parents) if candidate.exists()
+    )
+    available = shutil.disk_usage(existing).free
+    if required_bytes > available:
+        raise RuntimeError(
+            f"not enough free space to restore: {required_bytes} bytes needed "
+            f"under {path}, {available} available"
+        )
+
+
 def _remove_existing_path(path: Path) -> None:
     if not path.exists() and not path.is_symlink():
         return
@@ -1607,145 +1750,150 @@ def _remove_existing_path(path: Path) -> None:
     path.unlink()
 
 
+def _restore_entry_exists(path: Path) -> bool:
+    return path.exists() or path.is_symlink()
+
+
+def _rollback_restore_entries(entries: list[dict[str, Any]]) -> None:
+    for entry in reversed(entries):
+        target = Path(entry["target"])
+        stage = Path(entry["stage"])
+        rollback = Path(entry["rollback"])
+        if _restore_entry_exists(rollback):
+            if _restore_entry_exists(target):
+                _remove_existing_path(target)
+            shutil.move(str(rollback), str(target))
+        elif not entry["had_existing"] and _restore_entry_exists(target):
+            _remove_existing_path(target)
+        if _restore_entry_exists(stage):
+            _remove_existing_path(stage)
+
+
+def _discard_restore_rollbacks(entries: list[dict[str, Any]]) -> None:
+    for entry in entries:
+        for key in ("rollback", "stage"):
+            path = Path(entry[key])
+            if not _restore_entry_exists(path):
+                continue
+            try:
+                _remove_existing_path(path)
+            except Exception as exc:
+                logger.warning(
+                    "restore.rollback_cleanup_failed", path=str(path), error=str(exc)
+                )
+
+
+class _RestoreCommitUnknown(RuntimeError):
+    def __init__(self, journal_id: str) -> None:
+        super().__init__(
+            "restore commit outcome could not be determined; host left as is"
+        )
+        self.journal_id = journal_id
+
+
 class _RestoreBundleTransaction:
-    def __init__(self, metadata: dict[str, Any], bundle_path: Path | None) -> None:
+    def __init__(
+        self,
+        metadata: dict[str, Any],
+        bundle_path: Path | None,
+        *,
+        token: str | None = None,
+    ) -> None:
         self.metadata = metadata
         self.bundle_path = bundle_path
+        self.token = token or uuid.uuid4().hex[:12]
         self._temp_dir_context: tempfile.TemporaryDirectory[str] | None = None
         self._temp_dir: Path | None = None
-        self._staged_entries: list[tuple[Path, Path, Path, bool]] = []
-        self._applied_entries: list[tuple[Path, Path, bool]] = []
-        self._protected_rollbacks: set[Path] = set()
+        self.entries = self._plan_entries()
         self.restored_paths: list[str] = []
 
-    def apply(self) -> list[str]:
+    def _plan_entries(self) -> list[dict[str, Any]]:
         if self.bundle_path is None or not self.bundle_path.exists():
             return []
-
         mount_entries = self.metadata.get("mount_entries")
         if not isinstance(mount_entries, list):
             return []
+        planned: list[dict[str, Any]] = []
+        for entry in mount_entries:
+            if not isinstance(entry, dict) or not entry.get("exists"):
+                continue
+            host_path = entry.get("host_path")
+            archive_prefix = entry.get("archive_prefix")
+            if not isinstance(host_path, str) or not isinstance(archive_prefix, str):
+                continue
+            target = Path(host_path)
+            index = len(planned)
+            planned.append(
+                {
+                    "target": str(target),
+                    "stage": str(
+                        target.parent
+                        / f".cnc-restore-stage-{target.name}-{self.token}-{index}"
+                    ),
+                    "rollback": str(
+                        target.parent
+                        / f".cnc-restore-rollback-{target.name}-{self.token}-{index}"
+                    ),
+                    "archive_prefix": archive_prefix,
+                    "had_existing": _restore_entry_exists(target),
+                    "private_stage": entry.get("link_policy") == "guest"
+                    and entry.get("target_path") is None,
+                }
+            )
+        return planned
 
+    def apply(self) -> list[str]:
+        if not self.entries:
+            return []
+        assert self.bundle_path is not None
         self._temp_dir_context = tempfile.TemporaryDirectory(
             prefix="cnc-backup-restore-"
         )
         self._temp_dir = Path(self._temp_dir_context.name)
         _extract_bundle_entries(self.bundle_path, self._temp_dir, self.metadata)
-
+        guest_owner_roots = _bundle_guest_owner_roots(self.metadata)
         try:
-            for entry in mount_entries:
-                if not isinstance(entry, dict) or not entry.get("exists"):
-                    continue
-                host_path = entry.get("host_path")
-                archive_prefix = entry.get("archive_prefix")
-                if not isinstance(host_path, str) or not isinstance(
-                    archive_prefix, str
-                ):
-                    continue
-                extracted_path = self._temp_dir / archive_prefix
+            staged: list[dict[str, Any]] = []
+            for entry in self.entries:
+                extracted_path = self._temp_dir / entry["archive_prefix"]
                 if not extracted_path.exists():
                     continue
-
-                target_path = Path(host_path)
-                if entry.get("archive_prefix") in _bundle_guest_owner_roots(
-                    self.metadata
-                ):
-                    validate_guest_volume_paths(
-                        [f"{target_path}:/:rw"], allow_missing=True
-                    )
-                target_path.parent.mkdir(parents=True, exist_ok=True)
-                stage_path = (
-                    target_path.parent
-                    / f".cnc-restore-stage-{target_path.name}-{os.getpid()}-{len(self._staged_entries)}"
-                )
-                rollback_path = (
-                    target_path.parent
-                    / f".cnc-restore-rollback-{target_path.name}-{os.getpid()}-{len(self._staged_entries)}"
-                )
-                if stage_path.exists() or stage_path.is_symlink():
-                    _remove_existing_path(stage_path)
-                if rollback_path.exists() or rollback_path.is_symlink():
-                    _remove_existing_path(rollback_path)
-                shutil.move(str(extracted_path), str(stage_path))
-                if (
-                    entry.get("link_policy") == "guest"
-                    and entry.get("target_path") is None
-                ):
-                    stage_path.chmod(0o700)
-                had_existing = target_path.exists() or target_path.is_symlink()
-                self._staged_entries.append(
-                    (stage_path, target_path, rollback_path, had_existing)
-                )
-
-            for (
-                stage_path,
-                target_path,
-                rollback_path,
-                had_existing,
-            ) in self._staged_entries:
-                if had_existing:
-                    shutil.move(str(target_path), str(rollback_path))
-                    self._protected_rollbacks.add(rollback_path)
-                try:
-                    shutil.move(str(stage_path), str(target_path))
-                except Exception:
-                    if had_existing and rollback_path.exists():
-                        shutil.move(str(rollback_path), str(target_path))
-                        self._protected_rollbacks.discard(rollback_path)
-                    raise
-                self._applied_entries.append((target_path, rollback_path, had_existing))
-                self.restored_paths.append(str(target_path))
+                target = Path(entry["target"])
+                stage = Path(entry["stage"])
+                rollback = Path(entry["rollback"])
+                if entry["archive_prefix"] in guest_owner_roots:
+                    validate_guest_volume_paths([f"{target}:/:rw"], allow_missing=True)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                for leftover in (stage, rollback):
+                    if _restore_entry_exists(leftover):
+                        _remove_existing_path(leftover)
+                shutil.move(str(extracted_path), str(stage))
+                if entry["private_stage"]:
+                    stage.chmod(0o700)
+                staged.append(entry)
+            for entry in staged:
+                target = Path(entry["target"])
+                if entry["had_existing"]:
+                    shutil.move(str(target), entry["rollback"])
+                shutil.move(entry["stage"], str(target))
+                self.restored_paths.append(str(target))
             return list(self.restored_paths)
         except Exception:
             self.rollback()
             raise
 
     def commit(self) -> None:
-        for _target_path, rollback_path, _had_existing in self._applied_entries:
-            if rollback_path.exists() or rollback_path.is_symlink():
-                try:
-                    _remove_existing_path(rollback_path)
-                    self._protected_rollbacks.discard(rollback_path)
-                except Exception as exc:
-                    logger.warning(
-                        "restore.rollback_cleanup_failed",
-                        path=str(rollback_path),
-                        error=str(exc),
-                    )
+        _discard_restore_rollbacks(self.entries)
         try:
             self._cleanup()
         except Exception as exc:
             logger.warning("restore.temp_cleanup_failed", error=str(exc))
 
     def rollback(self) -> None:
-        for target_path, rollback_path, had_existing in reversed(self._applied_entries):
-            if target_path.exists() or target_path.is_symlink():
-                _remove_existing_path(target_path)
-            if had_existing and (rollback_path.exists() or rollback_path.is_symlink()):
-                shutil.move(str(rollback_path), str(target_path))
-                self._protected_rollbacks.discard(rollback_path)
-        for (
-            stage_path,
-            _target_path,
-            rollback_path,
-            _had_existing,
-        ) in self._staged_entries:
-            if stage_path.exists() or stage_path.is_symlink():
-                _remove_existing_path(stage_path)
-            if rollback_path.exists() or rollback_path.is_symlink():
-                if rollback_path in self._protected_rollbacks:
-                    logger.warning(
-                        "restore.rollback_path_preserved",
-                        path=str(rollback_path),
-                    )
-                else:
-                    _remove_existing_path(rollback_path)
+        _rollback_restore_entries(self.entries)
         self._cleanup()
 
     def _cleanup(self) -> None:
-        self._staged_entries = []
-        self._applied_entries = []
-        self._protected_rollbacks = set()
         self.restored_paths = []
         if self._temp_dir_context is not None:
             self._temp_dir_context.cleanup()
@@ -1754,10 +1902,9 @@ class _RestoreBundleTransaction:
 
 
 def _backend_container_exists(backend_name: str, settings: Settings) -> bool:
-    return container_exists(
-        container_name(backend_name),
-        settings.command_timeout_status_sec,
-    )
+    container = container_name(backend_name)
+    presence = container_presence(container, settings.command_timeout_status_sec)
+    return known(presence, f"container {container}") is not None
 
 
 def _backend_quadlet_service_exists(backend_name: str, settings: Settings) -> bool:
@@ -1800,11 +1947,65 @@ def _start_backend_runtime_if_present(backend_name: str, settings: Settings) -> 
     )
 
 
+async def _load_backend_for_recovery(
+    settings: Settings, backend_id: int
+) -> Backend | None:
+    engine = create_configured_async_engine(settings.database_url)
+    try:
+        maker = async_sessionmaker(bind=engine, expire_on_commit=False)
+        async with maker() as session:
+            return (
+                await session.execute(
+                    select(Backend)
+                    .options(selectinload(Backend.inputs))
+                    .where(Backend.id == backend_id)
+                )
+            ).scalar_one_or_none()
+    finally:
+        await engine.dispose()
+
+
+@journal_action("restore.rollback_paths")
+def _undo_restored_paths(_settings: Settings, args: dict[str, Any]) -> None:
+    _rollback_restore_entries(args["entries"])
+
+
+@journal_action("restore.discard_rollbacks")
+def _discard_restored_path_rollbacks(_settings: Settings, args: dict[str, Any]) -> None:
+    _discard_restore_rollbacks(args["entries"])
+
+
+@journal_action("runtime.stop_if_present")
+def _undo_runtime_start(settings: Settings, args: dict[str, Any]) -> None:
+    _stop_backend_runtime_if_present(args["backend"], settings)
+
+
+@journal_action("runtime.start_if_enabled")
+async def _undo_runtime_stop(settings: Settings, args: dict[str, Any]) -> None:
+    backend = await _load_backend_for_recovery(settings, int(args["backend_id"]))
+    if backend is None or backend.kind != "app" or not backend.enabled:
+        return
+    await _runtime_workers.run(_start_backend_runtime_if_present, backend.name, settings)
+
+
+@journal_action("control_assets.remove")
+def _undo_new_control_assets(settings: Settings, args: dict[str, Any]) -> None:
+    _remove_existing_path(settings.app_control_dir / ensure_backend_name(args["backend"]))
+
+
+@journal_action("control_assets.rewrite_from_db")
+async def _undo_control_assets(settings: Settings, args: dict[str, Any]) -> None:
+    backend = await _load_backend_for_recovery(settings, int(args["backend_id"]))
+    if backend is not None and backend.kind == "app":
+        await asyncio.to_thread(write_app_control_assets, backend, settings)
+
+
 async def _converge_restored_backend_host_state(
     session: AsyncSession,
     settings: Settings,
     operation: OperationHandle,
     *,
+    recovery: list[Any],
     progress_callback: BackupProgressCallback | None = None,
 ) -> dict[str, Any]:
     _report_backup_progress(progress_callback, 0, "Reconciling restored host state.")
@@ -1814,12 +2015,9 @@ async def _converge_restored_backend_host_state(
         commit_on_success=False,
         operation_kind="restore_backend",
         operation_handle=operation,
-        # A restore rebuilds an output from an archive and can reintroduce
-        # routing and accounts that other outputs share, and this converge
-        # point does not carry the output identity. Full reconcile is the
-        # honest scope rather than a narrower one we cannot justify.
         scope=full_reconcile("restore_backend").scope(),
         emit_success_event=False,
+        recovery=recovery,
     )
     if response.status != "success":
         details = response.details if isinstance(response.details, dict) else {}
@@ -2385,10 +2583,9 @@ async def restore_backend_backup(
     backend_name = backend.name
     backend_kind = backend.kind
     backup_id = backup.id
-    had_container = backend_kind == "app" and _backend_container_exists(
-        backend_name, settings
+    had_container = backend_kind == "app" and await _runtime_workers.run(
+        _backend_container_exists, backend_name, settings
     )
-    restore_txn = _RestoreBundleTransaction(metadata, bundle_path)
     restored_paths: list[str] = []
     host_operation = (
         operation.with_deferred_db_updates() if operation is not None else None
@@ -2402,20 +2599,46 @@ async def restore_backend_backup(
         operation=host_operation,
     )
     mutation_operation = await operation_context.__aenter__()
-    restored_container_started = False
+    try:
+        journal = HostJournal.begin(
+            settings, kind="restore_backend", subject=backend_name
+        )
+    except BaseException:
+        await operation_context.__aexit__(None, None, None)
+        raise
+    restore_txn = _RestoreBundleTransaction(
+        metadata, bundle_path, token=journal.id[:12]
+    )
     convergence_details: dict[str, Any] = {}
+    committed = False
+    lifecycle = HostMutationLifecycle(_runtime_workers)
+    host_recovery: list[Any] = []
 
     try:
         _report_backup_progress(progress_callback, 0, "Validating restore payload.")
         _validate_restore_mount_entries(metadata, settings, backend_name=backend.name)
-        # Validate policy before stopping the app or restoring any filesystem data.
         restored_policy = _backend_from_metadata(metadata).hardening_config_json
         if had_container:
             _report_backup_progress(progress_callback, 0, "Stopping existing runtime.")
-            _stop_backend_runtime_if_present(backend.name, settings)
+            await journal.step(
+                "stop_runtime",
+                lambda: _runtime_workers.run(
+                    _stop_backend_runtime_if_present, backend_name, settings
+                ),
+                undo="runtime.start_if_enabled",
+                undo_args={"backend_id": backend_id},
+            )
 
         _report_backup_progress(progress_callback, 0, "Restoring mounted paths.")
-        restored_paths = await asyncio.to_thread(restore_txn.apply)
+        restored_paths = await journal.step(
+            "restore_paths",
+            lambda: asyncio.to_thread(restore_txn.apply),
+            undo="restore.rollback_paths",
+            undo_args={"entries": restore_txn.entries},
+        )
+        journal.after_commit(
+            "restore.discard_rollbacks", {"entries": restore_txn.entries}
+        )
 
         _report_backup_progress(progress_callback, 0, "Restoring backend config.")
         backend.hardening_config_json = restored_policy
@@ -2443,11 +2666,7 @@ async def restore_backend_backup(
                     )
                 ).scalar_one_or_none()
                 if existing is None:
-                    existing = Input(
-                        kind=kind,
-                        hostname=hostname,
-                        enabled=bool(item.get("enabled", True)),
-                    )
+                    existing = _input_from_metadata(item, kind=kind, hostname=hostname)
                     session.add(existing)
                     await session.flush()
                 else:
@@ -2471,24 +2690,43 @@ async def restore_backend_backup(
 
         if backend.kind == "app":
             _report_backup_progress(progress_callback, 0, "Writing app control assets.")
-            write_app_control_assets(backend, settings)
+            await journal.step(
+                "write_control_assets",
+                lambda: write_app_control_assets(backend, settings),
+                undo="control_assets.rewrite_from_db",
+                undo_args={"backend_id": backend_id},
+            )
 
         if had_container and backend_kind == "app" and backend.enabled:
             _report_backup_progress(progress_callback, 0, "Restarting runtime.")
-            _start_backend_runtime_if_present(backend.name, settings)
-            restored_container_started = True
+            await journal.step(
+                "start_runtime",
+                lambda: _runtime_workers.run(
+                    _start_backend_runtime_if_present, backend_name, settings
+                ),
+                undo="runtime.stop_if_present",
+                undo_args={"backend": backend_name},
+            )
 
         convergence_details = await _converge_restored_backend_host_state(
             session,
             settings,
             mutation_operation,
             progress_callback=progress_callback,
+            recovery=host_recovery,
         )
 
         _report_backup_progress(progress_callback, 0, "Committing restore.")
-        await session.commit()
+        commit_outcome = await lifecycle.finish(journal.commit(session))
+        if commit_outcome == "unknown":
+            raise _RestoreCommitUnknown(journal.id)
+        if commit_outcome == "rolled_back":
+            raise RuntimeError(f"restore commit was not kept ({journal.error})")
+        committed = True
+        await lifecycle.finish(_runtime_workers.run(restore_txn.commit))
+        lifecycle.mark_committed()
+        lifecycle.raise_if_cancelled()
         await session.refresh(backend)
-        await asyncio.to_thread(restore_txn.commit)
         _report_backup_progress(progress_callback, 0, "Refreshing output page.")
 
         logger.info(
@@ -2556,15 +2794,58 @@ async def restore_backend_backup(
             "restored_paths": restored_paths,
             "convergence": convergence_details,
         }
-    except Exception as exc:
+    except BaseException as exc:
+        if committed:
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            logger.warning(
+                "restore.post_commit_reporting_failed",
+                backend=backend_name,
+                backup_id=backup_id,
+                error=str(exc),
+            )
+            return {
+                "backup": backup,
+                "restored_paths": restored_paths,
+                "convergence": convergence_details,
+            }
+        if isinstance(exc, _RestoreCommitUnknown):
+            unwind_details: dict[str, Any] = {
+                "commit_outcome": "unknown",
+                "failure_mode": "partial",
+                "manual_review_required": True,
+                "journal_id": journal.id,
+                "operator_action": (
+                    "CNC retries this restore's recovery on its next start; "
+                    "compare the output against the backup before rerunning"
+                ),
+            }
+        else:
+            async def recover() -> dict[str, Any]:
+                await session.rollback()
+                host_unwind = await unwind_recovery(host_recovery)
+                details = (await journal.unwind()).details()
+                await _runtime_workers.run(restore_txn.rollback)
+                if host_unwind.get("manual_review_required"):
+                    details.update(host_unwind)
+                return details
+            unwind_details = await lifecycle.finish(recover())
         await mutation_operation.complete(
-            "failed",
+            "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed",
             phase="restore",
-            error=str(exc),
-            details={"backend": backend_name, "backup_id": backup_id},
+            error=str(exc) or "Restore cancelled.",
+            details={
+                "backend": backend_name,
+                "backup_id": backup_id,
+                **unwind_details,
+            },
         )
         logger.warning(
-            "restore.failed", backend=backend_name, backup_id=backup_id, error=str(exc)
+            "restore.failed",
+            backend=backend_name,
+            backup_id=backup_id,
+            error=str(exc),
+            **unwind_details,
         )
         await emit_control_event(
             settings,
@@ -2582,34 +2863,10 @@ async def restore_backend_backup(
                 "backend": backend_name,
                 "backup_id": backup_id,
                 "error": str(exc),
+                **unwind_details,
             },
             notify=False,
         )
-        await session.rollback()
-        if restored_container_started and backend_kind == "app":
-            try:
-                _stop_backend_runtime_if_present(backend_name, settings)
-            except Exception as stop_exc:
-                logger.warning(
-                    "restore.rollback_stop_failed",
-                    backend=backend_name,
-                    backup_id=backup_id,
-                    error=str(stop_exc),
-                )
-        await asyncio.to_thread(restore_txn.rollback)
-        if backend_kind == "app":
-            session.expire_all()
-            original_backend = (
-                await session.execute(
-                    select(Backend)
-                    .options(selectinload(Backend.inputs))
-                    .where(Backend.id == backend_id)
-                )
-            ).scalar_one_or_none()
-            if original_backend is not None:
-                write_app_control_assets(original_backend, settings)
-                if had_container and original_backend.enabled:
-                    _start_backend_runtime_if_present(original_backend.name, settings)
         if notify_on_failure:
             await send_pushover_notification_async(
                 settings,
@@ -2746,24 +3003,19 @@ async def import_backend_backup_bundle(
             await session.refresh(record)
         try:
             await asyncio.to_thread(shutil.copy2, source_path, temp_destination_path)
-            metadata = await asyncio.to_thread(
-                _load_bundle_metadata, temp_destination_path
-            )
-            backend_payload = metadata.get("backend")
-            if not isinstance(backend_payload, dict):
-                raise RuntimeError("imported bundle metadata missing backend snapshot")
-            snapshot_kind = str(backend_payload.get("kind") or "")
-            if snapshot_kind and snapshot_kind != backend_kind:
-                raise RuntimeError(
-                    "imported bundle backend kind does not match this output"
-                )
-
             bundle_sha256 = await asyncio.to_thread(_sha256_file, temp_destination_path)
             verification = await asyncio.to_thread(
                 _verify_bundle_contents,
                 temp_destination_path,
                 expected_sha256=bundle_sha256,
+                max_expanded_bytes=settings.backend_backup_expanded_max_bytes,
             )
+            metadata = verification["metadata"]
+            snapshot_kind = str(metadata["backend"].get("kind") or "")
+            if snapshot_kind and snapshot_kind != backend_kind:
+                raise RuntimeError(
+                    "imported bundle backend kind does not match this output"
+                )
             temp_destination_path.replace(destination_path)
             record.status = "success"
             record.scope = str(verification["scope"])
@@ -2844,7 +3096,11 @@ async def restore_backend_bundle_as_new_backend(
     settings: Settings,
     backend_name: str | None = None,
 ) -> dict[str, Any]:
-    verification = await asyncio.to_thread(_verify_bundle_contents, source_path)
+    verification = await asyncio.to_thread(
+        _verify_bundle_contents,
+        source_path,
+        max_expanded_bytes=settings.backend_backup_expanded_max_bytes,
+    )
     metadata = verification["metadata"]
     source_backend_name = _backend_payload_name(metadata)
     target_backend_name = ensure_backend_name(backend_name or source_backend_name)
@@ -3038,7 +3294,6 @@ async def clone_backend_as_new_backend(
     if existing is not None:
         raise LookupError(f"output already exists: {target_backend_name}")
 
-    clone_txn: _RestoreBundleTransaction | None = None
     async with host_mutation_operation(
         settings,
         kind="clone_backend",
@@ -3082,19 +3337,40 @@ async def clone_backend_as_new_backend(
             session.add(clone_backend)
             await session.flush()
             await _validate_restored_backend_state(session)
-            clone_txn = _RestoreBundleTransaction(clone_metadata, bundle_path)
+            journal = HostJournal.begin(
+                settings, kind="clone_backend", subject=target_backend_name
+            )
+            clone_txn = _RestoreBundleTransaction(
+                clone_metadata, bundle_path, token=journal.id[:12]
+            )
             restored_paths: list[str] = []
+            post_clone_checks: list[dict[str, str]] = []
+            committed = False
+            lifecycle = HostMutationLifecycle(_runtime_workers)
 
             try:
                 _report_backup_progress(
                     progress_callback, 0, "Restoring guest and data."
                 )
-                restored_paths = await asyncio.to_thread(clone_txn.apply)
+                restored_paths = await journal.step(
+                    "clone_paths",
+                    lambda: asyncio.to_thread(clone_txn.apply),
+                    undo="restore.rollback_paths",
+                    undo_args={"entries": clone_txn.entries},
+                )
+                journal.after_commit(
+                    "restore.discard_rollbacks", {"entries": clone_txn.entries}
+                )
                 if clone_backend.kind == "app":
                     _report_backup_progress(
                         progress_callback, 0, "Writing app control assets."
                     )
-                    write_app_control_assets(clone_backend, settings)
+                    await journal.step(
+                        "write_control_assets",
+                        lambda: write_app_control_assets(clone_backend, settings),
+                        undo="control_assets.remove",
+                        undo_args={"backend": target_backend_name},
+                    )
                 _report_backup_progress(progress_callback, 0, "Running clone checks.")
                 post_clone_checks = await asyncio.to_thread(
                     _run_clone_post_checks,
@@ -3104,9 +3380,16 @@ async def clone_backend_as_new_backend(
                     settings=settings,
                 )
                 _report_backup_progress(progress_callback, 0, "Finalizing clone.")
-                await session.commit()
+                commit_outcome = await lifecycle.finish(journal.commit(session))
+                if commit_outcome == "unknown":
+                    raise _RestoreCommitUnknown(journal.id)
+                if commit_outcome == "rolled_back":
+                    raise RuntimeError(f"clone commit was not kept ({journal.error})")
+                committed = True
+                await lifecycle.finish(_runtime_workers.run(clone_txn.commit))
+                lifecycle.mark_committed()
+                lifecycle.raise_if_cancelled()
                 await session.refresh(clone_backend)
-                await asyncio.to_thread(clone_txn.commit)
                 logger.info(
                     "backend.clone.succeeded",
                     source_backend=loaded_backend.name,
@@ -3129,7 +3412,35 @@ async def clone_backend_as_new_backend(
                     "clone_contract": clone_metadata.get("clone_contract"),
                     "post_clone_checks": post_clone_checks,
                 }
-            except Exception as exc:
+            except BaseException as exc:
+                if committed:
+                    if isinstance(exc, asyncio.CancelledError):
+                        raise
+                    logger.warning(
+                        "backend.clone.post_commit_reporting_failed",
+                        clone_backend=target_backend_name,
+                        error=str(exc),
+                    )
+                    return {
+                        "backend": clone_backend,
+                        "restored_paths": restored_paths,
+                        "clone_contract": clone_metadata.get("clone_contract"),
+                        "post_clone_checks": post_clone_checks,
+                    }
+                if isinstance(exc, _RestoreCommitUnknown):
+                    unwind_details: dict[str, Any] = {
+                        "commit_outcome": "unknown",
+                        "failure_mode": "partial",
+                        "manual_review_required": True,
+                        "journal_id": journal.id,
+                    }
+                else:
+                    async def recover() -> dict[str, Any]:
+                        await session.rollback()
+                        details = (await journal.unwind()).details()
+                        await _runtime_workers.run(clone_txn.rollback)
+                        return details
+                    unwind_details = await lifecycle.finish(recover())
                 await operation.complete(
                     "failed",
                     phase="clone",
@@ -3137,16 +3448,9 @@ async def clone_backend_as_new_backend(
                     details={
                         "source_backend": loaded_backend.name,
                         "clone_backend": target_backend_name,
+                        **unwind_details,
                     },
                 )
-                await session.rollback()
-                if clone_txn is not None:
-                    await asyncio.to_thread(clone_txn.rollback)
-                if clone_backend.kind == "app":
-                    await asyncio.to_thread(
-                        _remove_existing_path,
-                        settings.app_control_dir / clone_backend.name,
-                    )
                 await send_pushover_notification_async(
                     settings,
                     title=f"CNC clone failed: {target_backend_name}",
@@ -3294,8 +3598,6 @@ async def describe_backend_backup(
     tasks = _description_tasks.setdefault(loop, {})
     task = tasks.get(cache_key)
     if task is None:
-        # Snapshot only the fields needed by the worker, independent of the
-        # request's ORM session and of any caller's cancellation.
         snapshot = BackendBackup(
             bundle_path=backup.bundle_path, bundle_sha256=backup.bundle_sha256
         )

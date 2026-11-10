@@ -60,13 +60,47 @@
       } catch (error) { message(output, error.message, true); button.disabled = false; }
     }
   });
+  const updateConnectionFields = form => {
+    const tunnel = form.querySelector('[name="connection"]')?.value === 'cloudflare_tunnel';
+    const manage = form.querySelector('[name="manage_dns"]')?.checked;
+    const ip = form.querySelector('[data-cf-ipv4-field]');
+    if (ip) {
+      ip.hidden = tunnel || !manage;
+      ip.querySelector('input').disabled = tunnel || !manage;
+      ip.querySelector('input').required = !tunnel && manage;
+    }
+    const certificate = form.querySelector('[data-cf-certificate-field]');
+    if (certificate) certificate.hidden = tunnel;
+    const originHTTPS = form.closest('[data-input-card]')?.querySelector('[data-input-origin-https]');
+    if (originHTTPS) originHTTPS.hidden = tunnel;
+    const instructions = form.querySelector('[data-cf-tunnel-fields]');
+    if (instructions) instructions.hidden = !tunnel;
+    const confirmation = form.querySelector('[data-cf-route-confirm]');
+    if (confirmation) {
+      confirmation.hidden = !tunnel || !manage;
+      confirmation.querySelector('input').required = tunnel && manage;
+    }
+  };
+  const updateCreateConnection = form => {
+    const kind = form.querySelector('[name="kind"]')?.value;
+    const connection = form.querySelector('[name="connection"]');
+    if (!connection) return;
+    const control = connection.closest('[data-input-connection-control]');
+    control.hidden = kind !== 'domain';
+    connection.disabled = kind !== 'domain';
+    const https = form.querySelector('[data-input-https-control]');
+    if (https) {
+      https.hidden = kind !== 'domain' || connection.value === 'cloudflare_tunnel';
+      https.querySelector('input').disabled = https.hidden;
+    }
+  };
   document.addEventListener('change', event => {
-    if (!event.target.matches('[data-cf-domain-form] [name="manage_dns"]')) return;
-    const field = event.target.form.querySelector('[data-cf-ipv4-field]');
-    field.hidden = !event.target.checked;
-    field.querySelector('input').disabled = !event.target.checked;
-    field.querySelector('input').required = event.target.checked;
+    const form = event.target.form;
+    if (form?.matches('[data-cf-domain-form]')) updateConnectionFields(form);
+    if (form?.matches('[data-input-create-form]')) updateCreateConnection(form);
   });
+  document.querySelectorAll('[data-cf-domain-form]').forEach(updateConnectionFields);
+  document.querySelectorAll('[data-input-create-form]').forEach(updateCreateConnection);
   document.addEventListener('submit', async event => {
     const form = event.target;
     if (!form.matches('[data-cf-connect-form], [data-cf-domain-form]')) return;
@@ -87,6 +121,7 @@
         preview = result.preview; operationId = null;
         previewDialog.querySelector('[data-cf-preview-host]').textContent = preview.hostname;
         previewDialog.querySelector('[data-cf-preview-certificate]').textContent = preview.certificate;
+        previewDialog.querySelector('[data-cf-mode-note]').hidden = preview.connection === 'cloudflare_tunnel';
         previewDialog.querySelector('[data-cf-preview-before]').textContent = preview.dns?.before || 'Unchanged';
         previewDialog.querySelector('[data-cf-preview-after]').textContent = preview.dns?.after || preview.dns_note;
         message(previewDialog.querySelector('[data-cf-preview-message]'), preview.conflict || '', Boolean(preview.conflict));

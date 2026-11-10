@@ -26,7 +26,7 @@ from app.access import (
     access_key_is_configured,
     verify_access_key_async,
 )
-from app.config import Settings
+from app.config import Settings, get_settings
 from app.logger import get_logger
 from app.models.entities import Backend
 from app.services.commands import guest_timeout_args
@@ -47,6 +47,7 @@ DEFAULT_EXEC_TIMEOUT_SEC = 60
 MAX_EXEC_TIMEOUT_SEC = 60 * 30
 DEFAULT_PTY_IDLE_TIMEOUT_SEC = 60 * 15
 MAX_PTY_IDLE_TIMEOUT_SEC = 60 * 60
+CREDENTIAL_CHECK_INTERVAL_SEC = 1.0
 logger = get_logger("agent_channel")
 
 
@@ -427,10 +428,65 @@ async def authenticate_agent_websocket(
     )
 
 
+def _live_access_key_hash() -> str:
+    return str(get_settings().access_key_hash or "")
+
+
 async def run_agent_channel(
     websocket: WebSocket,
     settings: Settings,
     session_factory: SessionFactory,
+    *,
+    live_credential: Callable[[], str] = _live_access_key_hash,
+) -> None:
+    """Serve one authenticated channel until it closes or its key is rotated.
+
+    Authentication happens once, at connect. A rotated access key must still
+    end the session: frames are checked against the live key before dispatch,
+    and a watcher closes an idle channel so its running execs and PTY stop.
+    """
+    authenticated_credential = str(settings.access_key_hash or "")
+    channel_task = asyncio.current_task()
+    revoked = False
+
+    def credential_revoked() -> bool:
+        return live_credential() != authenticated_credential
+
+    async def watch_credential() -> None:
+        nonlocal revoked
+        while not credential_revoked():
+            await asyncio.sleep(CREDENTIAL_CHECK_INTERVAL_SEC)
+        revoked = True
+        if channel_task is not None:
+            channel_task.cancel()
+
+    try:
+        await _serve_agent_channel(
+            websocket,
+            settings,
+            session_factory,
+            credential_revoked=credential_revoked,
+            watch_credential=watch_credential,
+        )
+    except asyncio.CancelledError:
+        if not revoked or channel_task is None:
+            raise
+        channel_task.uncancel()
+    if revoked or credential_revoked():
+        logger.warning("agent_channel.credential_revoked")
+        try:
+            await websocket.close(code=1008)
+        except (RuntimeError, OSError):
+            pass
+
+
+async def _serve_agent_channel(
+    websocket: WebSocket,
+    settings: Settings,
+    session_factory: SessionFactory,
+    *,
+    credential_revoked: Callable[[], bool],
+    watch_credential: Callable[[], Awaitable[None]],
 ) -> None:
     await websocket.accept()
     send_lock = asyncio.Lock()
@@ -455,11 +511,21 @@ async def run_agent_channel(
         }
     )
 
+    watcher = asyncio.create_task(watch_credential())
     try:
         while True:
             try:
                 raw_frame = await websocket.receive_text()
             except WebSocketDisconnect:
+                break
+            if credential_revoked():
+                await send_json(
+                    {
+                        "type": "error",
+                        "code": "credential_revoked",
+                        "message": "the access key changed; reconnect with the new key",
+                    }
+                )
                 break
             if len(raw_frame.encode("utf-8", errors="replace")) > MAX_FRAME_BYTES:
                 await send_json(
@@ -659,8 +725,6 @@ async def run_agent_channel(
                     payload["id"] = str(frame.get("id"))
                 await send_json(payload)
             except (OSError, SQLAlchemyError):
-                # Keep storage failures structured without echoing SQL parameters
-                # or command text. A persisted request key resolves lost replies.
                 await send_json(
                     {
                         "id": frame.get("id") if frame else None,
@@ -670,6 +734,7 @@ async def run_agent_channel(
                     }
                 )
     finally:
+        watcher.cancel()
         for task in exec_tasks.values():
             task.cancel()
         if exec_tasks:
@@ -710,8 +775,6 @@ async def _run_operation_frame(
         raise AgentChannelFrameError(
             "invalid_operation", "operation_id must be a positive integer"
         )
-    # Validate output eligibility afresh, and check operation scope before any
-    # read or cancellation. A socket's previous exec is not authorization state.
     backend = await _resolve_backend(session_factory, frame)
     async with session_factory() as session:
         job = await session.get(CommandJob, operation_id)
@@ -880,9 +943,6 @@ async def _run_exec_frame(
                 )
                 return
             await _finish_exec_process(process, stream_tasks)
-            # A returned 124 may mean GNU timeout reached the guest deadline or
-            # that the application itself exited 124. Podman completed either
-            # way; only the host wait timeout above proves an uncertain exec.
             _log_exec_finished(
                 backend,
                 frame_id,
@@ -1152,7 +1212,6 @@ async def _wait_for_fd(
 
     register = loop.add_writer if writable else loop.add_reader
     remove = loop.remove_writer if writable else loop.remove_reader
-    # Cancellation removes the readiness callback; no blocked OS read survives the task.
     register(fd, mark_ready)
     try:
         if timeout is None:

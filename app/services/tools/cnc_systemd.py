@@ -1,10 +1,3 @@
-"""cnc_systemd: CNC's own service, timer and slice units.
-
-Deliberately narrow. Podman quadlets are systemd units too, and netdata is a
-systemd service, but those belong to their own tools. This one owns exactly the
-units CNC ships in ``packaging/`` and nothing else, which is what the old name
-``host_base`` failed to say.
-"""
 
 from __future__ import annotations
 
@@ -20,15 +13,12 @@ from app.services.runtime_assets import (
 from app.services.tools.core import Plan, managed
 
 tool_name = "cnc_systemd"
-#: Phase strings this tool owns. Published to clients in apply details and
-#: matched by the progress card, so they keep their existing spelling.
 phases = ("runtime_assets",)
 
 PREFIX = "cnc-"
 
 
 def wanted(packaging_dir: Path | None = None) -> dict[str, str]:
-    """The unit files as shipped. Named by destination, not source path."""
     root = packaging_dir or PACKAGING_DIR
     units: dict[str, str] = {}
     for source_name, destination in MANAGED_SYSTEMD_ASSETS:
@@ -50,12 +40,6 @@ def cnc_systemd(plan: Plan) -> bool:
 
 
 def _enable_timers(plan: Plan, *, force: bool = False) -> bool:
-    """Make sure every managed timer is enabled and running.
-
-    Checked even when no unit file changed, because a timer can be stopped
-    without its file changing and no amount of comparing bytes would notice.
-    Asking systemd is the equivalent of reading the file for a timer.
-    """
     changed = False
     for timer in MANAGED_TIMER_UNITS:
         if not force and _is_active(plan, timer):

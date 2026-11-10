@@ -18,6 +18,7 @@ from app.routes.apply_errors import raise_apply_failure
 from app.schemas.inputs import InputIn, InputOut, InputStateIn, InputUpdate
 from app.services import input_commands
 from app.services.config_change import converge_change, route_change
+from app.services.operations import host_mutation_operation
 from app.services.status_service import invalidate_status_cache
 from app.services.validators import ValidationError
 
@@ -58,14 +59,18 @@ async def create_input(
         enabled=payload.enabled,
     )
     try:
-        item = await input_commands.create_input(session, payload, commit=False)
-        result = await converge_change(
-            session,
-            settings,
-            change=route_change(
-                "api.input.create", {str(b.name) for b in item.backends}
-            ),
-        )
+        async with host_mutation_operation(
+            settings, kind="api.input.create", actor="api", phase="configure"
+        ) as operation:
+            item = await input_commands.create_input(session, payload, commit=False)
+            result = await converge_change(
+                session,
+                settings,
+                change=route_change(
+                    "api.input.create", {str(b.name) for b in item.backends}
+                ),
+                operation_handle=operation,
+            )
         if not result.applied:
             raise_apply_failure(result.apply_response.details)
         item = await input_commands.require_input(session, item.id)
@@ -115,17 +120,21 @@ async def update_input(
     try:
         before = await input_commands.require_input(session, input_id)
         was_attached = {str(b.name) for b in before.backends}
-        item = await input_commands.update_input(
-            session, input_id, payload, commit=False
-        )
-        result = await converge_change(
-            session,
-            settings,
-            change=route_change(
-                "api.input.update",
-                was_attached | {str(b.name) for b in item.backends},
-            ),
-        )
+        async with host_mutation_operation(
+            settings, kind="api.input.update", actor="api", phase="configure"
+        ) as operation:
+            item = await input_commands.update_input(
+                session, input_id, payload, commit=False
+            )
+            result = await converge_change(
+                session,
+                settings,
+                change=route_change(
+                    "api.input.update",
+                    was_attached | {str(b.name) for b in item.backends},
+                ),
+                operation_handle=operation,
+            )
         if not result.applied:
             raise_apply_failure(result.apply_response.details)
         item = await input_commands.require_input(session, item.id)
@@ -174,19 +183,23 @@ async def toggle_input(
                 enabled=item.enabled,
             )
             return item
-        item = await input_commands.update_input(
-            session,
-            input_id,
-            InputUpdate(enabled=payload.enabled),
-            commit=False,
-        )
-        result = await converge_change(
-            session,
-            settings,
-            change=route_change(
-                "api.input.toggle", {str(b.name) for b in item.backends}
-            ),
-        )
+        async with host_mutation_operation(
+            settings, kind="api.input.toggle", actor="api", phase="configure"
+        ) as operation:
+            item = await input_commands.update_input(
+                session,
+                input_id,
+                InputUpdate(enabled=payload.enabled),
+                commit=False,
+            )
+            result = await converge_change(
+                session,
+                settings,
+                change=route_change(
+                    "api.input.toggle", {str(b.name) for b in item.backends}
+                ),
+                operation_handle=operation,
+            )
         if not result.applied:
             raise_apply_failure(result.apply_response.details)
         item = await input_commands.require_input(session, item.id)

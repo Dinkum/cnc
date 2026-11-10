@@ -86,8 +86,6 @@ async def verify_access_key_async(
         return False, retry_after
 
     async with _ACCESS_VERIFY_SEMAPHORE:
-        # A queued login rechecks after entering the bounded verifier so a
-        # burst from one peer cannot schedule repeated Argon2 work up front.
         retry_after = access_attempt_backoff_seconds(attempt_key)
         if retry_after > 0:
             return False, retry_after
@@ -98,8 +96,6 @@ async def verify_access_key_async(
         try:
             valid = await asyncio.shield(verify_task)
         except asyncio.CancelledError:
-            # Argon2 continues in its worker after caller cancellation. Keep the
-            # semaphore held until it finishes so the concurrency bound is real.
             while not verify_task.done():
                 try:
                     await asyncio.shield(verify_task)

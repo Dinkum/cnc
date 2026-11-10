@@ -65,7 +65,6 @@ def upgrade() -> None:
                     hashlib.sha256(blob).digest()
                 ).decode().rstrip("=")
             except (ValueError, IndexError):
-                # Preserve access even if a legacy value cannot be fingerprinted.
                 fingerprint = "Unavailable"
             connection.execute(
                 table.insert().values(
@@ -83,6 +82,5 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    # Private keys cannot be reconstructed. Public authorized keys remain on backends.
     op.drop_index("ix_backend_ssh_keys_backend_id", table_name="backend_ssh_keys")
     op.drop_table("backend_ssh_keys")

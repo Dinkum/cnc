@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import time
+from types import SimpleNamespace
 from pathlib import Path
 from inspect import signature
 from typing import Any
@@ -41,6 +42,7 @@ from app.services.resource_profile import (
 from app.services.renderers import container_name
 from app.services.shield_runtime import SHIELD_CONTAINER_NAME, SHIELD_CONTAINER_SERVICE
 from app.services.tailscale_urls import infer_tailnet_dns_name, tailscale_service_url
+from app.services.thread_workers import BoundedThreadWorker
 from app.services.time_utils import utc_isoformat
 from app.services.update_service import (
     current_app_version,
@@ -59,6 +61,9 @@ STATUS_KEYS = [
 ]
 
 logger = get_logger("status_service")
+# Shared by every status collection, and a slot is held until its thread
+# finishes: a cancelled refresh must not let the next one start more.
+_diagnostic_workers = BoundedThreadWorker(4)
 _status_cache_lock: asyncio.Lock | None = None
 _status_cache_lock_loop: asyncio.AbstractEventLoop | None = None
 _status_cache_payload: dict[str, Any] | None = None
@@ -76,6 +81,7 @@ _network_isolation_cache_payload: dict[str, Any] | None = None
 _network_isolation_cache_signature: tuple[tuple[str, int], ...] | None = None
 _network_isolation_cache_expires_at: float = 0.0
 _network_isolation_event_signature: str | None = None
+_network_isolation_refresh_task: asyncio.Task[None] | None = None
 NETWORK_ISOLATION_STATUS_CACHE_TTL_SEC = 300
 _SINGLE_OUTPUT_INPUT_KINDS = {"shield", "tailnet_path", "tailnet_service"}
 
@@ -352,7 +358,7 @@ async def _show_app_container(
     *,
     diagnostics_snapshot: AppDiagnosticsSnapshot | None = None,
 ) -> dict[str, Any]:
-    diagnostics = await asyncio.to_thread(
+    diagnostics = await _diagnostic_workers.run(
         _collect_app_backend_diagnostics, backend, settings, diagnostics_snapshot
     )
     bootstrap = diagnostics.get("bootstrap") or {}
@@ -1196,7 +1202,7 @@ async def _collect_status_uncached(
     diagnostics_snapshot_error = ""
     if enabled_app_backends:
         try:
-            diagnostics_snapshot = await asyncio.to_thread(
+            diagnostics_snapshot = await _diagnostic_workers.run(
                 collect_app_diagnostics_snapshot, settings
             )
         except Exception as exc:
@@ -1206,54 +1212,52 @@ async def _collect_status_uncached(
                 error=str(exc),
                 error_type=type(exc).__name__,
             )
-    diagnostics_semaphore = asyncio.Semaphore(4)
 
-    async def _show_bounded_app_container(backend: Backend) -> dict[str, Any]:
-        async with diagnostics_semaphore:
-            try:
-                return await _show_app_container(
-                    backend,
-                    resource_profile,
-                    settings,
-                    diagnostics_snapshot=diagnostics_snapshot,
-                )
-            except Exception as exc:
-                logger.exception(
-                    "status.backend.failed",
-                    backend=backend.name,
-                    error=str(exc),
-                    error_type=type(exc).__name__,
-                )
-                return {
-                    "backend": backend.name,
-                    "service": container_name(backend.name),
-                    "ok": False,
-                    "data": {
-                        "RuntimeDiagnosis": "diagnostics_failed",
-                        "RuntimeIssues": "diagnostics_failed",
-                    },
-                    "metrics": {
-                        "cpu_percent": None,
-                        "memory_percent": None,
-                        "cpu_percent_of_host": None,
-                        "cpu_entitlement_percent_of_host": None,
-                        "cpu_limit_percent_of_host": None,
-                        "memory_current_bytes": None,
-                        "memory_max_bytes": None,
-                        "network_rx_bytes": None,
-                        "network_tx_bytes": None,
-                        "network_rx_bps": None,
-                        "network_tx_bps": None,
-                        "network_total_bps": None,
-                    },
-                    "metric_service": container_name(backend.name),
-                    "action_hints": [],
-                    "error": str(exc),
-                    "error_type": type(exc).__name__,
-                }
+    async def _show_app_container_or_failure(backend: Backend) -> dict[str, Any]:
+        try:
+            return await _show_app_container(
+                backend,
+                resource_profile,
+                settings,
+                diagnostics_snapshot=diagnostics_snapshot,
+            )
+        except Exception as exc:
+            logger.exception(
+                "status.backend.failed",
+                backend=backend.name,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+            return {
+                "backend": backend.name,
+                "service": container_name(backend.name),
+                "ok": False,
+                "data": {
+                    "RuntimeDiagnosis": "diagnostics_failed",
+                    "RuntimeIssues": "diagnostics_failed",
+                },
+                "metrics": {
+                    "cpu_percent": None,
+                    "memory_percent": None,
+                    "cpu_percent_of_host": None,
+                    "cpu_entitlement_percent_of_host": None,
+                    "cpu_limit_percent_of_host": None,
+                    "memory_current_bytes": None,
+                    "memory_max_bytes": None,
+                    "network_rx_bytes": None,
+                    "network_tx_bytes": None,
+                    "network_rx_bps": None,
+                    "network_tx_bps": None,
+                    "network_total_bps": None,
+                },
+                "metric_service": container_name(backend.name),
+                "action_hints": [],
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+            }
 
     app_statuses = await asyncio.gather(
-        *[_show_bounded_app_container(backend) for backend in enabled_app_backends]
+        *[_show_app_container_or_failure(backend) for backend in enabled_app_backends]
     )
     service_statuses = list(app_statuses)
     if settings.shield_enabled or any(backend.kind == "shield" for backend in backends):
@@ -1694,29 +1698,83 @@ async def _network_isolation_status(
     *,
     force_refresh: bool = False,
 ) -> dict[str, Any]:
-    global \
-        _network_isolation_cache_expires_at, \
-        _network_isolation_cache_signature, \
-        _network_isolation_cache_payload
+    global _network_isolation_refresh_task
     if len(backends) <= 1:
         return _network_isolation_empty_status(backends)
     cache_key = _network_isolation_cache_key(backends)
     now = time.monotonic()
-    if (
-        not force_refresh
-        and _network_isolation_cache_payload is not None
+    cached_for_topology = (
+        _network_isolation_cache_payload is not None
         and _network_isolation_cache_signature == cache_key
-        and now < _network_isolation_cache_expires_at
-    ):
+    )
+    if cached_for_topology and not force_refresh:
         payload = dict(_network_isolation_cache_payload)
-        payload["cache"] = "hit"
-        payload["cache_ttl_seconds"] = max(
-            0, round(_network_isolation_cache_expires_at - now, 1)
-        )
+        if now < _network_isolation_cache_expires_at:
+            payload["cache"] = "hit"
+            payload["cache_ttl_seconds"] = max(
+                0, round(_network_isolation_cache_expires_at - now, 1)
+            )
+            return payload
+        # The canary costs a guest exec per app pair. For an unchanged set of
+        # apps, serve the last result and re-probe in the background rather
+        # than holding every status request behind it.
+        if _network_isolation_refresh_task is None or (
+            _network_isolation_refresh_task.done()
+        ):
+            snapshot = _network_isolation_backend_snapshot(backends)
+            _network_isolation_refresh_task = asyncio.create_task(
+                _refresh_network_isolation_in_background(snapshot, settings)
+            )
+        payload["cache"] = "stale"
+        payload["cache_ttl_seconds"] = 0
         return payload
+    # A new or changed set of apps has never been probed; report it only once
+    # it has been.
+    return await _refresh_network_isolation(
+        backends, settings, cache_key=cache_key, force_refresh=force_refresh
+    )
 
+
+def _network_isolation_backend_snapshot(backends: list[Backend]) -> list[Any]:
+    return [
+        SimpleNamespace(
+            name=str(backend.name),
+            kind=str(backend.kind),
+            enabled=bool(backend.enabled),
+            handoff_port=int(backend.handoff_port or 0),
+        )
+        for backend in backends
+    ]
+
+
+async def _refresh_network_isolation_in_background(
+    backends: list[Any], settings: Settings
+) -> None:
+    global _network_isolation_refresh_task
     try:
-        payload = await asyncio.to_thread(
+        await _refresh_network_isolation(
+            backends,
+            settings,
+            cache_key=_network_isolation_cache_key(backends),
+            force_refresh=False,
+        )
+    finally:
+        _network_isolation_refresh_task = None
+
+
+async def _refresh_network_isolation(
+    backends: list[Any],
+    settings: Settings,
+    *,
+    cache_key: tuple[tuple[str, int], ...],
+    force_refresh: bool,
+) -> dict[str, Any]:
+    global \
+        _network_isolation_cache_expires_at, \
+        _network_isolation_cache_signature, \
+        _network_isolation_cache_payload
+    try:
+        payload = await _diagnostic_workers.run(
             collect_app_network_isolation_canary, backends, settings
         )
     except Exception as exc:

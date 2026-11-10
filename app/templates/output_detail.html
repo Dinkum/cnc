@@ -325,15 +325,7 @@
                       </span>
                       <span class="placement-interface-path">
                         <span class="placement-interface-endpoint" data-placement-interface-path-left>{{ interface.left }}</span>
-                        <select
-                          name="inter_app_interface_directions"
-                          data-placement-interface-direction
-                          aria-label="{{ interface.name }} direction"
-                        >
-                          <option value="out" {% if interface.direction == "out" %}selected{% endif %}>OUTBOUND -&gt;</option>
-                          <option value="in" {% if interface.direction == "in" %}selected{% endif %}>INBOUND -&gt;</option>
-                          <option value="bidirectional" {% if interface.direction == "bidirectional" %}selected{% endif %}>BIDIRECTIONAL &lt;-&gt;</option>
-                        </select>
+                        <span class="placement-interface-arrow" aria-hidden="true">-&gt;</span>
                         <select
                           class="placement-interface-target-select"
                           name="inter_app_interface_targets"
@@ -368,14 +360,7 @@
                       </span>
                       <span class="placement-interface-path">
                         <span class="placement-interface-endpoint" data-placement-interface-inbound-path-left>{{ interface.left }}</span>
-                        <select
-                          data-placement-interface-inbound-direction
-                          aria-label="{{ interface.name }} direction"
-                        >
-                          <option value="out" {% if interface.direction == "out" %}selected{% endif %}>INBOUND -&gt;</option>
-                          <option value="in" {% if interface.direction == "in" %}selected{% endif %}>OUTBOUND -&gt;</option>
-                          <option value="bidirectional" {% if interface.direction == "bidirectional" %}selected{% endif %}>BIDIRECTIONAL &lt;-&gt;</option>
-                        </select>
+                        <span class="placement-interface-arrow" aria-hidden="true">-&gt;</span>
                         <span class="placement-interface-endpoint placement-interface-endpoint-right" data-placement-interface-inbound-path-right>{{ interface.right }}</span>
                       </span>
                       <span class="placement-interface-actions" data-placement-interface-inbound-actions>
@@ -556,8 +541,6 @@
             <button type="submit" data-backup-submit>Create backup</button>
           </form>
         </div>
-        {# The bar lives in the card stack; the log stays here because it is a
-           record of what happened, next to the history it refreshes. #}
         <section class="backup-progress-shell" id="backup-progress-shell" hidden>
           <div class="progress-log" data-progress-log></div>
         </section>
@@ -581,10 +564,10 @@
                     <td class="mono">{{ item.bundle }}</td>
                     <td>
                       <div class="backup-action-buttons">
-                        <form method="post" action="/ui/backends/{{ selected_backend.id }}/restore" data-restore-form>
+                        <form method="post" action="/ui/backends/{{ selected_backend.id }}/restore" data-restore-form data-backup-label="#{{ item.id }}" data-backup-created="{{ item.created_at_raw or item.created_at }}">
                           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                           <input type="hidden" name="backup_id" value="{{ item.id }}">
-                          <button type="submit" class="ghost" {% if not item.restorable %}disabled{% endif %}>Restore</button>
+                          <button type="button" class="ghost" data-restore-backup-trigger {% if not item.restorable %}disabled{% endif %}>Restore</button>
                         </form>
                         <form method="post" action="/ui/backends/{{ selected_backend.id }}/backups/{{ item.id }}/delete" data-delete-backup-form data-backup-id="{{ item.id }}" data-backup-label="#{{ item.id }}" data-backup-file="{{ item.bundle }}">
                           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -752,6 +735,19 @@
         </div>
       </form>
     </dialog>
+    <dialog class="confirm-modal" id="restore-backup-modal" aria-labelledby="restore-backup-title">
+      <form method="dialog" class="confirm-modal-card">
+        <div class="confirm-modal-copy">
+          <h2 id="restore-backup-title">Restore backup?</h2>
+          <p data-restore-backup-copy></p>
+          <p>Current files and configuration will be replaced. Changes since this backup will be lost.</p>
+        </div>
+        <div class="editor-actions">
+          <button type="button" class="ghost" data-restore-backup-cancel>Cancel</button>
+          <button type="button" class="danger" data-restore-backup-accept>Restore backup</button>
+        </div>
+      </form>
+    </dialog>
     <dialog class="confirm-modal" id="delete-backup-modal">
       <form method="dialog" class="confirm-modal-card">
         <div class="confirm-modal-copy">
@@ -846,7 +842,7 @@
         <section class="clone-modal-state" data-progress-state="confirm">
           <div class="confirm-modal-copy clone-modal-copy">
             <h2>Transfer output</h2>
-            <p>CNC will snapshot this output, restore it on the selected node, verify health, switch placement, render routes, then stop the source.</p>
+            <p>CNC will snapshot this output, restore it on the selected node, verify health, switch placement, render routes, then stop the source. You choose whether the source keeps running during the copy.</p>
           </div>
         </section>
         <section class="clone-modal-state" data-progress-state="target" hidden>
@@ -906,6 +902,22 @@
               {% endfor %}
               </div>
             </div>
+          </div>
+          <div class="replica-setup-options" role="radiogroup" aria-label="Source during transfer">
+            <label class="replica-setup-option">
+              <input type="radio" name="transfer_mode" value="pause" checked>
+              <span>
+                <strong>Pause during transfer</strong>
+                <small>No writes are lost. {{ selected_backend.name }} is unavailable until the transfer finishes.</small>
+              </span>
+            </label>
+            <label class="replica-setup-option">
+              <input type="radio" name="transfer_mode" value="live">
+              <span>
+                <strong>Keep running</strong>
+                <small>No downtime, but writes made after the snapshot are lost.</small>
+              </span>
+            </label>
           </div>
         </section>
         <section class="clone-modal-state" data-progress-state="progress" hidden>

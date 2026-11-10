@@ -930,7 +930,6 @@ def _redact_log_line(line: str) -> str:
             f"{match.group(1)}{match.group(2)}{match.group(3)}[redacted]{closing_quote}"
         )
 
-    # Consume the complete header value before generic key/value redaction.
     line = re.sub(
         r"(?i)(authorization[\"']?\s*[:=]\s*[\"']?)(?:bearer|basic)\s+[^\s,\"'}]+",
         r"\1[redacted]",
