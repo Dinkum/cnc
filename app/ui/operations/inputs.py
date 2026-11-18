@@ -14,8 +14,7 @@ from app.services.operation_runtime import delete_input_progress_plan
 from app.services.operations import OperationHandle
 from app.services.shield_service import make_code_hash
 from app.services.validators import ValidationError
-from app.services.config_change import route_change
-from app.services.config_change import converge_change
+from app.services.config_change import ConfigChange, converge_change, input_edit
 from app.ui.operations.action import Action
 from app.ui.operations.save import (
     ErrorRule,
@@ -130,7 +129,6 @@ async def _run_create_input_operation(
         )
         item = await input_commands.create_input(session, payload, commit=False)
         attached = [backend.id for backend in item.backends]
-        attached_names = {str(backend.name) for backend in item.backends}
         report = _input_reporter(action, getattr(item, "id", None), item.hostname, None)
         await report.step(
             operation,
@@ -147,7 +145,7 @@ async def _run_create_input_operation(
             input_value=item.hostname,
             plan=None,
             backend_ids=attached,
-            output_names=attached_names,
+            change=input_edit(action.kind, item),
         )
 
     await run_save(
@@ -242,14 +240,10 @@ async def _run_update_input_operation(
             phase="Save desired state",
             substate="Staging input config",
         )
-        was_attached = {str(backend.name) for backend in item.backends}
         updated = await input_commands.update_input(
             session, input_id, payload, commit=False
         )
         attached = [backend.id for backend in updated.backends]
-        attached_names = was_attached | {
-            str(backend.name) for backend in updated.backends
-        }
         await report.step(
             operation,
             "Checking uniqueness.",
@@ -265,7 +259,7 @@ async def _run_update_input_operation(
             input_value=updated.hostname,
             plan=None,
             backend_ids=attached,
-            output_names=attached_names,
+            change=input_edit(action.kind, item),
         )
 
     await run_save(
@@ -321,7 +315,7 @@ async def _converge_input(
     input_value: str,
     plan: dict[str, object] | None,
     backend_ids: list[int] | None = None,
-    output_names: set[str] | None = None,
+    change: ConfigChange,
 ) -> SaveResult:
     services = apply_services_with(
         _input_apply_progress_reporter(
@@ -347,7 +341,7 @@ async def _converge_input(
         services=services,
         apply_runner=run_apply,
         committer=converge_change,
-        scope=route_change(action.kind, output_names or set()).scope(),
+        scope=change.scope(),
     )
     return SaveResult(
         apply_response=response,
@@ -414,7 +408,6 @@ async def _run_delete_input_operation(
             phase="Save desired state",
             substate="Removing input config",
         )
-        detached_names = {str(backend.name) for backend in item.backends}
         await input_commands.delete_input(session, input_id)
         return await _converge_input(
             session,
@@ -424,7 +417,7 @@ async def _run_delete_input_operation(
             input_id=input_id,
             input_value=item.hostname,
             plan=plan,
-            output_names=detached_names,
+            change=input_edit(action.kind, item),
         )
 
     await run_save(

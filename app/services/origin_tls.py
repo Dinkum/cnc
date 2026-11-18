@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import argparse
@@ -111,7 +110,40 @@ def prepare_certificate(files: dict[str, str], path: Path) -> str | None:
     if not any(f'ssl_certificate "{path}";' in content for content in files.values()):
         return None
     with certificate_lock(path):
-        return certificate_fingerprint(path) if _ensure_certificate_locked(path) else None
+        return (
+            certificate_fingerprint(path) if _ensure_certificate_locked(path) else None
+        )
+
+
+def _activate_proxy_certificate(path: Path) -> None:
+    control_dir = path.parent.parent
+    container = (control_dir / "nginx-container-active").is_file()
+    if container:
+        from app.services.nginx_runtime import (
+            reload_command,
+            tls_directory,
+            validate_command,
+        )
+
+        projected = tls_directory(control_dir) / path.name
+        if not projected.is_file() or projected.is_symlink():
+            raise OSError(
+                f"NGINX certificate is missing from its read-only mount: {path.name}"
+            )
+        previous = projected.read_bytes()
+        _write_atomic(projected, path.read_bytes())
+        try:
+            _run_proxy_reload(validate_command(True), reload_command(True))
+        except (subprocess.SubprocessError, OSError):
+            _write_atomic(projected, previous)
+            raise
+    else:
+        _run_proxy_reload(["nginx", "-t"], ["systemctl", "reload", "nginx"])
+
+
+def _run_proxy_reload(validate: list[str], reload: list[str]) -> None:
+    for command in (validate, reload):
+        subprocess.run(command, check=True, capture_output=True, timeout=30)
 
 
 def renew_active_certificate(nginx_dir: Path, path: Path) -> bool:
@@ -123,13 +155,7 @@ def renew_active_certificate(nginx_dir: Path, path: Path) -> bool:
         if not _ensure_certificate_locked(path):
             return False
         try:
-            subprocess.run(["nginx", "-t"], check=True, capture_output=True, timeout=30)
-            subprocess.run(
-                ["systemctl", "reload", "nginx"],
-                check=True,
-                capture_output=True,
-                timeout=30,
-            )
+            _activate_proxy_certificate(path)
         except (subprocess.SubprocessError, OSError):
             if previous is not None:
                 _write_atomic(path, previous)
@@ -213,13 +239,7 @@ def reload_origin_certificate(
     path = origin_certificate_path(hostname, control_dir)
     with certificate_lock(path):
         fingerprint = certificate_fingerprint(path)
-        subprocess.run(["nginx", "-t"], check=True, capture_output=True, timeout=30)
-        subprocess.run(
-            ["systemctl", "reload", "nginx"],
-            check=True,
-            capture_output=True,
-            timeout=30,
-        )
+        _activate_proxy_certificate(path)
         certificate_activated(path, fingerprint)
 
 
@@ -240,7 +260,6 @@ def main() -> None:
     parser.add_argument(
         "--nginx-dir",
         type=Path,
-        default=Path(os.environ.get("NGINX_GENERATED_DIR", "/etc/nginx/generated")),
     )
     args = parser.parse_args()
     if args.origin_request:
@@ -261,12 +280,20 @@ def main() -> None:
     if args.origin_reload:
         reload_origin_certificate(args.origin_reload, args.control_dir)
         return
+    nginx_dir = args.nginx_dir
+    if nginx_dir is None:
+        if (args.control_dir / "nginx-container-active").exists():
+            from app.services.nginx_runtime import container_routes_directory
+
+            nginx_dir = container_routes_directory(args.control_dir)
+        else:
+            nginx_dir = Path(os.environ.get("NGINX_GENERATED_DIR", "/etc/nginx/generated"))
     path = certificate_path(args.control_dir)
     if args.prepare:
-        files = {p.name: p.read_text() for p in args.nginx_dir.glob("cnc-*.conf")}
+        files = {p.name: p.read_text() for p in nginx_dir.glob("cnc-*.conf")}
         changed = prepare_certificate(files, path)
     else:
-        changed = renew_active_certificate(args.nginx_dir, path)
+        changed = renew_active_certificate(nginx_dir, path)
     print(f"origin_https: {'certificate updated' if changed else 'unchanged'}")
 
 

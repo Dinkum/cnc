@@ -40,7 +40,7 @@ from app.services.inter_app_interfaces import (
     INTERFACE_STATUS_REJECTED,
     clean_interface_status,
 )
-from app.services.config_change import converge_change, output_change
+from app.services.config_change import changed_output_fields, converge_change, output_edit
 from app.services.operation_runtime import (
     create_output_progress_plan,
     delete_output_progress_plan,
@@ -48,7 +48,6 @@ from app.services.operation_runtime import (
 )
 from app.services.operations import (
     active_host_mutation_blocker,
-    create_operation,
 )
 from app.services.shield_service import make_code_hash
 from app.services.ssh_access import deferred_backend_ssh_reconcile
@@ -75,7 +74,6 @@ from app.ui.http import (
     ui_request_mode,
 )
 from app.ui.mutation_feedback import (
-    backend_update_changed_keys,
     host_mutation_blocked_message,
     host_mutation_preflight_message,
 )
@@ -202,11 +200,9 @@ async def create_backend_form(
                 backend_kind=payload.kind,
                 input_kinds=(),
             )
-            operation = await create_operation(
+            operation = await enqueue_mutation(
                 settings,
-                kind="create_backend",
-                actor="ui",
-                phase="queued",
+                "create_backend",
                 details={
                     "progress": progress_plan_value(
                         progress_plan,
@@ -220,11 +216,6 @@ async def create_backend_form(
                     "backend_name": payload.name,
                     "backend_kind": payload.kind,
                 },
-            )
-            await enqueue_mutation(
-                settings,
-                operation.id,
-                "create_backend",
                 payload=payload.model_copy(update={"shield_access_code": None}),
                 secret_kwargs={"shield_access_code": payload.shield_access_code},
             )
@@ -234,9 +225,7 @@ async def create_backend_form(
         mutation = await converge_change(
             session,
             settings,
-            change=output_change(
-                "ui.backend.create", str(backend.name or "")
-            ),
+            change=output_edit("ui.backend.create", backend, membership_change=True),
             apply_runner=run_apply,
         )
         apply_response = mutation.apply_response
@@ -388,11 +377,10 @@ async def update_backend_form(
     if blocked_response is not None:
         return blocked_response
     if request_prefers_json(request):
-        operation = await create_operation(
+        operation = await enqueue_mutation(
             settings,
+            "update_backend",
             kind="ui.backend.update",
-            actor="ui",
-            backend_id=backend.id,
             phase="Validate output",
             details=_output_save_progress_details(
                 0,
@@ -402,11 +390,6 @@ async def update_backend_form(
                 backend_id=backend.id,
                 backend_name=backend.name,
             ),
-        )
-        await enqueue_mutation(
-            settings,
-            operation.id,
-            "update_backend",
             backend_id=backend.id,
             form_values={
                 "name": name,
@@ -473,16 +456,14 @@ async def update_backend_form(
             shield_code_hash=shield_code_hash,
             shield_access_code=shield_access_code_display,
         )
-        changed_keys = backend_update_changed_keys(backend, payload)
         backend = await backend_commands.update_backend(
             session, backend_id, payload, commit=False
         )
+        changed_keys = changed_output_fields(backend)
         mutation = await converge_change(
             session,
             settings,
-            change=output_change(
-                "ui.backend.update", str(backend.name or "")
-            ),
+            change=output_edit("ui.backend.update", backend, requested_fields=payload.model_fields_set),
             apply_runner=run_apply,
         )
         apply_response = mutation.apply_response
@@ -558,11 +539,10 @@ async def update_backend_section_form(
     )
     if blocked is not None:
         return blocked
-    operation = await create_operation(
+    operation = await enqueue_mutation(
         settings,
+        "update_backend",
         kind="ui.backend.update",
-        actor="ui",
-        backend_id=backend_id,
         phase="Validate output",
         details=_output_save_progress_details(
             0,
@@ -573,11 +553,6 @@ async def update_backend_section_form(
             backend_name=backend.name,
             section=section,
         ),
-    )
-    await enqueue_mutation(
-        settings,
-        operation.id,
-        "update_backend",
         backend_id=backend_id,
         form_values={
             "section": section,
@@ -630,11 +605,10 @@ async def update_backend_inputs_form(
     if blocked_response is not None:
         return blocked_response
     if request_prefers_json(request):
-        operation = await create_operation(
+        operation = await enqueue_mutation(
             settings,
+            "update_backend_inputs",
             kind="ui.backend.inputs",
-            actor="ui",
-            backend_id=backend.id,
             phase="Validate output",
             details=_output_save_progress_details(
                 0,
@@ -644,11 +618,6 @@ async def update_backend_inputs_form(
                 backend_id=backend.id,
                 backend_name=backend.name,
             ),
-        )
-        await enqueue_mutation(
-            settings,
-            operation.id,
-            "update_backend_inputs",
             backend_id=backend.id,
             input_ids=[str(item) for item in form.getlist("input_ids")],
         )
@@ -668,9 +637,7 @@ async def update_backend_inputs_form(
         mutation = await converge_change(
             session,
             settings,
-            change=output_change(
-                "ui.backend.inputs", str(backend.name or "")
-            ),
+            change=output_edit("ui.backend.inputs", backend, requested_fields={"inputs"}),
             apply_runner=run_apply,
         )
         logger.info(
@@ -767,11 +734,10 @@ async def update_backend_inbound_interface_form(
         )
 
     try:
-        operation = await create_operation(
+        operation = await enqueue_mutation(
             settings,
+            "update_backend_interface",
             kind="ui.backend.interface",
-            actor="ui",
-            backend_id=backend.id,
             phase="Validate output",
             details=_output_save_progress_details(
                 0,
@@ -784,11 +750,6 @@ async def update_backend_inbound_interface_form(
                 interface_name=interface_name,
                 status=next_status,
             ),
-        )
-        await enqueue_mutation(
-            settings,
-            operation.id,
-            "update_backend_interface",
             backend_id=backend.id,
             source_backend_id=source_backend_id,
             interface_name=interface_name,
@@ -884,11 +845,10 @@ async def update_backend_state_form(
         request_mode=ui_request_mode(request),
     )
     if request_prefers_json(request):
-        operation = await create_operation(
+        operation = await enqueue_mutation(
             settings,
+            "update_backend_state",
             kind="ui.backend.state",
-            actor="ui",
-            backend_id=backend.id,
             phase="Validate output",
             details=_output_save_progress_details(
                 0,
@@ -899,11 +859,6 @@ async def update_backend_state_form(
                 backend_name=backend.name,
                 enabled=target_enabled,
             ),
-        )
-        await enqueue_mutation(
-            settings,
-            operation.id,
-            "update_backend_state",
             backend_id=backend.id,
             target_enabled=target_enabled,
         )
@@ -917,7 +872,7 @@ async def update_backend_state_form(
         mutation = await converge_change(
             session,
             settings,
-            change=output_change("ui.backend.state", backend_name),
+            change=output_edit("ui.backend.state", backend, requested_fields={"enabled"}),
             apply_runner=run_apply,
         )
         logger.info(
@@ -1025,12 +980,9 @@ async def delete_backend_form(
     )
     if request_prefers_json(request):
         progress_plan = delete_output_progress_plan(backend_kind=backend.kind)
-        operation = await create_operation(
+        operation = await enqueue_mutation(
             settings,
-            kind="delete_backend",
-            actor="ui",
-            backend_id=backend.id,
-            phase="queued",
+            "delete_backend",
             details=_planned_operation_progress_details(
                 progress_plan,
                 0,
@@ -1039,6 +991,7 @@ async def delete_backend_form(
                 substate="Opening delete operation",
                 redirect_url=dashboard_tab_url(request, "outputs", defer_status=True),
             ),
+            backend_id=backend.id,
         )
         logger.info(
             "ui.backend.delete.operation_created",
@@ -1046,12 +999,6 @@ async def delete_backend_form(
             backend_name=backend.name,
             operation_id=operation.id,
             request_mode="async",
-        )
-        await enqueue_mutation(
-            settings,
-            operation.id,
-            "delete_backend",
-            backend_id=backend.id,
         )
         response = _operation_response(operation, message="Delete started.")
         return response
@@ -1066,6 +1013,7 @@ async def delete_backend_form(
             session,
             settings,
             deleted_backend_name,
+            change=output_edit("ui.backend.delete", backend, membership_change=True),
             backend_id=backend_id,
             apply_services=services,
         )

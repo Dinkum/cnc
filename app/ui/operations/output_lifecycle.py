@@ -30,7 +30,7 @@ from app.services.ssh_access import (
     remove_backend_ssh_access,
 )
 from app.services.validators import ValidationError
-from app.services.config_change import converge_change, output_change
+from app.services.config_change import ConfigChange, converge_change, output_edit
 from app.ui.operations.action import Action
 from app.ui.operations.save import (
     ErrorRule,
@@ -196,7 +196,7 @@ async def _run_create_backend_operation(
                 converge_change(
                     session,
                     settings,
-                    change=output_change("ui.backend.create", backend_name),
+                    change=output_edit("ui.backend.create", backend, membership_change=True),
                     apply_runner=run_apply,
                     apply_services=_create_backend_apply_services(
                         operation,
@@ -381,6 +381,7 @@ async def converge_output_delete(
     backend_id: int,
     apply_services,
     operation_handle: OperationHandle | None = None,
+    change: ConfigChange,
     before_ssh_cleanup: Callable[[ApplyResponse], Awaitable[None]] | None = None,
 ) -> OutputDeleteOutcome:
     """Converge a pending output deletion, then remove what it left by name.
@@ -394,7 +395,7 @@ async def converge_output_delete(
         mutation = await converge_change(
             session,
             settings,
-            change=output_change("ui.backend.delete", backend_name),
+            change=change,
             apply_runner=run_apply,
             apply_services=apply_services,
             operation_handle=operation_handle,
@@ -523,6 +524,7 @@ async def _run_delete_operation(
             session,
             settings,
             deleted_backend_name,
+            change=output_edit("ui.backend.delete", backend, membership_change=True),
             backend_id=backend_id,
             apply_services=services,
             operation_handle=operation,

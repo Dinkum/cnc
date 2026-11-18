@@ -4,7 +4,8 @@ from __future__ import annotations
 import asyncio
 
 from app.config import Settings
-from app.services.observation import Absent
+from app.services import nginx_runtime
+from app.services.observation import known
 from app.services.app_containers import (
     inspect_container,
     read_saved_spec,
@@ -24,6 +25,8 @@ from app.services.app_quadlet import (
     render_quadlet_container,
 )
 from app.services.renderers import container_name
+from app.services.nginx_contract import nginx_gateway_enabled
+from app.services.change_scope import Scope
 from app.services.tools.core import Plan
 
 tool_name = "podman"
@@ -33,11 +36,26 @@ phases = ("app_runtime",)
 def backends_needing_work(
     desired: DesiredState,
     settings: Settings,
+    scope: Scope,
     *,
     inspect=None,
 ) -> set[str]:
     needs: set[str] = set()
     for backend in desired.known_app_backends:
+        if not scope.covers(backend.name):
+            if (
+                scope.rebalance_resources
+                and backend.enabled
+                and desired.resource_profile.mode == "auto"
+            ):
+                profile = desired.runtime_graph.app_backends[backend.name]
+                saved = read_saved_spec(settings, backend.name) or {}
+                if any(
+                    saved.get(key) != getattr(profile, key)
+                    for key in ("memory_high", "memory_max", "cpu_quota", "cpu_shares")
+                ):
+                    needs.add(backend.name)
+            continue
         wanted = runtime_spec(
             backend,
             settings,
@@ -69,18 +87,22 @@ def backends_needing_work(
     return needs
 
 
-def orphaned_runtimes(desired: DesiredState, settings: Settings) -> set[str]:
+def orphaned_runtimes(
+    desired: DesiredState, settings: Settings, scope: Scope
+) -> set[str]:
     wanted = {backend.name for backend in desired.known_app_backends}
-    root = settings.app_control_dir
-    if not root.is_dir():
-        return set()
-    return {
-        entry.name
-        for entry in root.iterdir()
-        if entry.is_dir()
-        and entry.name not in wanted
-        and spec_path(settings, entry.name).exists()
-    }
+    if scope.outputs is None:
+        try:
+            candidates = {
+                entry.name
+                for entry in settings.app_control_dir.iterdir()
+                if entry.is_dir()
+            }
+        except FileNotFoundError:
+            return set()
+    else:
+        candidates = scope.outputs
+    return {name for name in candidates - wanted if spec_path(settings, name).is_file()}
 
 
 def _quadlet_matches(backend, desired: DesiredState, settings: Settings) -> bool:
@@ -94,6 +116,7 @@ def _quadlet_matches(backend, desired: DesiredState, settings: Settings) -> bool
         backend,
         settings,
         base_profile=desired.resource_profile,
+        nginx_container=desired.nginx_container,
         inter_app_interfaces=tuple(
             item
             for item in desired.runtime_graph.inter_app_interfaces
@@ -108,27 +131,23 @@ def _container_definitely_absent(
     observation = (inspect or inspect_container)(
         container_name(name), timeout_sec=settings.command_timeout_status_sec
     )
-    return isinstance(observation, Absent)
+    return known(observation, f"container {name}") is None
 
 
 async def podman(plan: Plan) -> bool:
-    orphans = await asyncio.to_thread(orphaned_runtimes, plan.desired, plan.settings)
+    orphans = await asyncio.to_thread(orphaned_runtimes, plan.desired, plan.settings, plan.scope)
     if not plan.desired.known_app_backends and not orphans:
         return False
 
     await plan.report("Plan runtime", "Inspecting app container")
-    drifted = await asyncio.to_thread(
+    selected = await asyncio.to_thread(
         lambda: backends_needing_work(
             plan.desired,
             plan.settings,
+            plan.scope,
             inspect=getattr(plan.services.runtime_services, "inspect_container", None),
         )
     )
-    selected = plan.scope.limit(drifted)
-    out_of_scope = sorted(drifted - selected)
-    if out_of_scope:
-        plan.details["podman_drift_out_of_scope"] = out_of_scope
-
     candidates = plan.scope.limit(
         plan.desired.runtime_graph.enabled_app_backend_names - selected
     )
@@ -163,6 +182,10 @@ async def podman(plan: Plan) -> bool:
         )
     )
     plan.touching(tool_name)
+    if nginx_gateway_enabled(
+        plan.settings, container_mode=plan.desired.nginx_container
+    ) and any(backend.name in selected for backend in plan.desired.enabled_app_backends):
+        await nginx_runtime.ensure_nginx_network(plan)
 
     kwargs = {
         "services": plan.services.runtime_services,

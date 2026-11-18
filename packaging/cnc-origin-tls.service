@@ -1,6 +1,6 @@
 [Unit]
 Description=cnc origin HTTPS certificate renewal
-After=nginx.service
+After=nginx.service cnc-nginx.service
 
 [Service]
 Type=oneshot
@@ -8,7 +8,8 @@ User=root
 Group=root
 UMask=0077
 EnvironmentFile=-/etc/cnc.env
-ExecStart=/usr/bin/python3 /var/lib/cnc/current/app/services/origin_tls.py
+WorkingDirectory=/var/lib/cnc/current
+ExecStart=/var/lib/cnc/current/.venv/bin/python -m app.services.origin_tls
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true

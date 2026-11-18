@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 from app.config import Settings
 from app.logger import get_logger
+from app.services.change_scope import ToolScope
 from app.services import cloudflare_ingress
 from app.services.app_network_isolation import audit_app_network_isolation_guard
 from app.services.app_quadlet import (
@@ -15,6 +16,8 @@ from app.services.app_quadlet import (
     verify_app_quadlet_dir_writable,
 )
 from app.services.commands import run_command
+from app.services.nginx_contract import GATEWAY, container_ingress_marker
+from app.services.nginx_runtime import active_routes_directory
 from app.services.runtime_services import AppRuntimeServices
 from app.services.notification_state import NotificationStateTransaction
 from app.services.notifications import (
@@ -35,6 +38,7 @@ ADMIN_REFERENCE_PATTERNS = (
     re.compile(r"\b127\.0\.0\.1:9090\b"),
     re.compile(r"\blocalhost:9090\b"),
     re.compile(r"\[::1\]:9090\b"),
+    re.compile(rf"\b{re.escape(GATEWAY)}:9090\b"),
 )
 SSHD_BASELINE = {
     "passwordauthentication": "no",
@@ -51,6 +55,7 @@ SELF_AUDIT_CHECK_SEVERITY = {
     "nginx_admin_reference": "blocking",
     "tailscale_admin_exposure": "blocking",
     "firewall_restrictions": "warning",
+    "nginx_ingress_firewall": "blocking",
     "app_network_isolation": "warning",
     "sshd_global_policy": "warning",
 }
@@ -187,7 +192,7 @@ def _audit_admin_loopback_startup_config(settings: Settings) -> dict[str, object
 
 def _audit_nginx_admin_reference(settings: Settings) -> dict[str, object]:
     offending_files: list[str] = []
-    generated_dir = settings.nginx_generated_dir
+    generated_dir = active_routes_directory(settings)
     if not generated_dir.exists():
         return {"checked_files": 0, "offending_files": []}
 
@@ -220,6 +225,14 @@ def _audit_firewall_cloudflare_restrictions(settings: Settings) -> dict[str, obj
         policy,
         run_command_func=run_command,
         timeout_sec=settings.command_timeout_status_sec,
+    )
+
+
+def _audit_nginx_ingress_firewall(settings: Settings) -> dict[str, object]:
+    from app.services.nginx_firewall import audit_nginx_firewall
+
+    return audit_nginx_firewall(
+        settings, services=AppRuntimeServices(run_command=run_command),
     )
 
 
@@ -303,7 +316,7 @@ def _audit_app_network_isolation_guard(settings: Settings) -> dict[str, object]:
 
 
 def run_control_plane_self_audit(
-    settings: Settings, *, startup_mode: bool = False
+    settings: Settings, *, startup_mode: bool = False, tools: ToolScope = ToolScope.HOST
 ) -> dict[str, object]:
     findings: list[dict[str, object]] = []
     details: dict[str, object] = {}
@@ -311,19 +324,42 @@ def run_control_plane_self_audit(
     checks = (
         (
             "admin_loopback_bind",
+            ToolScope.NGINX | ToolScope.TAILSCALE | ToolScope.CLOUDFLARE_TUNNEL,
             _audit_admin_loopback_startup_config
             if startup_mode
             else _audit_admin_loopback_bind,
         ),
-        ("admin_runtime_write_paths", _audit_admin_runtime_write_paths),
-        ("nginx_admin_reference", _audit_nginx_admin_reference),
-        ("tailscale_admin_exposure", verify_tailscale_admin_exposure),
-        ("firewall_restrictions", _audit_firewall_cloudflare_restrictions),
-        ("app_network_isolation", _audit_app_network_isolation_guard),
-        ("sshd_global_policy", _audit_sshd_global_policy),
+        (
+            "admin_runtime_write_paths",
+            ToolScope.PODMAN,
+            _audit_admin_runtime_write_paths,
+        ),
+        ("nginx_admin_reference", ToolScope.NGINX, _audit_nginx_admin_reference),
+        (
+            "tailscale_admin_exposure",
+            ToolScope.TAILSCALE,
+            verify_tailscale_admin_exposure,
+        ),
+        (
+            "firewall_restrictions",
+            ToolScope.UFW | ToolScope.NGINX,
+            _audit_firewall_cloudflare_restrictions,
+        ),
+        ("app_network_isolation", ToolScope.PODMAN, _audit_app_network_isolation_guard),
+        ("sshd_global_policy", ToolScope.SSH, _audit_sshd_global_policy),
     )
+    if container_ingress_marker(settings).exists():
+        checks += (
+            (
+                "nginx_ingress_firewall",
+                ToolScope.UFW | ToolScope.NGINX,
+                _audit_nginx_ingress_firewall,
+            ),
+        )
 
-    for name, fn in checks:
+    for name, owners, fn in checks:
+        if not tools & owners:
+            continue
         try:
             details[name] = fn(settings)
         except TailscaleAdminExposureError as exc:
@@ -405,6 +441,7 @@ def _startup_self_audit_failure_title(exc: ControlPlaneSelfAuditError) -> str:
         "nginx_admin_reference": "admin proxy",
         "tailscale_admin_exposure": "admin exposure",
         "firewall_restrictions": "firewall",
+        "nginx_ingress_firewall": "ingress firewall",
         "app_network_isolation": "output isolation",
         "sshd_global_policy": "SSH policy",
     }
@@ -448,6 +485,7 @@ def _startup_self_audit_recovered_title(previous_signature: str) -> str:
         "nginx_admin_reference": "admin proxy",
         "tailscale_admin_exposure": "admin exposure",
         "firewall_restrictions": "firewall",
+        "nginx_ingress_firewall": "ingress firewall",
         "app_network_isolation": "output isolation",
         "sshd_global_policy": "SSH policy",
     }

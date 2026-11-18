@@ -14,11 +14,12 @@ from typing import Callable
 from uuid import uuid4
 
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import Settings
-from app.services.config_change import output_change
+from app.services.config_change import ConfigChange
 from app.logger import get_logger
 from app.models.entities import Backend, ClusterNode
 from app.services.app_quadlet import (
@@ -31,13 +32,14 @@ from app.services.app_quadlet import (
     write_app_quadlet_assets,
 )
 from app.services.apply_service import run_apply
-from app.services.commands import run_command
+from app.services.commands import CommandResult, run_command
 from app.services.guest_isolation import (
     archive_guest,
     extract_guest,
     guest_helper_bytes,
     validate_guest_hardening,
 )
+from app.services.host_journal import CommitOutcome, commit_with_marker
 from app.services.hardening_policy import read_hardening_policy
 from app.services.renderers import container_name, network_name
 from app.services.resource_profile import build_resource_profile
@@ -47,9 +49,11 @@ from app.services.replica_readiness import (
     record_replica_readiness,
     replica_target_url,
 )
+from app.services.operation_runtime import operation_progress_value
 from app.services.operations import OperationHandle, host_mutation_operation
 from app.services.placement_config import (
     apply_backend_placement,
+    backend_has_local_runtime,
     read_backend_placement,
 )
 from app.services.sandbox_profiles import app_sandbox_dir, get_app_sandbox_profile
@@ -94,6 +98,17 @@ class TargetRollbackState:
     service_was_active: bool = False
 
 
+class TransferCommitUnknown(RuntimeError):
+    def __init__(self, message: str, run_id: int | None) -> None:
+        super().__init__(message)
+        self.details = {
+            "apply_run_id": run_id,
+            "commit_outcome": "unknown",
+            "manual_review_required": True,
+            "operator_action": message,
+        }
+
+
 REPLICA_SETUP_MODE_CLONE = "clone"
 REPLICA_SETUP_MODE_FRESH = "fresh"
 REPLICA_SETUP_MODES = {REPLICA_SETUP_MODE_CLONE, REPLICA_SETUP_MODE_FRESH}
@@ -107,8 +122,7 @@ async def transfer_backend(
     target_node_uid: str,
     pause_source: bool,
     progress_callback: TransferProgressCallback | None = None,
-    acquire_lock: bool = True,
-    _lifecycle: HostMutationLifecycle | None = None,
+    operation_handle: OperationHandle | None = None,
 ) -> TransferResult:
     """Move an app output to another node.
 
@@ -117,29 +131,72 @@ async def transfer_backend(
     fails at any point before cutover. Without it the source keeps serving
     during the copy and writes made after the snapshot are not carried over.
     """
-    if acquire_lock:
-        async with host_mutation_operation(
-            settings,
-            kind="transfer_backend",
-            actor="ui",
-            backend_id=backend_id,
-            phase="transfer_backend",
-            operation=OperationHandle(
-                id=None, kind="transfer_backend", settings=settings
-            ),
-        ):
-            return await transfer_backend(
+    async with host_mutation_operation(
+        settings,
+        kind="transfer_backend",
+        actor="ui",
+        backend_id=backend_id,
+        phase="Transfer output",
+        operation=operation_handle.as_step() if operation_handle else None,
+    ) as operation:
+        if operation.id is None:
+            raise RuntimeError("Could not record the transfer before starting it.")
+        try:
+            return await _transfer_backend(
                 session,
                 settings,
                 backend_id=backend_id,
                 target_node_uid=target_node_uid,
                 pause_source=pause_source,
                 progress_callback=progress_callback,
-                acquire_lock=False,
-                _lifecycle=HostMutationLifecycle(),
+                operation=operation_handle or operation,
             )
+        except BaseException as exc:
+            try:
+                await session.rollback()
+            except SQLAlchemyError as rollback_error:
+                logger.warning(
+                    "cluster_transfer.session_rollback_failed",
+                    error=str(rollback_error),
+                )
+            if isinstance(exc, TransferCommitUnknown):
+                await operation.complete(
+                    "partial",
+                    phase="Verify placement",
+                    error=str(exc),
+                    details=exc.details,
+                )
+            raise
 
-    lifecycle = _lifecycle or HostMutationLifecycle()
+
+async def _transfer_backend(
+    session: AsyncSession,
+    settings: Settings,
+    *,
+    backend_id: int,
+    target_node_uid: str,
+    pause_source: bool,
+    progress_callback: TransferProgressCallback | None,
+    operation: OperationHandle,
+) -> TransferResult:
+    lifecycle = HostMutationLifecycle()
+
+    def publish(message: str) -> None:
+        operation.publish_progress(
+            status="running",
+            phase="Transfer output",
+            details={
+                "progress": operation_progress_value("transferOutput", message=message),
+                "message": message,
+                "substate": message,
+                "backend_id": backend_id,
+                "target_node": target_node_uid,
+            },
+        )
+
+    def report(progress: int, message: str) -> None:
+        publish(message)
+        _report(progress_callback, progress, message)
 
     backend = (
         await session.execute(
@@ -183,18 +240,24 @@ async def transfer_backend(
     )
     messages: list[str] = []
 
-    _report(progress_callback, 6, "Reading transfer request.")
-    _report(progress_callback, 14, "Checking target node.")
+    report(6, "Reading transfer request.")
+    report(14, "Checking target node.")
     if target_node is not None and str(target_node.state or "").strip().lower() not in {
         "healthy",
         "joining",
     }:
         raise ValueError(f"target node is not healthy: {target_node.state}")
 
+    # Host recovery may still need these values after a failed commit expires the session.
+    session.expunge(backend)
+    for node in (source_node, target_node):
+        if node is not None:
+            session.expunge(node)
+    commit_unknown = False
     pause_started = False
     try:
         if pause_source:
-            _report(progress_callback, 20, "Pausing source.")
+            report(20, "Pausing source.")
             pause_started = True
             await lifecycle.run(
                 _set_source_paused, backend, settings, source_node, paused=True
@@ -206,14 +269,14 @@ async def transfer_backend(
             temp_dir = Path(temp_dir_name)
             bundle_path = temp_dir / f"{backend.name}.tar.gz"
             if source_uid == LOCAL_NODE_UID:
-                _report(progress_callback, 24, "Capturing source state.")
+                report(24, "Capturing source state.")
                 await lifecycle.run(
                     _archive_local_backend, backend, settings, bundle_path
                 )
             else:
                 if source_node is None:
                     raise ValueError("source node is not linked")
-                _report(progress_callback, 24, "Capturing source state from peer.")
+                report(24, "Capturing source state from peer.")
                 await lifecycle.run(
                     _archive_remote_backend, backend, settings, source_node, bundle_path
                 )
@@ -222,7 +285,7 @@ async def transfer_backend(
             target_rollback: TargetRollbackState | None = None
             try:
                 if target_uid == LOCAL_NODE_UID:
-                    _report(progress_callback, 44, "Restoring output on leader.")
+                    report(44, "Restoring output on leader.")
                     target_rollback = await lifecycle.run_recoverable(
                         _restore_local_backend, backend, settings, bundle_path
                     )
@@ -231,7 +294,7 @@ async def transfer_backend(
                 else:
                     if target_node is None:
                         raise ValueError("target node is not linked")
-                    _report(progress_callback, 38, "Copying snapshot to target.")
+                    report(38, "Copying snapshot to target.")
                     target_rollback = await lifecycle.run_recoverable(
                         _restore_remote_backend,
                         backend,
@@ -242,7 +305,7 @@ async def transfer_backend(
                     lifecycle.raise_if_cancelled()
                     messages.append(f"restored on {target_node.name}")
 
-                _report(progress_callback, 68, "Checking target health.")
+                report(68, "Checking target health.")
                 if target_uid == LOCAL_NODE_UID:
                     await lifecycle.run(
                         _start_local_backend_replica, backend, settings
@@ -269,16 +332,17 @@ async def transfer_backend(
                 )
                 await session.flush()
 
-                _report(progress_callback, 76, "Saving output placement.")
+                report(76, "Saving output placement.")
+                placement_backend = await session.get(Backend, backend_id)
                 apply_backend_placement(
-                    backend,
+                    placement_backend,
                     enabled=False,
                     mode="",
                     active_node_uid=target_uid,
                     selected_node_uids=(),
                 )
 
-                _report(progress_callback, 84, "Rendering cluster routes.")
+                report(84, "Rendering cluster routes.")
                 with session.no_autoflush:
                     apply_response = await lifecycle.finish(
                         run_apply(
@@ -286,12 +350,42 @@ async def transfer_backend(
                             settings,
                             operation_kind="transfer_backend",
                             actor="ui",
-                            scope=output_change(
-                                "transfer_backend", str(backend.name or "")
+                            operation_handle=operation.as_step(),
+                            scope=ConfigChange(
+                                "transfer_backend",
+                                outputs=frozenset({backend.name}),
+                                rebalance_resources=backend_has_local_runtime(backend)
+                                != backend_has_local_runtime(placement_backend),
                             ).scope(),
                         )
                     )
                 if apply_response.status != "success":
+                    if (
+                        getattr(apply_response, "details", {}).get("commit_outcome")
+                        == "unknown"
+                    ):
+                        commit_unknown = True
+                        source_action = (
+                            "CNC requested a source pause."
+                            if pause_source
+                            else "The source stayed live during the copy."
+                        )
+                        message = (
+                            f"Cannot verify transfer of {backend.name} from {source_uid} to {target_uid}. "
+                            f"{source_action} Check the saved placement before retrying."
+                        )
+                        if target_rollback:
+                            paths = filter(
+                                None,
+                                (
+                                    target_rollback.rollback_path,
+                                    target_rollback.unit_backup_path,
+                                ),
+                            )
+                            message += f" Recovery files on {target_uid} are at {', '.join(paths)}."
+                        raise TransferCommitUnknown(
+                            message, apply_response.run_id,
+                        )
                     raise RuntimeError(
                         f"host apply failed after transfer: {apply_response.message}"
                     )
@@ -308,10 +402,11 @@ async def transfer_backend(
                     )
                 lifecycle.raise_if_cancelled()
             except BaseException as exc:
-                if lifecycle.committed:
+                if lifecycle.committed or commit_unknown:
                     raise
                 rollback_messages: list[str] = []
                 if target_rollback is not None:
+                    publish("Restoring the target after transfer failure.")
                     rollback_messages = await lifecycle.recover(
                         lambda: _restore_target_rollback(
                             backend,
@@ -327,7 +422,8 @@ async def transfer_backend(
                     ) from exc
                 raise
     except BaseException:
-        if pause_started and not lifecycle.committed:
+        if pause_started and not lifecycle.committed and not commit_unknown:
+            publish("Resuming the source after transfer failure.")
             await lifecycle.recover(
                 lambda: _resume_source_after_failure(
                     backend, settings, source_node, lifecycle=lifecycle
@@ -340,7 +436,7 @@ async def transfer_backend(
             "were not carried over"
         )
 
-    _report(progress_callback, 92, "Stopping source runtime.")
+    report(92, "Stopping source runtime.")
     cleaned_remote_node_uids: list[str] = []
     cleanup_remote_node_uids = tuple(
         node_uid
@@ -391,7 +487,7 @@ async def transfer_backend(
                 count=deleted_count,
             )
 
-    _report(progress_callback, 100, "Transfer complete.")
+    report(100, "Transfer complete.")
     return TransferResult(
         backend_id=backend.id,
         backend_name=backend.name,
@@ -474,6 +570,13 @@ async def setup_backend_replica(
     }:
         raise ValueError(f"target node is not healthy: {target_node.state}")
 
+    # Recovery needs these already-loaded values even after SQLAlchemy expires
+    # attached rows on rollback. Replica setup only writes the readiness row.
+    session.expunge(backend)
+    if target_node is not None:
+        session.expunge(target_node)
+
+    commit_outcome: CommitOutcome = "rolled_back"
     target_rollback: TargetRollbackState | None = None
     try:
         if normalized_mode == REPLICA_SETUP_MODE_CLONE:
@@ -560,7 +663,18 @@ async def setup_backend_replica(
             target_url=target_url,
             healthcheck_result=healthcheck_result,
         )
-        await lifecycle.commit(session.commit())
+        marker = uuid4().hex
+        commit_outcome = "unknown"
+        commit_outcome, error = await lifecycle.finish(
+            commit_with_marker(session, settings, marker, "replica_setup")
+        )
+        if commit_outcome == "unknown":
+            raise RuntimeError(
+                f"Cannot verify replica commit {marker} for {backend.name} on {target_uid}. "
+                f"Target and recovery files retained: {target_rollback}. {error}"
+            )
+        if commit_outcome == "rolled_back":
+            raise RuntimeError(f"Replica readiness was not saved: {error}")
         if target_rollback is not None:
             await lifecycle.finish(
                 _discard_target_rollback(
@@ -573,7 +687,7 @@ async def setup_backend_replica(
             )
         lifecycle.raise_if_cancelled()
     except BaseException as exc:
-        if lifecycle.committed:
+        if commit_outcome != "rolled_back":
             raise
 
         async def restore_precommit_state() -> list[str]:
@@ -840,12 +954,11 @@ def _local_backend_service_active(backend: Backend, settings: Settings) -> bool:
         [
             "systemctl",
             "is-active",
-            "--quiet",
             quadlet_container_service_name(backend.name),
         ],
         timeout_sec=settings.command_timeout_status_sec,
     )
-    return result.ok
+    return _observed_active(result)
 
 
 def _remote_backend_service_active(
@@ -856,11 +969,20 @@ def _remote_backend_service_active(
             "ssh",
             *SSH_BATCH_OPTIONS,
             f"root@{_node_ip(node)}",
-            f"systemctl is-active --quiet {shlex.quote(quadlet_container_service_name(backend.name))}",
+            f"systemctl is-active {shlex.quote(quadlet_container_service_name(backend.name))}",
         ],
         timeout_sec=settings.command_timeout_apply_sec,
     )
-    return result.ok
+    return _observed_active(result)
+
+
+def _observed_active(result: CommandResult) -> bool:
+    state = result.stdout.strip()
+    if result.ok and state == "active":
+        return True
+    if result.returncode in {3, 4} and state in {"inactive", "failed", "unknown"}:
+        return False
+    raise RuntimeError(f"Cannot determine target service state: {result.stderr or state or result.returncode}")
 
 
 def _cleanup_remote_transfer_path(

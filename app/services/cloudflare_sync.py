@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 import json
 import re
@@ -11,6 +12,7 @@ from typing import Any
 from urllib.request import Request, urlopen
 
 from app.config import Settings
+from app.services.change_scope import Scope, ToolScope
 from app.logger import get_logger
 from app.services import cloudflare_ingress
 from app.services.host_state import (
@@ -19,6 +21,11 @@ from app.services.host_state import (
 )
 from app.services.commands import CommandError, command_result_is_retryable, run_command
 from app.services.managed_env import apply_managed_env_updates
+from app.services.nginx_contract import TUNNEL_PORT, container_ingress_marker
+from app.services.nginx_firewall import (
+    read_nginx_firewall_policy,
+    reconcile_nginx_firewall,
+)
 from app.services.notifications import (
     admin_dashboard_url,
     build_operator_message,
@@ -29,6 +36,12 @@ from app.services.retry import retry_call
 
 
 RULE_NUMBER_RE = re.compile(r"^\[\s*(?P<number>\d+)\]\s+(?P<rule>.+)$")
+NGINX_LISTEN_RE = re.compile(r"(?:^|(?<=[{};]))[ \t]*listen\s+([^;]+);", re.MULTILINE)
+TUNNEL_LISTEN_DIRECTIVES = frozenset(
+    f"{address}{TUNNEL_PORT}{suffix}"
+    for address in ("", "127.0.0.1:")
+    for suffix in ("", " default_server")
+)
 UFW_STATUS_ACTIVE_PREFIX = "Status: active"
 SYNC_ENV_KEY = "NGINX_CLOUDFLARE_IPS"
 SYNC_USER_AGENT = "cnc-cloudflare-sync/1.0"
@@ -232,12 +245,17 @@ def _last_known_good_cidrs(settings: Settings) -> tuple[str, ...]:
         return ()
 
 
+_CIDR_SCOPE = Scope.outputs_named(
+    set(), "timer.cloudflare.sync", ToolScope.NGINX | ToolScope.CLUSTER
+)
+
+
 async def _load_desired_state_for_sync(settings: Settings):
     from app.database import SessionLocal
     from app.services.apply_state import build_desired_state
 
     async with SessionLocal() as session:
-        return await build_desired_state(session, settings)
+        return await build_desired_state(session, settings, scope=_CIDR_SCOPE)
 
 
 def _desired_cluster_ingress_cidrs(desired: Any) -> tuple[str, ...]:
@@ -260,7 +278,12 @@ def _validate_generated_nginx_preview(
     policy = cloudflare_ingress.build_cloudflare_ingress_policy(
         (*cidrs, *extra_ingress_cidrs)
     )
+    tunnel_file_count = 0
     for filename, content in nginx_files.items():
+        listens = {" ".join(value.split()) for value in NGINX_LISTEN_RE.findall(content)}
+        if listens and listens <= TUNNEL_LISTEN_DIRECTIVES:
+            tunnel_file_count += 1
+            continue
         try:
             cloudflare_ingress.audit_rendered_cloudflare_nginx_acl(policy, content)
         except RuntimeError as exc:
@@ -268,6 +291,7 @@ def _validate_generated_nginx_preview(
     return {
         "checked": True,
         "file_count": len(nginx_files),
+        "tunnel_file_count": tunnel_file_count,
         "cidr_count": len(cidrs),
         "extra_ingress_cidr_count": len(extra_ingress_cidrs),
     }
@@ -461,13 +485,12 @@ def _settings_with_cloudflare_cidrs(
 async def _run_apply_for_sync(settings: Settings) -> tuple[dict[str, Any], bool]:
     from app.database import SessionLocal
     from app.services.apply_service import run_apply
-    from app.services.config_change import full_reconcile
 
     async with SessionLocal() as session:
         response = await run_apply(
             session,
             settings,
-            scope=full_reconcile("timer.cloudflare.sync").scope(),
+            scope=_CIDR_SCOPE,
         )
     return json.loads(response.model_dump_json()), response.status == "success"
 
@@ -822,6 +845,14 @@ async def run_cloudflare_sync(settings: Settings) -> dict[str, Any]:
                 payload["firewall"] = reconcile_cloudflare_http_firewall(
                     settings, cidrs=fetched_cidrs
                 )
+                if container_ingress_marker(settings).is_file():
+                    policy = read_nginx_firewall_policy(settings)
+                    if policy is None:
+                        raise RuntimeError("NGINX ingress firewall policy is missing. Run Apply.")
+                    await asyncio.to_thread(
+                        reconcile_nginx_firewall, settings, policy.backend_ports
+                    )
+                    payload["firewall"]["nginx_ingress_checked"] = True
                 _record_phase(
                     payload,
                     "firewall",

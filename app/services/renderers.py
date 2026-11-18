@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from app.services import cloudflare_ingress
 from app.services.cloudflare_tunnel import TUNNEL_ORIGIN_PORT
+from app.services.nginx_contract import GATEWAY, HTTP_PORT, HTTPS_PORT
 
 SHIELD_BACKEND_NAME = "shield"
 SHIELD_PROFILE = "shield"
@@ -107,12 +108,32 @@ def _tunnel_headers(config: str, hostname: str) -> str:
     )
 
 
-def _tunnel_client_ip() -> list[str]:
+def _tunnel_client_ip(nginx_container: bool) -> list[str]:
+    peer = GATEWAY if nginx_container else "127.0.0.1"
     return [
-        "    set_real_ip_from 127.0.0.1;",
+        f"    set_real_ip_from {peer};",
         "    real_ip_header CF-Connecting-IP;",
         "",
     ]
+
+
+def _http_listen_lines(
+    *, tunnel: bool, nginx_container: bool, default: bool = False
+) -> list[str]:
+    suffix = " default_server" if default else ""
+    if tunnel:
+        address = "" if nginx_container else "127.0.0.1:"
+        return [f"    listen {address}{TUNNEL_ORIGIN_PORT}{suffix};"]
+    if not nginx_container:
+        return [f"    listen 80{suffix};"]
+    return [f"    listen {HTTP_PORT}{suffix};", f"    listen [::]:{HTTP_PORT}{suffix};"]
+
+
+def _https_listen_lines(*, nginx_container: bool, default: bool = False) -> list[str]:
+    suffix = " ssl default_server" if default else " ssl"
+    if not nginx_container:
+        return [f"    listen 443{suffix};"]
+    return [f"    listen {HTTPS_PORT}{suffix};", f"    listen [::]:{HTTPS_PORT}{suffix};"]
 
 
 def render_nginx_http(
@@ -128,6 +149,7 @@ def render_nginx_http(
     shield_port: int = SHIELD_PORT,
     shield_target: int | str | None = None,
     shield_output_key: str = "global",
+    nginx_container: bool = False,
 ) -> str:
     upstream = upstream_name(hostname) + upstream_suffix
     if isinstance(ports, int | str):
@@ -162,22 +184,20 @@ def render_nginx_http(
     lines.extend(
         [
             "server {",
-            f"    listen 127.0.0.1:{TUNNEL_ORIGIN_PORT};"
-            if tunnel
-            else "    listen 80;",
+            *_http_listen_lines(tunnel=tunnel, nginx_container=nginx_container),
             f"    server_name {hostname};",
             "",
         ]
     )
     lines.extend(
-        _tunnel_client_ip()
+        _tunnel_client_ip(nginx_container)
         if tunnel
         else _cloudflare_acl_lines(cloudflare_only, cloudflare_ips)
     )
     if tls_certificate and not tunnel:
         lines.extend(
             [
-                "    listen 443 ssl;",
+                *_https_listen_lines(nginx_container=nginx_container),
                 f'    ssl_certificate "{tls_certificate}";',
                 f'    ssl_certificate_key "{tls_certificate}";',
                 "    ssl_protocols TLSv1.2 TLSv1.3;",
@@ -236,10 +256,11 @@ def render_nginx_shield_closed(
     *,
     cloudflare_only: bool = False,
     cloudflare_ips: tuple[str, ...] = (),
+    nginx_container: bool = False,
 ) -> str:
     lines = [
         "server {",
-        "    listen 80;",
+        *_http_listen_lines(tunnel=False, nginx_container=nginx_container),
         f"    server_name {hostname};",
         "",
     ]
@@ -269,6 +290,7 @@ def render_nginx_static(
     shield_port: int = SHIELD_PORT,
     shield_target: int | str | None = None,
     shield_output_key: str = "global",
+    nginx_container: bool = False,
 ) -> str:
     upstream = upstream_name(hostname) + upstream_suffix
     shield_upstream = f"{upstream}_shield"
@@ -289,24 +311,23 @@ def render_nginx_static(
     lines.extend(
         [
             "server {",
-            f"    listen 127.0.0.1:{TUNNEL_ORIGIN_PORT};"
-            if tunnel
-            else "    listen 80;",
+            *_http_listen_lines(tunnel=tunnel, nginx_container=nginx_container),
             f"    server_name {hostname};",
             f"    root {static_root};",
             "    index index.html;",
+            *(["    disable_symlinks on from=$document_root;"] if nginx_container else []),
             "",
         ]
     )
     lines.extend(
-        _tunnel_client_ip()
+        _tunnel_client_ip(nginx_container)
         if tunnel
         else _cloudflare_acl_lines(cloudflare_only, cloudflare_ips)
     )
     if tls_certificate and not tunnel:
         lines.extend(
             [
-                "    listen 443 ssl;",
+                *_https_listen_lines(nginx_container=nginx_container),
                 f'    ssl_certificate "{tls_certificate}";',
                 f'    ssl_certificate_key "{tls_certificate}";',
                 "    ssl_protocols TLSv1.2 TLSv1.3;",
@@ -385,14 +406,30 @@ def render_follower_admin_proxy(
 
 
 def render_nginx_https_default(
-    *, cloudflare_only: bool = False, cloudflare_ips: tuple[str, ...] = ()
+    *,
+    cloudflare_only: bool = False,
+    cloudflare_ips: tuple[str, ...] = (),
+    nginx_container: bool = False,
 ) -> str:
     lines = [
         "server {",
-        "    listen 443 ssl default_server;",
+        *_https_listen_lines(nginx_container=nginx_container, default=True),
         "    ssl_reject_handshake on;",
         "    ssl_protocols TLSv1.2 TLSv1.3;",
     ]
     lines.extend(_cloudflare_acl_lines(cloudflare_only, cloudflare_ips))
     lines.extend(["    return 404;", "}", ""])
     return "\n".join(lines)
+
+
+def render_nginx_tunnel_default(*, nginx_container: bool = False) -> str:
+    return "\n".join(
+        [
+            "server {",
+            *_http_listen_lines(tunnel=True, nginx_container=nginx_container, default=True),
+            "    server_name _;",
+            "    return 404;",
+            "}",
+            "",
+        ]
+    )

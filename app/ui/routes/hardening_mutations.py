@@ -40,9 +40,6 @@ from app.services.app_hardening import (
 )
 from app.services.error_reporting import ErrorCode
 from app.services.hardening_policy import hardening_configuration, hardening_preview
-from app.services.operations import (
-    create_operation,
-)
 from app.ui.errors import operator_error_json as _operator_error_json
 from app.ui.mutation_feedback import host_mutation_preflight_message
 from app.ui.operations.common import operation_backend, operation_response
@@ -156,18 +153,12 @@ async def apply_hardening_configuration(
     if blocked:
         raise HTTPException(status_code=409, detail=blocked)
     await session.rollback()
-    operation = await create_operation(
+    operation = await enqueue_mutation(
         settings,
+        "hardening_apply",
         kind="ui.backend.hardening",
-        actor="ui",
-        backend_id=backend_id,
         phase="Apply security configuration",
         details={"message": "Security configuration queued.", "backend_id": backend_id},
-    )
-    await enqueue_mutation(
-        settings,
-        operation.id,
-        "hardening_apply",
         backend_id=backend_id,
         mode=mode,
         configuration=configuration,

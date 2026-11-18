@@ -32,11 +32,10 @@ from app.services.error_reporting import (
     ErrorCode,
     error_context,
 )
-from app.services.config_change import converge_change, route_change
+from app.services.config_change import converge_change, input_edit
 from app.services.operation_runtime import delete_input_progress_plan
 from app.services.operations import (
     active_host_mutation_blocker,
-    create_operation,
 )
 from app.services.shield_service import make_code_hash
 from app.services.validators import ValidationError
@@ -154,10 +153,10 @@ async def create_input_form(
             connection=connection if kind == "domain" else "public_ip",
         )
         if async_dashboard:
-            operation = await create_operation(
+            operation = await enqueue_mutation(
                 settings,
+                "create_input",
                 kind="ui.input.create",
-                actor="ui",
                 phase="Validate input",
                 details=_input_progress_details(
                     "createInput",
@@ -167,11 +166,6 @@ async def create_input_form(
                     substate="Reading submitted config",
                     input_value=payload.value,
                 ),
-            )
-            await enqueue_mutation(
-                settings,
-                operation.id,
-                "create_input",
                 form_values={
                     "kind": kind,
                     "value": value,
@@ -188,9 +182,7 @@ async def create_input_form(
         mutation = await converge_change(
             session,
             settings,
-            change=route_change(
-                "ui.input.create", {str(b.name) for b in item.backends}
-            ),
+            change=input_edit("ui.input.create", item),
             apply_runner=run_apply,
         )
         apply_response = mutation.apply_response
@@ -333,14 +325,11 @@ async def _delete_input_and_redirect(
     snapshot = {
         "hostname": item.hostname,
     }
-    detached_output_names = {str(backend.name) for backend in item.backends}
     await input_commands.delete_input(session, input_id)
     mutation = await converge_change(
         session,
         settings,
-        change=route_change(
-                "ui.input.delete", detached_output_names
-            ),
+        change=input_edit("ui.input.delete", item),
         apply_runner=run_apply,
     )
     apply_response = mutation.apply_response
@@ -367,10 +356,10 @@ async def _input_delete_operation_response(
     settings: Settings, input_id: int, *, input_kind: str = "domain"
 ) -> JSONResponse:
     progress_plan = delete_input_progress_plan(input_kind=input_kind)
-    operation = await create_operation(
+    operation = await enqueue_mutation(
         settings,
+        "delete_input",
         kind="ui.input.delete",
-        actor="ui",
         phase="Validate input",
         details=_planned_operation_progress_details(
             progress_plan,
@@ -380,11 +369,6 @@ async def _input_delete_operation_response(
             substate="Loading current route graph",
             input_id=input_id,
         ),
-    )
-    await enqueue_mutation(
-        settings,
-        operation.id,
-        "delete_input",
         input_id=input_id,
     )
     response = _operation_response(operation, message="Input delete started.")
@@ -478,10 +462,10 @@ async def update_input_form(
             shield_access_code=shield_access_code_display,
         )
         if request_prefers_json(request):
-            operation = await create_operation(
+            operation = await enqueue_mutation(
                 settings,
+                "update_input",
                 kind="ui.input.update",
-                actor="ui",
                 phase="Validate input",
                 details=_input_progress_details(
                     "saveInput",
@@ -492,11 +476,6 @@ async def update_input_form(
                     input_id=input_id,
                     input_value=item.hostname,
                 ),
-            )
-            await enqueue_mutation(
-                settings,
-                operation.id,
-                "update_input",
                 input_id=input_id,
                 form_values={
                     "backend_ids": [
@@ -517,9 +496,7 @@ async def update_input_form(
         mutation = await converge_change(
             session,
             settings,
-            change=route_change(
-                "ui.input.update", {str(b.name) for b in item.backends}
-            ),
+            change=input_edit("ui.input.update", item),
             apply_runner=run_apply,
         )
         logger.info(

@@ -141,6 +141,12 @@ class DesiredState:
         default_factory=dict
     )
     static_replicas: dict[str, dict[str, str]] = field(default_factory=dict)
+    nginx_container: bool = False
+    nginx_backend_ports: tuple[int, ...] = ()
+    nginx_static_roots: tuple[str, ...] = ()
+    nginx_public_http: bool = False
+    nginx_public_https: bool = False
+    nginx_tunnel: bool = False
 
 
 
@@ -172,6 +178,19 @@ def desired_state_snapshot(desired: DesiredState) -> dict[str, Any]:
     }
     return {
         "generated_nginx_files": generated_nginx_files,
+        **(
+            {
+                "nginx_ingress": {
+                    "backend_ports": list(desired.nginx_backend_ports),
+                    "static_roots": list(desired.nginx_static_roots),
+                    "public_http": desired.nginx_public_http,
+                    "public_https": desired.nginx_public_https,
+                    "tunnel": desired.nginx_tunnel,
+                }
+            }
+            if desired.nginx_container
+            else {}
+        ),
         "tailscale_paths": {
             path: desired.tailscale_paths[path]
             for path in sorted(desired.tailscale_paths)

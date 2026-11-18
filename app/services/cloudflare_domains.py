@@ -15,7 +15,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import Settings
-from app.services.config_change import converge_change, full_reconcile
+from app.services.change_scope import ToolScope
+from app.services.config_change import ConfigChange, converge_change
 from app.logger import get_logger
 from app.models.entities import Input
 from app.services.cloudflare_api import CloudflareClient, CloudflareError
@@ -301,7 +302,7 @@ async def apply_domain_preview(
     mutation = await converge_change(
         session,
         settings,
-        change=full_reconcile("cloudflare.domain.https"),
+        change=ConfigChange("cloudflare.domain.https", tools=ToolScope.DOMAIN_CONNECTION),
         operation_handle=apply_operation,
     )
     if not mutation.applied:
@@ -340,7 +341,7 @@ async def apply_domain_preview(
         cleanup = await converge_change(
             session,
             settings,
-            change=full_reconcile("cloudflare.domain.connection"),
+            change=ConfigChange("cloudflare.domain.connection", tools=ToolScope.DOMAIN_CONNECTION),
             operation_handle=cleanup_operation,
         )
         if not cleanup.applied:
@@ -371,6 +372,7 @@ async def sync_cloudflare_domains(
         reconcile_follower_certificates,
     )
     from app.services.origin_tls import reload_origin_certificate
+    from app.services.nginx_runtime import active_routes_directory
 
     results = []
     async with host_mutation_operation(
@@ -390,7 +392,7 @@ async def sync_cloudflare_domains(
         )
         active_files = {
             path.name: path.read_text()
-            for path in settings.nginx_generated_dir.glob("cnc-*.conf")
+            for path in active_routes_directory(settings).glob("cnc-*.conf")
         }
         active_origins = set(origin_hosts(active_files, settings.app_control_dir))
         for item in inputs:

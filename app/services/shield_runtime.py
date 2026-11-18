@@ -7,6 +7,7 @@ from typing import Any
 from app.config import Settings
 from app.services.app_quadlet import QUADLET_HEADER
 from app.services.cluster_topology import leader_tailnet_ip
+from app.services.nginx_contract import GATEWAY, NETWORK_NAME, nginx_gateway_enabled
 from app.services.renderers import SHIELD_BACKEND_NAME, SHIELD_PORT
 
 
@@ -19,15 +20,22 @@ def shield_quadlet_path(settings: Settings) -> Path:
     return settings.app_quadlet_dir / SHIELD_CONTAINER_UNIT
 
 
-def render_shield_quadlet(settings: Settings) -> str:
+def render_shield_quadlet(settings: Settings, *, nginx_container: bool = False) -> str:
     env_file = settings.shield_env_file_path
     state_dir = settings.shield_state_dir
     port = settings.shield_port or SHIELD_PORT
     publish_ports = [f"PublishPort=127.0.0.1:{port}:1026/tcp"]
+    unit_dependencies: list[str] = []
     if settings.multi_node_enabled:
         publish_ports.append(
             f"PublishPort={leader_tailnet_ip(settings)}:{port}:1026/tcp"
         )
+    if nginx_gateway_enabled(settings, container_mode=nginx_container):
+        publish_ports.append(f"PublishPort={GATEWAY}:{port}:1026/tcp")
+        unit_dependencies = [
+            f"Requires={NETWORK_NAME}-network.service",
+            f"After={NETWORK_NAME}-network.service",
+        ]
     lines = [
         QUADLET_HEADER,
         "",
@@ -35,6 +43,7 @@ def render_shield_quadlet(settings: Settings) -> str:
         "Description=CNC Shield access gate",
         "After=network-online.target",
         "Wants=network-online.target",
+        *unit_dependencies,
         "",
         "[Container]",
         f"ContainerName={SHIELD_CONTAINER_NAME}",
@@ -108,11 +117,14 @@ def write_shield_runtime_assets(
     settings: Settings,
     *,
     output_code_hashes: dict[str, str] | None = None,
+    nginx_container: bool = False,
 ) -> dict[str, Any]:
     changed_files: list[str] = []
     settings.shield_state_dir.mkdir(parents=True, exist_ok=True)
     if _write_text_atomic(
-        shield_quadlet_path(settings), render_shield_quadlet(settings), mode=0o644
+        shield_quadlet_path(settings),
+        render_shield_quadlet(settings, nginx_container=nginx_container),
+        mode=0o644,
     ):
         changed_files.append(str(shield_quadlet_path(settings)))
     if _write_text_atomic(

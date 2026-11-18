@@ -17,7 +17,7 @@ from app.models.entities import Input
 from app.routes.apply_errors import raise_apply_failure
 from app.schemas.inputs import InputIn, InputOut, InputStateIn, InputUpdate
 from app.services import input_commands
-from app.services.config_change import converge_change, route_change
+from app.services.config_change import converge_change, input_edit
 from app.services.operations import host_mutation_operation
 from app.services.status_service import invalidate_status_cache
 from app.services.validators import ValidationError
@@ -66,9 +66,7 @@ async def create_input(
             result = await converge_change(
                 session,
                 settings,
-                change=route_change(
-                    "api.input.create", {str(b.name) for b in item.backends}
-                ),
+                change=input_edit("api.input.create", item),
                 operation_handle=operation,
             )
         if not result.applied:
@@ -118,8 +116,6 @@ async def update_input(
     _csrf: None = Depends(csrf_api_dependency),
 ) -> Input:
     try:
-        before = await input_commands.require_input(session, input_id)
-        was_attached = {str(b.name) for b in before.backends}
         async with host_mutation_operation(
             settings, kind="api.input.update", actor="api", phase="configure"
         ) as operation:
@@ -129,10 +125,7 @@ async def update_input(
             result = await converge_change(
                 session,
                 settings,
-                change=route_change(
-                    "api.input.update",
-                    was_attached | {str(b.name) for b in item.backends},
-                ),
+                change=input_edit("api.input.update", item),
                 operation_handle=operation,
             )
         if not result.applied:
@@ -195,9 +188,7 @@ async def toggle_input(
             result = await converge_change(
                 session,
                 settings,
-                change=route_change(
-                    "api.input.toggle", {str(b.name) for b in item.backends}
-                ),
+                change=input_edit("api.input.toggle", item),
                 operation_handle=operation,
             )
         if not result.applied:

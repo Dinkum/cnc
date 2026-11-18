@@ -14,7 +14,8 @@ from app.services import backend_commands
 from app.services.mutation_queue import mutation_runner
 from app.services.apply_service import default_apply_services, run_apply
 from app.services.error_reporting import ErrorCode
-from app.services.config_change import ConfigChange, converge_change
+from app.services.change_scope import ToolScope
+from app.services.config_change import ConfigChange, changed_output_fields, converge_change, output_edit
 from app.ui.operations.action import Action
 from app.ui.operations.save import Reporter, SaveResult, Subject, run_save
 from app.services.inter_app_interfaces import (
@@ -45,16 +46,6 @@ class _OutputSaveResult:
     apply_response: ApplyResponse
     backend_name: str
     extra_details: dict[str, object]
-
-
-def _backend_update_changed_keys(backend: Backend, payload: object) -> set[str]:
-    changed: set[str] = set()
-    for key, value in vars(payload).items():
-        if value is None:
-            continue
-        if getattr(backend, key, None) != value:
-            changed.add(key)
-    return changed
 
 
 def operator_validation_error(exc: ValidationError) -> str:
@@ -91,10 +82,9 @@ async def _commit_output_save_apply(
     settings: Settings,
     operation: OperationHandle,
     *,
-    operation_name: str,
+    change: ConfigChange,
     backend_id: int,
     backend_name: str,
-    related_outputs: set[str] | None = None,
 ) -> ApplyResponse:
     services = replace(
         default_apply_services(),
@@ -107,10 +97,7 @@ async def _commit_output_save_apply(
     mutation = await converge_change(
         session,
         settings,
-        ConfigChange(
-            kind=operation_name,
-            outputs=frozenset({backend_name, *(related_outputs or ())}),
-        ),
+        change,
         apply_runner=run_apply,
         apply_services=services,
         operation_handle=operation,
@@ -246,10 +233,10 @@ async def _run_update_backend_operation(
                 shield_code_hash=shield_code_hash,
                 shield_access_code=shield_access_code_display,
             )
-        changed_keys = _backend_update_changed_keys(backend, payload)
         backend = await backend_commands.update_backend(
             session, backend_id, payload, commit=False
         )
+        changed_keys = changed_output_fields(backend)
         backend_name = str(backend.name or backend_name)
         await _update_output_save_operation_progress(
             operation,
@@ -278,7 +265,7 @@ async def _run_update_backend_operation(
             session,
             settings,
             operation,
-            operation_name="ui.backend.update",
+            change=output_edit("ui.backend.update", backend, requested_fields=payload.model_fields_set),
             backend_id=backend_id,
             backend_name=backend_name,
         )
@@ -324,7 +311,7 @@ async def _run_update_backend_inputs_operation(
     ) -> _OutputSaveResult:
         payload = _backend_inputs_payload_from_form(input_ids=input_ids)
         normalized_input_ids = list(payload.input_ids or [])
-        await backend_commands.set_backend_inputs(
+        updated = await backend_commands.set_backend_inputs(
             session,
             backend_id,
             normalized_input_ids,
@@ -334,7 +321,7 @@ async def _run_update_backend_inputs_operation(
             session,
             settings,
             operation,
-            operation_name="ui.backend.inputs",
+            change=output_edit("ui.backend.inputs", updated, requested_fields={"inputs"}),
             backend_id=backend_id,
             backend_name=backend_name,
         )
@@ -381,7 +368,7 @@ async def _run_update_backend_state_operation(
             session,
             settings,
             operation,
-            operation_name="ui.backend.state",
+            change=output_edit("ui.backend.state", _backend, requested_fields={"enabled"}),
             backend_id=backend_id,
             backend_name=backend_name,
         )
@@ -437,10 +424,9 @@ async def _run_update_backend_interface_operation(
             session,
             settings,
             operation,
-            operation_name="ui.backend.interface",
+            change=ConfigChange("ui.backend.interface", outputs=frozenset({backend_name, *peers}), tools=ToolScope.PODMAN),
             backend_id=backend_id,
             backend_name=backend_name,
-            related_outputs=peers,
         )
         return _OutputSaveResult(
             apply_response=apply_response,

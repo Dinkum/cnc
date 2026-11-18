@@ -3,50 +3,21 @@ from __future__ import annotations
 
 import inspect
 import os
+import stat
+import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping
 
 from app.logger import get_logger
+from app.services.change_scope import Scope
 
 if TYPE_CHECKING:
     from app.config import Settings
     from app.services.apply_core import DesiredState
 
 logger = get_logger("tools")
-
-
-@dataclass(frozen=True)
-class Scope:
-    outputs: frozenset[str] | None = None
-    reason: str = "full reconcile"
-
-    @property
-    def is_full(self) -> bool:
-        return self.outputs is None
-
-    def covers(self, output: str) -> bool:
-        return self.is_full or output in (self.outputs or frozenset())
-
-    def limit(self, names: set[str]) -> set[str]:
-        if self.is_full:
-            return set(names)
-        return {name for name in names if self.covers(name)}
-
-    def as_details(self) -> dict[str, Any]:
-        return {
-            "scope": "full" if self.is_full else sorted(self.outputs or ()),
-            "scope_reason": self.reason,
-        }
-
-    @classmethod
-    def everything(cls, reason: str = "full reconcile") -> "Scope":
-        return cls(outputs=None, reason=reason)
-
-    @classmethod
-    def outputs_named(cls, names: set[str], reason: str) -> "Scope":
-        return cls(outputs=frozenset(names), reason=reason)
 
 
 @dataclass(frozen=True)
@@ -87,33 +58,31 @@ class Plan:
 
 def _write_atomic(path: Path, content: str, mode: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(content, encoding="utf-8")
-    os.chmod(temporary, mode)
-    os.replace(temporary, path)
-
-
-def _read(path: Path) -> str | None:
-    try:
-        return path.read_text(encoding="utf-8")
-    except OSError:
-        return None
-
-
-def _ensure_dir(directory: Path) -> None:
-    directory.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=path.parent, delete=False
+    ) as stream:
+        temporary = Path(stream.name)
+        try:
+            stream.write(content)
+            stream.flush()
+            os.fchmod(stream.fileno(), mode)
+            os.replace(temporary, path)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
 
 
 def _owned(directory: Path, prefix: str) -> dict[Path, str]:
-    if not directory.is_dir():
-        return {}
-    found: dict[Path, str] = {}
-    for path in sorted(directory.iterdir(), key=lambda item: item.name):
-        if not path.name.startswith(prefix) or not path.is_file():
+    found = {}
+    for path in directory.iterdir():
+        if not path.name.startswith(prefix):
             continue
-        content = _read(path)
-        if content is not None:
-            found[path] = content
+        mode = path.lstat().st_mode
+        if stat.S_ISDIR(mode):
+            continue
+        if not stat.S_ISREG(mode):
+            raise OSError(f"expected a regular managed file at {path}")
+        found[path] = path.read_text(encoding="utf-8")
     return found
 
 
@@ -128,16 +97,17 @@ def managed(
     tool: str = "",
     after_restore: Callable[[], Any] | None = None,
 ) -> Iterator[list[str]]:
-    _ensure_dir(directory)
+    directory.mkdir(parents=True, exist_ok=True)
     before = _owned(directory, prefix)
     changed: list[str] = []
 
     def restore() -> None:
-        for path in list(directory.iterdir()) if directory.is_dir() else []:
-            if path.name.startswith(prefix) and path not in before and path.is_file():
+        for name in reversed(changed):
+            path = directory / name
+            if path in before:
+                _write_atomic(path, before[path], mode)
+            else:
                 path.unlink(missing_ok=True)
-        for path, content in before.items():
-            _write_atomic(path, content, mode)
 
     try:
         for name in sorted(wanted):
@@ -155,11 +125,6 @@ def managed(
             if path.name not in wanted:
                 path.unlink()
                 changed.append(path.name)
-    except BaseException:
-        restore()
-        raise
-
-    try:
         yield sorted(changed)
     except BaseException:
         restore()
@@ -183,10 +148,14 @@ def managed_file(
     plan: "Plan | None" = None,
     tool: str = "",
 ) -> Iterator[bool]:
-    existed = path.exists()
-    before = _read(path) if existed else None
-    if existed and before is None:
-        raise OSError(f"cannot read {path} to compare against desired content")
+    try:
+        file_mode = path.lstat().st_mode
+    except FileNotFoundError:
+        before = None
+    else:
+        if not stat.S_ISREG(file_mode):
+            raise OSError(f"expected a regular managed file at {path}")
+        before = path.read_text(encoding="utf-8")
     if before == content:
         yield False
         return

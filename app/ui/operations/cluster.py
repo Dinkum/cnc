@@ -5,10 +5,16 @@ import asyncio
 from app.config import Settings
 from app.logger import get_logger
 from app.services.mutation_queue import mutation_runner
-from app.services.cluster_transfer import setup_backend_replica, transfer_backend
+from app.services.cluster_transfer import (
+    TransferCommitUnknown,
+    setup_backend_replica,
+    transfer_backend,
+)
 from app.services.error_reporting import ErrorCode, error_context
+from app.services.operation_runtime import RUNNING_PROGRESS_MAX
 from app.services.operations import OperationHandle
-from app.ui.errors import operator_action_error
+from app.services.thread_workers import run_to_completion
+from app.ui.errors import operator_action_error, operator_error_message
 from app.ui.operations.common import background_db_session
 from app.ui.progress import _operation_progress_details
 
@@ -43,45 +49,14 @@ async def _run_transfer_operation(
             ),
         )
         async with background_db_session(settings) as session:
-            loop = asyncio.get_running_loop()
-            last_progress = {"value": 0}
-            progress_updates = []
-
-            def report_transfer_progress(_progress: int, message: str) -> None:
-                details = _operation_progress_details(
-                    "transferOutput",
-                    int(last_progress["value"]),
-                    message,
-                    phase="Transfer output",
-                    substate=message,
-                    backend_id=backend_id,
-                    target_node=target_node,
-                )
-                last_progress["value"] = int(details["progress"])
-                progress_updates.append(
-                    asyncio.run_coroutine_threadsafe(
-                        operation.update(
-                            status="running",
-                            phase="Transfer output",
-                            details=details,
-                        ),
-                        loop,
-                    )
-                )
-
             result = await transfer_backend(
                 session,
                 settings,
                 backend_id=backend_id,
                 target_node_uid=target_node,
                 pause_source=pause_source,
-                progress_callback=report_transfer_progress,
+                operation_handle=operation,
             )
-            for progress_update in progress_updates:
-                try:
-                    await asyncio.wrap_future(progress_update)
-                except Exception as exc:
-                    logger.warning("ui.transfer.progress_update_failed", error=str(exc))
             transferred = f"{result.backend_name} transferred to {result.target_label}."
             if not pause_source:
                 transferred += (
@@ -105,12 +80,22 @@ async def _run_transfer_operation(
                     "source_paused": pause_source,
                 },
             )
+    except asyncio.CancelledError:
+        await operation.complete(
+            "cancelled", phase="Transfer output", error="Transfer cancelled."
+        )
+        raise
     except Exception as exc:
+        uncertain = isinstance(exc, TransferCommitUnknown)
         error_fields = error_context(ErrorCode.CLUSTER_TRANSFER_FAILED)
-        flash_error = operator_action_error(
-            "Transfer",
-            "Unexpected error while transferring the output. Check server logs with this instance.",
-            error_fields,
+        flash_error = (
+            operator_error_message(str(exc), error_fields)
+            if uncertain
+            else operator_action_error(
+                "Transfer",
+                "Unexpected error while transferring the output. Check server logs with this instance.",
+                error_fields,
+            )
         )
         logger.exception(
             "ui.transfer.worker_failed",
@@ -121,12 +106,15 @@ async def _run_transfer_operation(
             error=str(exc),
         )
         await operation.complete(
-            "failed",
-            phase="Transfer output",
+            "partial" if uncertain else "failed",
+            phase="Verify placement" if uncertain else "Transfer output",
             error=flash_error,
             details={
                 "progress": 100,
-                "message": "Transfer failed.",
+                "message": "Verify placement before retrying."
+                if uncertain
+                else "Transfer failed.",
+                **(exc.details if uncertain else {}),
                 "flash_error": flash_error,
                 "backend_id": backend_id,
                 "target_node": target_node,
@@ -146,6 +134,22 @@ async def _run_replica_setup_operation(
     operation = OperationHandle(
         id=operation_id, kind="setup_backend_replica", settings=settings
     )
+
+    def report_setup_progress(progress: int, message: str) -> None:
+        operation.publish_progress(
+            status="running",
+            phase="Replica setup",
+            details=_operation_progress_details(
+                "replicaSetup",
+                min(progress, RUNNING_PROGRESS_MAX),
+                message,
+                phase="Replica setup",
+                backend_id=backend_id,
+                target_node=target_node,
+                setup_mode=setup_mode,
+            ),
+        )
+
     try:
         await operation.update(
             status="running",
@@ -162,30 +166,6 @@ async def _run_replica_setup_operation(
             ),
         )
         async with background_db_session(settings) as session:
-            loop = asyncio.get_running_loop()
-            progress_updates = []
-
-            def report_setup_progress(progress: int, message: str) -> None:
-                progress_updates.append(
-                    asyncio.run_coroutine_threadsafe(
-                        operation.update(
-                            status="running",
-                            phase="Replica setup",
-                            details=_operation_progress_details(
-                                "replicaSetup",
-                                progress,
-                                message,
-                                phase="Replica setup",
-                                substate=message,
-                                backend_id=backend_id,
-                                target_node=target_node,
-                                setup_mode=setup_mode,
-                            ),
-                        ),
-                        loop,
-                    ),
-                )
-
             result = await setup_backend_replica(
                 session,
                 settings,
@@ -194,29 +174,17 @@ async def _run_replica_setup_operation(
                 setup_mode=setup_mode,
                 progress_callback=report_setup_progress,
             )
-            for progress_update in progress_updates:
-                try:
-                    await asyncio.wrap_future(progress_update)
-                except Exception as exc:
-                    logger.warning(
-                        "ui.replica_setup.progress_update_failed", error=str(exc)
-                    )
-            await operation.complete(
-                "success",
+    except asyncio.CancelledError:
+        message = "Replica setup was interrupted. Check node readiness before retrying."
+        await run_to_completion(
+            operation.complete(
+                "cancelled",
                 phase="Replica setup",
-                details={
-                    "progress": 100,
-                    "message": f"{result.backend_name} set up on {result.target_label}.",
-                    "flash_success": f"{result.backend_name} set up on {result.target_label}.",
-                    "backend_id": result.backend_id,
-                    "backend_name": result.backend_name,
-                    "target_node_uid": result.target_node_uid,
-                    "target_label": result.target_label,
-                    "setup_mode": result.setup_mode,
-                    "route_target": result.route_target,
-                    "messages": result.messages,
-                },
+                error=message,
+                details={"progress": 100, "message": message},
             )
+        )
+        raise
     except Exception as exc:
         error_fields = error_context(ErrorCode.CLUSTER_REPLICA_SETUP_FAILED)
         flash_error = operator_action_error(
@@ -233,7 +201,7 @@ async def _run_replica_setup_operation(
             **error_fields,
             error=str(exc),
         )
-        await operation.complete(
+        completion = operation.complete(
             "failed",
             phase="Replica setup",
             error=flash_error,
@@ -247,3 +215,22 @@ async def _run_replica_setup_operation(
                 **error_fields,
             },
         )
+    else:
+        message = f"{result.backend_name} set up on {result.target_label}."
+        completion = operation.complete(
+            "success",
+            phase="Replica setup",
+            details={
+                "progress": 100,
+                "message": message,
+                "flash_success": message,
+                "backend_id": result.backend_id,
+                "backend_name": result.backend_name,
+                "target_node_uid": result.target_node_uid,
+                "target_label": result.target_label,
+                "setup_mode": result.setup_mode,
+                "route_target": result.route_target,
+                "messages": result.messages,
+            },
+        )
+    await run_to_completion(completion)

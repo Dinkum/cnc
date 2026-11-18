@@ -217,7 +217,9 @@ trap cleanup EXIT
 tar -C "$stage" -xzf {quoted_remote_path}
 install -d -m 0755 /usr/local/lib/cnc
 install -m 0644 "$stage/origin_tls.py" /usr/local/lib/cnc/origin_tls.py
-sed 's|/var/lib/cnc/current/app/services/origin_tls.py|/usr/local/lib/cnc/origin_tls.py|' "$stage/cnc-origin-tls.service" > /etc/systemd/system/cnc-origin-tls.service
+sed -e '/^WorkingDirectory=/d' \\
+  -e 's|^ExecStart=.*|ExecStart=/usr/bin/python3 /usr/local/lib/cnc/origin_tls.py|' \\
+  "$stage/cnc-origin-tls.service" > /etc/systemd/system/cnc-origin-tls.service
 install -m 0644 "$stage/cnc-origin-tls.timer" /etc/systemd/system/cnc-origin-tls.timer
 python3 /usr/local/lib/cnc/origin_tls.py --prepare --nginx-dir "$stage/app-nginx"
 systemctl daemon-reload

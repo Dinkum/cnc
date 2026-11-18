@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from app.config import Settings
-from app.services.config_change import converge_change, output_change, route_change
+from app.services.config_change import converge_change, input_edit, output_edit
 from app.database import create_configured_async_engine
 from app.models.entities import Backend, Input
 from app.schemas.backends import BackendIn, BackendOut, BackendUpdate
@@ -150,11 +150,14 @@ async def mutate_resource(
                         item, include_collections=True
                     )
             if resource == "output":
-                change = output_change(kind, str(item.name or ""))
-            else:
-                change = route_change(
-                    kind, {str(b.name) for b in getattr(item, "backends", [])}
+                change = output_edit(
+                    kind,
+                    item,
+                    membership_change=action == "create",
+                    requested_fields=data.model_fields_set,
                 )
+            else:
+                change = input_edit(kind, item)
             result = await converge_change(
                 session,
                 settings,
@@ -240,7 +243,7 @@ async def change_route(
                 result = await converge_change(
                     session,
                     settings,
-                    change=output_change(kind, str(output.name or "")),
+                    change=input_edit(kind, item),
                     operation_handle=operation,
                 )
                 if not result.applied:

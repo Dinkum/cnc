@@ -1510,6 +1510,8 @@ async def _collect_status_uncached(
     apply_state_payload = None
     if host_apply_state is not None:
         current_hash = last_apply.desired_state_hash if last_apply is not None else None
+        latest_details = last_apply_payload["details"] if last_apply_payload else {}
+        comparable = isinstance(latest_details, dict) and latest_details.get("tool_scope", "host") == "host"
         last_hash = host_apply_state.last_applied_state_hash
         apply_state_payload = {
             "last_applied_state_hash": last_hash,
@@ -1519,7 +1521,7 @@ async def _collect_status_uncached(
             "latest_apply_desired_state_hash": current_hash,
             "latest_apply_differs_from_last_applied": bool(
                 current_hash and last_hash and current_hash != last_hash
-            ),
+            ) if comparable else None,
         }
 
     last_update_payload = None

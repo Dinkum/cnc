@@ -56,11 +56,11 @@ from app.services.inter_app_interfaces import (
 )
 from app.services.operations import (
     active_host_mutation_blocker,
-    create_operation,
 )
 from app.services.placement_config import (
     PLACEMENT_MODE_FAILOVER,
     apply_backend_placement,
+    backend_has_local_runtime,
     clean_node_uid,
     read_backend_placement,
     unique_node_uids,
@@ -150,12 +150,9 @@ async def backup_backend_form(
     if blocked is not None:
         return blocked
     if request_prefers_json(request):
-        operation = await create_operation(
+        operation = await enqueue_mutation(
             settings,
-            kind="backup_backend",
-            actor="ui",
-            backend_id=backend.id,
-            phase="queued",
+            "backup_backend",
             details=_operation_progress_details(
                 "backup",
                 0,
@@ -164,11 +161,6 @@ async def backup_backend_form(
                 operation_role="ui_backup",
                 backend_id=backend.id,
             ),
-        )
-        await enqueue_mutation(
-            settings,
-            operation.id,
-            "backup_backend",
             backend_id=backend.id,
         )
         response = _operation_response(operation, message="Backup started.")
@@ -221,12 +213,9 @@ async def restore_backend_form(
     if blocked is not None:
         return blocked
     if request_prefers_json(request):
-        operation = await create_operation(
+        operation = await enqueue_mutation(
             settings,
-            kind="restore_backend",
-            actor="ui",
-            backend_id=backend.id,
-            phase="queued",
+            "restore_backend",
             details=_operation_progress_details(
                 "restore",
                 0,
@@ -234,11 +223,6 @@ async def restore_backend_form(
                 phase="Restore backup",
                 backup_id=resolved_backup_id,
             ),
-        )
-        await enqueue_mutation(
-            settings,
-            operation.id,
-            "restore_backend",
             backend_id=backend.id,
             backup_id=resolved_backup_id,
         )
@@ -341,12 +325,9 @@ async def delete_backup_form(
         return blocked
 
     if request_prefers_json(request):
-        operation = await create_operation(
+        operation = await enqueue_mutation(
             settings,
-            kind="delete_backend_backup",
-            actor="ui",
-            backend_id=backend.id,
-            phase="queued",
+            "delete_backend_backup",
             details=_operation_progress_details(
                 "deleteBackup",
                 0,
@@ -354,11 +335,6 @@ async def delete_backup_form(
                 phase="Delete backup",
                 backup_id=backup_id,
             ),
-        )
-        await enqueue_mutation(
-            settings,
-            operation.id,
-            "delete_backend_backup",
             backend_id=backend.id,
             backup_id=backup_id,
         )
@@ -436,12 +412,9 @@ async def import_restore_backend_form(
             max_bytes=settings.backend_backup_upload_max_bytes,
         )
         if request_prefers_json(request):
-            operation = await create_operation(
+            operation = await enqueue_mutation(
                 settings,
-                kind="import_backend_backup",
-                actor="ui",
-                backend_id=backend.id,
-                phase="queued",
+                "import_backend_backup",
                 details=_operation_progress_details(
                     "importBackup",
                     0,
@@ -450,11 +423,6 @@ async def import_restore_backend_form(
                     operation_role="ui_backup_import",
                     filename=bundle.filename,
                 ),
-            )
-            await enqueue_mutation(
-                settings,
-                operation.id,
-                "import_backend_backup",
                 backend_id=backend.id,
                 temp_path=str(temp_path),
                 original_name=bundle.filename,
@@ -532,12 +500,9 @@ async def clone_backend_form(
     try:
         payload = _backend_clone_payload_from_form(name=name, port=port)
         if request_prefers_json(request):
-            operation = await create_operation(
+            operation = await enqueue_mutation(
                 settings,
-                kind="clone_backend",
-                actor="ui",
-                backend_id=backend.id,
-                phase="queued",
+                "clone_backend",
                 details=_operation_progress_details(
                     "clone",
                     0,
@@ -545,11 +510,6 @@ async def clone_backend_form(
                     phase="Clone output",
                     clone_name=payload.name,
                 ),
-            )
-            await enqueue_mutation(
-                settings,
-                operation.id,
-                "clone_backend",
                 backend_id=backend.id,
                 name=name,
                 port=port,
@@ -642,12 +602,9 @@ async def transfer_backend_form(
             {"flash_error": host_mutation_blocked_message("Transfer", blocker)},
             status_code=409,
         )
-    operation = await create_operation(
+    operation = await enqueue_mutation(
         settings,
-        kind="transfer_backend",
-        actor="ui",
-        backend_id=backend.id,
-        phase="queued",
+        "transfer_backend",
         details=_operation_progress_details(
             "transferOutput",
             0,
@@ -657,11 +614,6 @@ async def transfer_backend_form(
             target_node=target_node,
             transfer_mode=transfer_mode,
         ),
-    )
-    await enqueue_mutation(
-        settings,
-        operation.id,
-        "transfer_backend",
         backend_id=backend.id,
         target_node=target_node,
         pause_source=transfer_mode == "pause",
@@ -714,12 +666,9 @@ async def setup_backend_replica_form(
             {"flash_error": host_mutation_blocked_message("Replica setup", blocker)},
             status_code=409,
         )
-    operation = await create_operation(
+    operation = await enqueue_mutation(
         settings,
-        kind="setup_backend_replica",
-        actor="ui",
-        backend_id=backend.id,
-        phase="queued",
+        "setup_backend_replica",
         details=_operation_progress_details(
             "replicaSetup",
             0,
@@ -729,11 +678,6 @@ async def setup_backend_replica_form(
             target_node=target_node,
             setup_mode=normalized_mode,
         ),
-    )
-    await enqueue_mutation(
-        settings,
-        operation.id,
-        "setup_backend_replica",
         backend_id=backend.id,
         target_node=target_node,
         setup_mode=normalized_mode,
@@ -864,6 +808,7 @@ async def update_backend_placement_form(
             backend_id=backend.id,
             interfaces=inter_app_interfaces,
         )
+        was_local = backend_has_local_runtime(backend)
         apply_backend_placement(
             backend,
             enabled=enabled,
@@ -887,6 +832,7 @@ async def update_backend_placement_form(
             change=ConfigChange(
                 kind="ui.backend.placement",
                 outputs=frozenset({str(backend.name or ""), *interface_peers}),
+                rebalance_resources=was_local != backend_has_local_runtime(backend),
             ),
             apply_runner=run_apply,
         )

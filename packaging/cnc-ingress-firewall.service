@@ -1,0 +1,16 @@
+[Unit]
+Description=CNC ingress network firewall
+After=ufw.service
+Before=cnc-ingress-network.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=true
+EnvironmentFile=-/etc/cnc.env
+WorkingDirectory=/var/lib/cnc/current
+ExecStart=/var/lib/cnc/current/.venv/bin/python -m app.services.nginx_firewall
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+TimeoutStartSec=60

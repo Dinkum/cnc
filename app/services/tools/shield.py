@@ -4,8 +4,10 @@ from __future__ import annotations
 from typing import Any
 
 from app.config import Settings
+from app.services import nginx_runtime
 from app.services.apply_core import DesiredState
 from app.services.commands import CommandError, run_command
+from app.services.nginx_contract import nginx_gateway_enabled
 from app.services.shield_runtime import (
     SHIELD_CONTAINER_SERVICE,
     remove_shield_runtime_assets,
@@ -41,6 +43,10 @@ async def shield(plan: Plan) -> bool:
         }
         return False
     plan.touching(tool_name)
+    if plan.desired.shield_required and nginx_gateway_enabled(
+        plan.settings, container_mode=plan.desired.nginx_container
+    ):
+        await nginx_runtime.ensure_nginx_network(plan)
     plan.details["shield_runtime"] = await _reconcile(
         plan.desired, plan.settings, services=plan.services
     )
@@ -64,7 +70,9 @@ def converged(
     if not desired.shield_required:
         return not _assets_exist(settings)
     expected_files = {
-        shield_quadlet_path(settings): render_shield_quadlet(settings),
+        shield_quadlet_path(settings): render_shield_quadlet(
+            settings, nginx_container=desired.nginx_container
+        ),
         settings.shield_env_file_path: render_shield_env(settings),
         settings.shield_config_path: render_shield_config(
             desired.shield_output_code_hashes
@@ -117,6 +125,7 @@ async def _reconcile(
     result = write_shield_runtime_assets(
         settings,
         output_code_hashes=desired.shield_output_code_hashes,
+        nginx_container=desired.nginx_container,
     )
     await services.runtime_services.run_command_checked_async(
         ["systemctl", "daemon-reload"],

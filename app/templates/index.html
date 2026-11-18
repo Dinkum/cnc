@@ -117,6 +117,7 @@
     </section>
 
     <section class="panel" data-panel="inputs" data-loaded="{{ '1' if initial_tab == 'inputs' else '0' }}"{% if initial_tab != "inputs" %} hidden{% endif %}>
+      {% if initial_tab == "inputs" %}
       <article class="card">
         <div class="section-head">
           <h2>Inputs</h2>
@@ -352,6 +353,7 @@
           </table>
         </div>
       </article>
+      {% endif %}
     </section>
 
     {% if beta_routing %}
@@ -372,6 +374,7 @@
     {% endif %}
 
     <section class="panel" data-panel="outputs" data-loaded="{{ '1' if initial_tab == 'outputs' else '0' }}"{% if initial_tab != "outputs" %} hidden{% endif %}>
+      {% if initial_tab == "outputs" %}
       <article class="card">
         <div class="section-head">
           <h2>Outputs</h2>
@@ -551,6 +554,7 @@
           </table>
         </div>
       </article>
+      {% endif %}
     </section>
 
     <section class="panel" data-panel="settings" data-loaded="{{ '1' if initial_tab == 'settings' else '0' }}"{% if initial_tab != "settings" %} hidden{% endif %}>

@@ -70,6 +70,7 @@ from app.services.bootstrap_state import (
 )
 from app.services.commands import CommandError, CommandResult
 from app.services.container_runtime import classify_listing
+from app.services.nginx_contract import GATEWAY, nginx_gateway_enabled
 from app.services.observation import (
     Observation,
     ObservationUnavailable,
@@ -232,6 +233,7 @@ async def apply_app_backends(
             desired_interface_network_names,
             settings,
             services=services,
+            scoped_to=removable_backend_names,
         )
         cleanup["networks_removed"].extend(interface_cleanup["networks_removed"])
         cleanup["quadlet_files_removed"].extend(
@@ -260,6 +262,7 @@ async def apply_app_backends(
                 settings,
                 base_profile=desired.resource_profile,
                 inter_app_interfaces=backend_interface_links,
+                nginx_container=desired.nginx_container,
                 services=services,
                 operation_id=operation_id,
             )
@@ -399,6 +402,7 @@ async def _cleanup_deleted_app_runtime(
         desired_interface_network_names,
         settings,
         services=services,
+        scoped_to=removable_backend_names,
     )
 
     for entry in _managed_podman_entries(
@@ -519,6 +523,7 @@ async def _cleanup_stale_interface_runtime(
     settings: Settings,
     *,
     services: AppRuntimeServices,
+    scoped_to: set[str] | None = None,
 ) -> dict[str, list[str]]:
     networks_removed: list[str] = []
     quadlet_files_removed: list[str] = []
@@ -538,6 +543,11 @@ async def _cleanup_stale_interface_runtime(
     ):
         if _entry_label(entry, "io.cnc.kind") != "interface":
             continue
+        if scoped_to is not None and not any(
+            _entry_label(entry, key) in scoped_to
+            for key in ("io.cnc.source_backend", "io.cnc.target_backend")
+        ):
+            continue
         target = _entry_primary_name(entry) or _entry_id(entry)
         if not target or target in desired_interface_network_names:
             continue
@@ -549,7 +559,7 @@ async def _cleanup_stale_interface_runtime(
         networks_removed.append(target)
 
     for network in sorted(
-        managed_quadlet_interface_network_names(settings)
+        managed_quadlet_interface_network_names(settings, scoped_to=scoped_to)
         - desired_interface_network_names
     ):
         quadlet_files_removed.extend(remove_interface_quadlet_asset(settings, network))
@@ -782,6 +792,7 @@ async def _reconcile_app_quadlet_assets(
     *,
     base_profile: ResourceProfile,
     inter_app_interfaces: tuple[RuntimeInterAppInterface, ...] = (),
+    nginx_container: bool = False,
     services: AppRuntimeServices,
 ) -> dict[str, Any]:
     asset_paths = {
@@ -801,6 +812,7 @@ async def _reconcile_app_quadlet_assets(
             settings,
             base_profile=base_profile,
             inter_app_interfaces=inter_app_interfaces,
+            nginx_container=nginx_container,
         )
     except AppQuadletWriteError as exc:
         raise ApplyFailed(
@@ -1943,6 +1955,7 @@ class AppRuntimeReconciler:
         *,
         base_profile: ResourceProfile,
         inter_app_interfaces: tuple[RuntimeInterAppInterface, ...] = (),
+        nginx_container: bool = False,
         services: AppRuntimeServices | None = None,
         operation_id: int | None = None,
     ) -> None:
@@ -1950,6 +1963,7 @@ class AppRuntimeReconciler:
         self.settings = settings
         self.base_profile = base_profile
         self.inter_app_interfaces = inter_app_interfaces
+        self.nginx_container = nginx_container
         self.services = services or default_app_runtime_services()
         self.operation_id = operation_id
         self.container = container_name(backend.name)
@@ -2250,11 +2264,27 @@ class AppRuntimeReconciler:
         guest_state_preexisting = _sandbox_dir_has_runtime_artifacts(
             app_sandbox_rootfs_path(self.settings, self.backend.name).parent
         )
+        gateway_binding_changes = False
+        existing_unit = quadlet_container_path(self.settings, self.backend.name)
+        if container_exists and existing_unit.is_file():
+            expected_gateway_binding = nginx_gateway_enabled(
+                self.settings, container_mode=self.nginx_container
+            )
+            current_gateway_binding = any(
+                line.startswith(f"PublishPort={GATEWAY}:")
+                for line in existing_unit.read_text(encoding="utf-8").splitlines()
+            )
+            gateway_binding_changes = current_gateway_binding != expected_gateway_binding
         if (
             container_exists
-            and self.saved_spec is not None
-            and self.saved_spec.get("guest_isolation_revision")
-            != self.current_spec.get("guest_isolation_revision")
+            and (
+                gateway_binding_changes
+                or (
+                    self.saved_spec is not None
+                    and self.saved_spec.get("guest_isolation_revision")
+                    != self.current_spec.get("guest_isolation_revision")
+                )
+            )
         ):
             self._save_previous_isolation_runtime()
         network_exists = self.network_payload is not None
@@ -2413,6 +2443,7 @@ class AppRuntimeReconciler:
                 self.settings,
                 base_profile=self.base_profile,
                 inter_app_interfaces=self.inter_app_interfaces,
+                nginx_container=self.nginx_container,
                 services=self.services,
             )
             _record_app_reconcile_step(
@@ -2466,6 +2497,7 @@ class AppRuntimeReconciler:
                 self.settings,
                 base_profile=self.base_profile,
                 inter_app_interfaces=self.inter_app_interfaces,
+                nginx_container=self.nginx_container,
                 services=self.services,
             )
             if quadlet_details["container_restart_required"]:
@@ -2492,6 +2524,8 @@ class AppRuntimeReconciler:
                     **restart_fields,
                 )
                 try:
+                    if self._isolation_rollback_files:
+                        self._isolation_migration_started = True
                     await _restart_app_quadlet_backend(
                         self.backend,
                         self.settings,
@@ -2578,6 +2612,7 @@ class AppRuntimeReconciler:
                         self.settings,
                         base_profile=self.base_profile,
                         inter_app_interfaces=self.inter_app_interfaces,
+                        nginx_container=self.nginx_container,
                         services=self.services,
                     )
                     _record_app_reconcile_step(

@@ -16,6 +16,7 @@ PACKAGING_DIR = REPO_ROOT / "packaging"
 SYSTEMD_UNIT_DIR = Path("/etc/systemd/system")
 MANAGED_SYSTEMD_ASSETS = (
     ("cnc-cloudflare-tunnel.service", "cnc-cloudflare-tunnel.service"),
+    ("cnc-ingress-firewall.service", "cnc-ingress-firewall.service"),
     ("cnc-admin.service", "cnc-admin.service"),
     ("cnc-auto-size.service", "cnc-auto-size.service"),
     ("cnc-auto-size.timer", "cnc-auto-size.timer"),

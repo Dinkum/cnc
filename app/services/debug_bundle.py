@@ -29,6 +29,7 @@ from app.models.entities import (
     UpdateCheck,
     UpdateRun,
 )
+from app.services.nginx_runtime import active_routes_directory
 from app.services.update_service import current_app_version
 
 
@@ -780,7 +781,7 @@ def _support_host_payload(settings: Settings) -> dict[str, Any]:
             "paths": {
                 "log_path": str(settings.log_path),
                 "managed_env": str(settings.managed_env_file_path),
-                "nginx_generated": str(settings.nginx_generated_dir),
+                "nginx_generated": str(active_routes_directory(settings)),
                 "apply_backup_dir": str(settings.apply_backup_dir),
                 "backend_backup_dir": str(settings.backend_backup_dir),
                 "app_control_dir": str(settings.app_control_dir),

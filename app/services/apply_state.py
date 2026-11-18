@@ -10,6 +10,8 @@ from sqlalchemy.orm import selectinload
 
 from app.services.hardening_policy import read_hardening_policy
 from app.config import Settings
+from app.services import nginx_runtime
+from app.services.change_scope import Scope, ToolScope
 from app.services.cloudflare_connection import section
 from app.services.cloudflare_tunnel import TUNNEL_METRICS_PORT, TUNNEL_ORIGIN_PORT
 from app.logger import get_logger
@@ -29,6 +31,10 @@ from app.services.inter_app_interfaces import (
     read_inter_app_interfaces,
 )
 from app.services.netdata_constants import NETDATA_SERVICE_NAME
+from app.services.nginx_contract import (
+    GATEWAY,
+    container_ingress_enabled,
+)
 from app.services.placement_config import (
     LOCAL_NODE_UID,
     PLACEMENT_MODE_FAILOVER,
@@ -50,6 +56,7 @@ from app.services.renderers import (
     render_nginx_https_default,
     render_nginx_shield_closed,
     render_nginx_static,
+    render_nginx_tunnel_default,
     safe_slug,
 )
 from app.services.resource_profile import build_resource_profile
@@ -365,6 +372,8 @@ def _render_route_target(
     attached_backends: list[Backend],
     settings: Settings,
     nodes_by_uid: dict[str, ClusterNode],
+    *,
+    nginx_container: bool,
 ) -> str:
     if not attached_backends:
         return "no outputs attached"
@@ -381,6 +390,12 @@ def _render_route_target(
             return (
                 f"{_tailnet_service_route_label(input_value, settings)} -> http://"
                 f"{_backend_upstream_target(primary_backend, nodes_by_uid, multi_node_enabled=settings.multi_node_enabled)}"
+            )
+        if nginx_container:
+            return ", ".join(
+                f"http://{GATEWAY}:{backend.port}"
+                for backend in attached_backends
+                if backend.port is not None
             )
         return ", ".join(
             f"http://{_backend_upstream_target(backend, nodes_by_uid, multi_node_enabled=settings.multi_node_enabled)}"
@@ -476,6 +491,8 @@ def _route_contracts(
     tailscale_service_to_backends: dict[str, list[Backend]],
     settings: Settings,
     nodes_by_uid: dict[str, ClusterNode],
+    *,
+    nginx_container: bool,
 ) -> list[dict[str, object]]:
     contracts: list[dict[str, object]] = []
     for item in inputs:
@@ -500,7 +517,12 @@ def _route_contracts(
                 "https_provider": item.https_provider or "self_signed",
                 "backend_names": [backend.name for backend in attached_backends],
                 "target": _render_route_target(
-                    input_kind, input_value, attached_backends, settings, nodes_by_uid
+                    input_kind,
+                    input_value,
+                    attached_backends,
+                    settings,
+                    nodes_by_uid,
+                    nginx_container=nginx_container,
                 ),
             }
         )
@@ -675,6 +697,7 @@ def _build_cluster_follower_ingress(
             ) from exc
 
     static_replicas: dict[str, dict[str, str]] = {}
+    static_hashes: dict[Path, str] = {}
     app_node_files: dict[str, dict[str, str]] = {}
     admin_node_files: dict[str, dict[str, str]] = {}
     shield_target = f"{leader_ip}:{SHIELD_PORT}" if leader_ip else ""
@@ -766,17 +789,17 @@ def _build_cluster_follower_ingress(
                         shield_ready=shield_ready,
                     )
                 )
-                content_hash = _hash_static_root(
-                    static_root,
-                    backend=primary_backend,
-                    hostname=hostname,
-                )
+                root = Path(static_root)
+                if root not in static_hashes:
+                    static_hashes[root] = _hash_static_root(
+                        static_root, backend=primary_backend, hostname=hostname
+                    )
                 replica_root = _static_replica_root(primary_backend)
                 static_replicas[primary_backend.name] = {
                     "backend": primary_backend.name,
                     "source_root": static_root,
                     "replica_root": replica_root,
-                    "content_hash": content_hash,
+                    "content_hash": static_hashes[root],
                 }
                 app_files[filename] = render_nginx_static(
                     hostname,
@@ -808,7 +831,7 @@ def _build_cluster_follower_ingress(
 
 
 async def build_desired_state(
-    session: AsyncSession, settings: Settings
+    session: AsyncSession, settings: Settings, *, scope: Scope = Scope.everything()
 ) -> DesiredState:
     backends = (
         (await session.execute(select(Backend).options(selectinload(Backend.inputs))))
@@ -846,6 +869,12 @@ async def build_desired_state(
     )
 
     enabled_backends = [backend for backend in backends if backend.enabled]
+    nginx_container = container_ingress_enabled(settings, scope)
+    if nginx_container and any(
+        backend.kind == "app" and not _backend_is_local(backend, multi_node_enabled=False)
+        for backend in enabled_backends
+    ):
+        nginx_container = False
     enabled_runtime_backends = [
         backend
         for backend in enabled_backends
@@ -892,7 +921,14 @@ async def build_desired_state(
 
     try:
         allocate_ports(
-            runtime_backends, settings.port_range_start, settings.port_range_end
+            [
+                b
+                for b in runtime_backends
+                if b.port is not None
+                or (ToolScope.PODMAN in scope.tools and scope.covers(b.name))
+            ],
+            settings.port_range_start,
+            settings.port_range_end,
         )
     except PortAllocationError as exc:
         raise ApplyFailed(str(exc), phase="allocate_ports") from exc
@@ -903,8 +939,6 @@ async def build_desired_state(
     ):
         await session.flush()
 
-    await _validate_remote_placement_readiness(session, settings, backends)
-
     try:
         validated_bindings = validate_input_bindings(inputs)
     except ValidationError as exc:
@@ -914,7 +948,20 @@ async def build_desired_state(
     hostname_to_input: dict[str, Input] = {}
     tailscale_path_to_backends: dict[str, list[Backend]] = {}
     tailscale_service_to_backends: dict[str, list[Backend]] = {}
+    published_backend_ids: set[int] = set()
     for binding in validated_bindings:
+        public = binding.input_kind in {"domain", "shield"}
+        if public and ToolScope.NGINX not in scope.tools:
+            continue
+        if not public and ToolScope.TAILSCALE not in scope.tools:
+            continue
+        for backend in binding.attached_enabled_backends:
+            published_backend_ids.add(backend.id)
+            if backend.kind == "app" and backend.port is None:
+                raise ApplyFailed(
+                    f"Output {backend.name} needs a host port before publishing a route. Run host reconcile.",
+                    phase="allocate_ports",
+                )
         if binding.input_kind in {"domain", "shield"}:
             hostname_to_backends[binding.input_value] = (
                 binding.attached_enabled_backends
@@ -939,9 +986,28 @@ async def build_desired_state(
                 binding.attached_enabled_backends
             )
 
+    if settings.multi_node_enabled:
+        runtime_selected = ToolScope.PODMAN in scope.tools
+        await _validate_remote_placement_readiness(
+            session,
+            settings,
+            [
+                b
+                for b in backends
+                if scope.is_full
+                or b.id in published_backend_ids
+                or (runtime_selected and scope.covers(b.name))
+            ],
+        )
+
     shield_ready = _shield_prerequisites_ready(inputs)
     shield_output_code_hashes: dict[str, str] = {}
     nginx_files: dict[str, str] = {}
+    nginx_backend_ports: set[int] = set()
+    nginx_static_roots: set[str] = set()
+    nginx_public_http = False
+    nginx_public_https = False
+    nginx_tunnel = False
     domain_states = section(settings, "cloudflare_domains")
     for hostname, attached_backends in hostname_to_backends.items():
         route_input = hostname_to_input.get(hostname)
@@ -955,39 +1021,7 @@ async def build_desired_state(
             )
         filename = nginx_filename(hostname)
         primary_backend = attached_backends[0]
-        if primary_backend.kind == "app":
-            route_input = hostname_to_input.get(hostname)
-            shield_enabled, shield_route_key, shield_code_hash = _route_shield_config(
-                item=route_input
-                or Input(kind="domain", hostname=hostname, enabled=True),
-                attached_backends=attached_backends,
-                shield_ready=shield_ready,
-            )
-            if shield_enabled and shield_code_hash:
-                shield_output_code_hashes[shield_route_key] = shield_code_hash
-            nginx_files[filename] = render_nginx_http(
-                hostname,
-                [
-                    target
-                    for backend in attached_backends
-                    for target in _backend_upstream_targets(
-                        backend,
-                        nodes_by_uid,
-                        multi_node_enabled=settings.multi_node_enabled,
-                    )
-                    if backend.port is not None
-                ],
-                cloudflare_only=settings.nginx_cloudflare_only,
-                cloudflare_ips=ingress_allow_ips,
-                tunnel=is_tunnel,
-                tls_certificate=input_certificate_path(
-                    route_input, settings.app_control_dir
-                ),
-                shield_enabled=shield_enabled,
-                shield_port=SHIELD_PORT,
-                shield_output_key=shield_route_key,
-            )
-        elif primary_backend.kind == "shield":
+        if primary_backend.kind == "shield":
             if len(attached_backends) != 1:
                 raise ApplyFailed(
                     f"shield input {hostname} must attach exactly one shield output",
@@ -998,7 +1032,37 @@ async def build_desired_state(
                 hostname,
                 cloudflare_only=settings.nginx_cloudflare_only,
                 cloudflare_ips=ingress_allow_ips,
+                nginx_container=nginx_container,
             )
+            continue
+
+        shield_enabled, shield_route_key, shield_code_hash = _route_shield_config(
+            item=route_input or Input(kind="domain", hostname=hostname, enabled=True),
+            attached_backends=attached_backends,
+            shield_ready=shield_ready,
+        )
+        if shield_enabled and shield_code_hash:
+            shield_output_code_hashes[shield_route_key] = shield_code_hash
+        if shield_enabled and nginx_container:
+            nginx_backend_ports.add(settings.shield_port)
+
+        if primary_backend.kind == "app":
+            render_route = render_nginx_http
+            route_ports = [b.port for b in attached_backends if b.port is not None]
+            if nginx_container:
+                nginx_backend_ports.update(route_ports)
+                route_target = [f"{GATEWAY}:{port}" for port in route_ports]
+            else:
+                route_target = [
+                    target
+                    for backend in attached_backends
+                    if backend.port is not None
+                    for target in _backend_upstream_targets(
+                        backend,
+                        nodes_by_uid,
+                        multi_node_enabled=settings.multi_node_enabled,
+                    )
+                ]
         else:
             if not primary_backend.static_root:
                 raise ApplyFailed(
@@ -1006,28 +1070,34 @@ async def build_desired_state(
                     phase="render_nginx",
                     details={"backend": primary_backend.name, "hostname": hostname},
                 )
-            route_input = hostname_to_input.get(hostname)
-            shield_enabled, shield_route_key, shield_code_hash = _route_shield_config(
-                item=route_input
-                or Input(kind="domain", hostname=hostname, enabled=True),
-                attached_backends=attached_backends,
-                shield_ready=shield_ready,
-            )
-            if shield_enabled and shield_code_hash:
-                shield_output_code_hashes[shield_route_key] = shield_code_hash
-            nginx_files[filename] = render_nginx_static(
-                hostname,
-                primary_backend.static_root,
-                cloudflare_only=settings.nginx_cloudflare_only,
-                cloudflare_ips=ingress_allow_ips,
-                tunnel=is_tunnel,
-                tls_certificate=input_certificate_path(
-                    route_input, settings.app_control_dir
-                ),
-                shield_enabled=shield_enabled,
-                shield_port=SHIELD_PORT,
-                shield_output_key=shield_route_key,
-            )
+            render_route = render_nginx_static
+            route_target = primary_backend.static_root
+            if nginx_container:
+                nginx_static_roots.add(route_target)
+                route_target = nginx_runtime.nginx_static_target(route_target)
+
+        origin_certificate = input_certificate_path(route_input, settings.app_control_dir)
+        route_options = dict(
+            cloudflare_only=settings.nginx_cloudflare_only,
+            cloudflare_ips=ingress_allow_ips,
+            shield_enabled=shield_enabled,
+            shield_port=settings.shield_port,
+            shield_target=(
+                f"{GATEWAY}:{settings.shield_port}" if nginx_container else None
+            ),
+            shield_output_key=shield_route_key,
+            nginx_container=nginx_container,
+        )
+        nginx_files[filename] = render_route(
+            hostname,
+            route_target,
+            tunnel=is_tunnel,
+            tls_certificate=origin_certificate,
+            **route_options,
+        )
+        nginx_public_http |= not is_tunnel
+        nginx_public_https |= bool(origin_certificate) and not is_tunnel
+        nginx_tunnel |= is_tunnel
 
         transition = (
             domain_states.get(str(route_input.id), {})
@@ -1036,59 +1106,38 @@ async def build_desired_state(
         )
         previous = transition.get("previous_connection")
         if (
-            transition.get("hostname") == hostname
+            route_input is not None
+            and transition.get("hostname") == hostname
             and transition.get("pending_dns")
             and transition.get("keep_previous_connection")
             and previous in {"public_ip", "cloudflare_tunnel"}
             and previous != route_input.connection
-            and primary_backend.kind in {"app", "static"}
         ):
             previous_tunnel = previous == "cloudflare_tunnel"
-            options = dict(
-                cloudflare_only=settings.nginx_cloudflare_only,
-                cloudflare_ips=ingress_allow_ips,
+            previous_certificate = input_certificate_path(
+                route_input, settings.app_control_dir, connection=previous
+            )
+            nginx_files["cnc-transition-" + filename] = render_route(
+                hostname,
+                route_target,
                 tunnel=previous_tunnel,
                 upstream_suffix="_previous",
-                tls_certificate=input_certificate_path(
-                    route_input, settings.app_control_dir, connection=previous
-                ),
-                shield_enabled=shield_enabled,
-                shield_port=SHIELD_PORT,
-                shield_output_key=shield_route_key,
+                tls_certificate=previous_certificate,
+                **route_options,
             )
-            nginx_files["cnc-transition-" + filename] = (
-                render_nginx_http(
-                    hostname,
-                    [
-                        target
-                        for backend in attached_backends
-                        for target in _backend_upstream_targets(
-                            backend,
-                            nodes_by_uid,
-                            multi_node_enabled=settings.multi_node_enabled,
-                        )
-                        if backend.port is not None
-                    ],
-                    **options,
-                )
-                if primary_backend.kind == "app"
-                else render_nginx_static(
-                    hostname, primary_backend.static_root, **options
-                )
-            )
+            nginx_public_http |= not previous_tunnel
+            nginx_public_https |= bool(previous_certificate) and not previous_tunnel
+            nginx_tunnel |= previous_tunnel
 
-    if any(
-        f"listen 127.0.0.1:{TUNNEL_ORIGIN_PORT};" in config
-        for config in nginx_files.values()
-    ):
-        nginx_files["cnc-tunnel-default.conf"] = (
-            f"server {{\n    listen 127.0.0.1:{TUNNEL_ORIGIN_PORT} default_server;\n"
-            "    server_name _;\n    return 404;\n}\n"
+    if nginx_tunnel:
+        nginx_files["cnc-tunnel-default.conf"] = render_nginx_tunnel_default(
+            nginx_container=nginx_container,
         )
-    if any("listen 443 ssl;" in content for content in nginx_files.values()):
+    if nginx_public_https:
         nginx_files["cnc-origin-https-default.conf"] = render_nginx_https_default(
             cloudflare_only=settings.nginx_cloudflare_only,
             cloudflare_ips=ingress_allow_ips,
+            nginx_container=nginx_container,
         )
 
     (
@@ -1098,7 +1147,7 @@ async def build_desired_state(
         static_replicas,
     ) = _build_cluster_follower_ingress(
         settings=settings,
-        cluster_nodes=list(cluster_nodes),
+        cluster_nodes=list(cluster_nodes) if ToolScope.CLUSTER in scope.tools else [],
         hostname_to_backends=hostname_to_backends,
         hostname_to_input=hostname_to_input,
         shield_ready=shield_ready,
@@ -1126,7 +1175,7 @@ async def build_desired_state(
             tailscale_services[service] = _static_tailnet_target(
                 primary_backend, service
             )
-    if settings.netdata_enabled:
+    if settings.netdata_enabled and ToolScope.TAILSCALE in scope.tools:
         tailscale_services[NETDATA_SERVICE_NAME] = (
             f"http://127.0.0.1:{settings.netdata_port}"
         )
@@ -1150,11 +1199,18 @@ async def build_desired_state(
         tailscale_service_to_backends,
         settings,
         nodes_by_uid,
+        nginx_container=nginx_container,
     )
     backend_contracts = _backend_contracts(backends)
 
     return DesiredState(
         nginx_files=nginx_files,
+        nginx_container=nginx_container,
+        nginx_backend_ports=tuple(sorted(nginx_backend_ports)),
+        nginx_static_roots=tuple(sorted(nginx_static_roots)),
+        nginx_public_http=nginx_public_http,
+        nginx_public_https=nginx_public_https,
+        nginx_tunnel=nginx_tunnel,
         tailscale_paths=tailscale_paths,
         tailscale_services=tailscale_services,
         enabled_app_backends=enabled_app_backends,

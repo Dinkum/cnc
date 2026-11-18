@@ -86,9 +86,10 @@ def _write_file_atomic(path: Path, content: str, mode: int) -> bool:
 def _snapshot_file(
     path: Path,
 ) -> tuple[bytes | None, int | None, int | None, int | None]:
-    if not path.exists():
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
         return None, None, None, None
-    stat = path.stat()
     return path.read_bytes(), stat.st_mode & 0o777, stat.st_uid, stat.st_gid
 
 
@@ -492,7 +493,11 @@ async def reconcile_backend_ssh_access(
             settings.ssh_backend_root_wrapper_path,
             settings.ssh_backend_sshd_config_path,
             settings.ssh_backend_sudoers_path,
-            *(_backend_authorized_keys_path(settings, name) for name in desired),
+            *(
+                _backend_authorized_keys_path(settings, name)
+                for name in desired
+                if scoped_to is None or name in scoped_to
+            ),
         )
         previous_files = {path: _snapshot_file(path) for path in managed_paths}
         sudoers_content = _sudoers_config(settings)

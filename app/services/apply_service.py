@@ -18,9 +18,9 @@ from app.services.app_containers import (
 )
 from app.services.thread_workers import run_to_completion
 from app.services.tools import TOOLS
+from app.services.change_scope import Scope, ToolScope
 from app.services.tools.core import (
     Plan,
-    Scope,
     converge,
     record_unwind_outcome,
     unwind_plan,
@@ -53,6 +53,7 @@ from app.services.commands import (
 )
 from app.services.control_events import emit_control_event
 from app.services.error_reporting import CNCError, ErrorCode
+from app.services.host_journal import commit_verified
 from app.services.history_retention import prune_control_plane_history
 from app.services.notifications import (
     admin_dashboard_url,
@@ -84,19 +85,16 @@ logger = get_logger("apply")
 MANAGED_PREFIX = "cnc-"
 ApplyProgressPlanCallback = Callable[[DesiredState], Awaitable[None] | None]
 ApplyProgressCallback = Callable[[str, str], Awaitable[None] | None]
-APPLY_PHASE_ORDER = (
-    "app_runtime",
-    "ssh_access",
-    "sync_files",
-    "nginx_validate",
-    "nginx_reload",
-    "cloudflare_tunnel",
-    "cluster_followers",
-    "tailscale_paths",
-    "tailscale_services",
-    "tailscale_admin_verify",
-    "control_plane_self_audit",
-)
+def _phase_order(tools: ToolScope) -> list[str]:
+    phases = [
+        phase
+        for tool in TOOLS
+        if tools.includes(tool.tool_name)
+        for phase in tool.phases
+    ]
+    if ToolScope.TAILSCALE in tools:
+        phases.append("tailscale_admin_verify")
+    return [*phases, "control_plane_self_audit"]
 
 
 @dataclass
@@ -127,7 +125,7 @@ class ApplyServices:
     verify_tailscale_admin_exposure: Callable[[Settings], dict[str, Any]] = field(
         default_factory=lambda: verify_tailscale_admin_exposure
     )
-    run_control_plane_self_audit: Callable[[Settings], dict[str, Any]] = field(
+    run_control_plane_self_audit: Callable[..., dict[str, Any]] = field(
         default_factory=lambda: run_control_plane_self_audit
     )
     progress_callback: ApplyProgressCallback | None = None
@@ -368,6 +366,7 @@ async def run_apply(
     recovery: list[Any] | None = None,
 ) -> ApplyResponse:
     services = services or default_apply_services()
+    scope = scope or Scope.everything()
     if recovery is None:
         recovery = []
     apply_operation = (
@@ -391,7 +390,7 @@ async def run_apply(
                     await _emit_apply_progress(
                         services, "Save desired state", "Building host plan"
                     )
-                    desired = await build_desired_state(session, settings)
+                    desired = await build_desired_state(session, settings, scope=scope)
                     log_operation.step(
                         "apply.desired_state.ready",
                         nginx_files=len(desired.nginx_files),
@@ -399,23 +398,27 @@ async def run_apply(
                     )
                     desired_record = _desired_state_record(desired)
                     await _emit_apply_progress_plan(services, desired)
-                    tailscale_service_host_precheck = (
-                        tailscale_service_host_precheck_skip_details(
-                            desired,
-                            settings,
-                        )
-                    )
-                    if tailscale_service_host_precheck_required(desired, settings):
-                        await _emit_apply_progress(
-                            services, "Prepare host", "Checking tailnet service host"
-                        )
+                    skipped = {"skipped": True, "reason": "outside change scope"}
+                    tailscale_service_host_precheck = skipped
+                    if ToolScope.TAILSCALE in scope.tools:
                         tailscale_service_host_precheck = (
-                            await verify_tailscale_service_host_precheck(
-                                desired.tailscale_services,
-                                settings,
-                                services=services,
+                            tailscale_service_host_precheck_skip_details(
+                                desired, settings
                             )
                         )
+                        if tailscale_service_host_precheck_required(desired, settings):
+                            await _emit_apply_progress(
+                                services,
+                                "Prepare host",
+                                "Checking tailnet service host",
+                            )
+                            tailscale_service_host_precheck = (
+                                await verify_tailscale_service_host_precheck(
+                                    desired.tailscale_services,
+                                    settings,
+                                    services=services,
+                                )
+                            )
                     await operation.update(
                         config_revision=desired_record.config_revision,
                         desired_state_hash=desired_record.desired_state_hash,
@@ -424,38 +427,42 @@ async def run_apply(
                             "desired_state_hash": desired_record.desired_state_hash,
                         },
                     )
-                    try:
+                    runtime_assets = skipped
+                    if scope.tools is ToolScope.HOST:
+                        try:
+                            await _emit_apply_progress(
+                                services,
+                                "Prepare host",
+                                "Reconciling CNC runtime assets",
+                            )
+                            runtime_assets = await asyncio.to_thread(
+                                services.reconcile_managed_systemd_assets, settings
+                            )
+                        except Exception as exc:
+                            raise ApplyFailed(
+                                "managed runtime asset reconcile failed",
+                                phase="runtime_assets",
+                                details={
+                                    "error": str(exc),
+                                    "failure_mode": "partial",
+                                    "manual_review_required": True,
+                                    "operator_action": "inspect systemd unit drift and rerun apply",
+                                },
+                            ) from exc
+                    admin_exposure_precheck = skipped
+                    if ToolScope.TAILSCALE in scope.tools:
                         await _emit_apply_progress(
-                            services,
-                            "Prepare host",
-                            "Reconciling CNC runtime assets",
+                            services, "Prepare host", "Checking admin exposure"
                         )
-                        runtime_assets = await asyncio.to_thread(
-                            services.reconcile_managed_systemd_assets, settings
+                        admin_exposure_precheck = await asyncio.to_thread(
+                            services.verify_tailscale_admin_exposure,
+                            settings,
                         )
-                    except Exception as exc:
-                        raise ApplyFailed(
-                            "managed runtime asset reconcile failed",
-                            phase="runtime_assets",
-                            details={
-                                "error": str(exc),
-                                "failure_mode": "partial",
-                                "manual_review_required": True,
-                                "operator_action": "inspect systemd unit drift and rerun apply",
-                            },
-                        ) from exc
-                    await _emit_apply_progress(
-                        services, "Prepare host", "Checking admin exposure"
-                    )
-                    admin_exposure_precheck = await asyncio.to_thread(
-                        services.verify_tailscale_admin_exposure,
-                        settings,
-                    )
                     details = await _apply_desired_state(
                         desired,
                         settings,
                         services=services,
-                        scope=scope or Scope.everything(),
+                        scope=scope,
                         recovery=recovery,
                         operation_id=operation.id,
                     )
@@ -503,24 +510,59 @@ async def run_apply(
                     session.add(run)
                     await session.flush()
                     await session.refresh(run)
-                    await _record_last_applied_state(
-                        session,
-                        run=run,
-                        operation_id=operation.id,
-                        desired_state=desired_record,
-                    )
+                    if scope.tools is ToolScope.HOST and scope.is_full:
+                        await _record_last_applied_state(
+                            session,
+                            run=run,
+                            operation_id=operation.id,
+                            desired_state=desired_record,
+                        )
                     await prune_control_plane_history(session)
+                    run_id, created_at = run.id, run.created_at
                     if commit_on_success:
-                        await session.commit()
-                        # From here the apply is durable. A reporting failure
-                        # below must not unwind the host or record a failure.
+                        commit = await commit_verified(
+                            session, settings, ApplyRun, run_id
+                        )
+                        if commit.error:
+                            response_details.update(
+                                commit_outcome=commit.outcome, commit_error=commit.error
+                            )
+                        if commit.outcome == "unknown":
+                            details = {
+                                **response_details,
+                                "phase": "database_commit",
+                                "error": commit.error,
+                                "failure_mode": "partial",
+                                "manual_review_required": True,
+                                "operator_action": "Verify the saved configuration before retrying.",
+                                "apply_run_id": run_id,
+                            }
+                            committed_response = ApplyResponse(
+                                status="error",
+                                message="Cannot verify database commit",
+                                details=details,
+                                run_id=run_id,
+                            )
+                            await operation.complete(
+                                "partial",
+                                phase="database_commit",
+                                error=commit.error,
+                                details=details,
+                            )
+                            return committed_response
+                        if commit.outcome == "rolled_back":
+                            raise ApplyFailed(
+                                commit.error,
+                                phase="database_commit",
+                                details={"commit_outcome": commit.outcome},
+                            )
                         committed_response = ApplyResponse(
                             status="success",
                             message=success_message,
                             details=response_details,
                             host_changed=response_details["host_changed"],
-                            created_at=run.created_at,
-                            run_id=run.id,
+                            created_at=created_at,
+                            run_id=run_id,
                         )
                     else:
                         await session.flush()
@@ -532,7 +574,7 @@ async def run_apply(
                         ),
                     )
                     operation_success_details = {
-                        "apply_run_id": run.id,
+                        "apply_run_id": run_id,
                         "status": "success",
                         "app_healthcheck_status": response_details.get(
                             "app_healthcheck_status"
@@ -557,7 +599,7 @@ async def run_apply(
                         response_details["deferred_operation_kind"] = operation.kind
                         operation.completed = True
                     success_subevents = _apply_success_event_subevents(
-                        run_id=run.id,
+                        run_id=run_id,
                         output_event=output_event,
                         degraded_health=degraded_health,
                     )
@@ -575,7 +617,7 @@ async def run_apply(
                             affects_all=True,
                             subevents=success_subevents,
                             details={
-                                "run_id": run.id,
+                                "run_id": run_id,
                                 "status": "success",
                                 "message": success_message,
                                 **output_event,
@@ -589,15 +631,15 @@ async def run_apply(
                             },
                         )
                     log_operation.result(
-                        success_message, status="success", run_id=run.id
+                        success_message, status="success", run_id=run_id
                     )
                     return ApplyResponse(
                         status="success",
                         message=success_message,
                         details=response_details,
                         host_changed=response_details["host_changed"],
-                        created_at=run.created_at,
-                        run_id=run.id,
+                        created_at=created_at,
+                        run_id=run_id,
                     )
                 except Exception as exc:
                     if committed_response is not None:
@@ -641,6 +683,7 @@ async def run_apply(
                             details["operator_action"] = (
                                 "rerun apply to reconcile durable desired state"
                             )
+                    details.update(scope.as_details())
                     if desired_record is not None:
                         details = {
                             "config_revision": desired_record.config_revision,
@@ -911,6 +954,7 @@ async def _apply_desired_state(
     operation_id: int | None = None,
     recovery: list[Any] | None = None,
 ) -> dict[str, Any]:
+    scope = scope or Scope.everything()
     settings.apply_backup_dir.mkdir(parents=True, exist_ok=True)
     progress = _ApplyProgressTracker()
     details = {
@@ -931,8 +975,8 @@ async def _apply_desired_state(
         "runtime_graph": desired.runtime_graph.as_dict(),
         "backup_dir": str(settings.apply_backup_dir),
         "resource_profile": desired.resource_profile.as_dict(),
-        "apply_phase_order": list(APPLY_PHASE_ORDER),
-        "rollback_contract": _apply_rollback_contract(),
+        "apply_phase_order": _phase_order(scope.tools),
+        "rollback_contract": _apply_rollback_contract(scope.tools),
     }
     try:
         tool_plan = Plan(
@@ -940,7 +984,7 @@ async def _apply_desired_state(
             settings=settings,
             services=services,
             details=details,
-            scope=scope or Scope.everything(),
+            scope=scope,
             extras={
                 "operation_id": operation_id,
             },
@@ -949,31 +993,34 @@ async def _apply_desired_state(
         if recovery is not None:
             recovery.append(tool_plan)
 
-        details["changed_tools"] = await converge(
-            TOOLS, tool_plan, progress=progress
-        )
+        tools = [
+            tool for tool in TOOLS if tool_plan.scope.tools.includes(tool.tool_name)
+        ]
+        details["selected_tools"] = [tool.tool_name for tool in tools]
+        details["changed_tools"] = await converge(tools, tool_plan, progress=progress)
 
-        progress.enter("tailscale_admin_verify")
-        await _emit_apply_progress(
-            services, "Verify output", "Verifying admin exposure"
-        )
-        try:
-            details["tailscale_admin_verify"] = await asyncio.to_thread(
-                services.verify_tailscale_admin_exposure,
-                settings,
+        if ToolScope.TAILSCALE in tool_plan.scope.tools:
+            progress.enter("tailscale_admin_verify")
+            await _emit_apply_progress(
+                services, "Verify output", "Verifying admin exposure"
             )
-        except TailscaleAdminExposureError as exc:
-            raise ApplyFailed(
-                "tailscale admin exposure verification failed",
-                phase="tailscale_admin_verify",
-                details={"error": str(exc)},
-            ) from exc
-        progress.completed("tailscale_admin_verify")
+            try:
+                details["tailscale_admin_verify"] = await asyncio.to_thread(
+                    services.verify_tailscale_admin_exposure,
+                    settings,
+                )
+            except TailscaleAdminExposureError as exc:
+                raise ApplyFailed(
+                    "tailscale admin exposure verification failed",
+                    phase="tailscale_admin_verify",
+                    details={"error": str(exc)},
+                ) from exc
+            progress.completed("tailscale_admin_verify")
         progress.enter("control_plane_self_audit")
         await _emit_apply_progress(services, "Verify output", "Auditing control plane")
         try:
             audit_payload = await _run_control_plane_self_audit_for_apply(
-                settings, services=services
+                settings, services=services, tools=tool_plan.scope.tools
             )
             details["control_plane_self_audit"] = {"ok": True, **audit_payload}
         except ControlPlaneSelfAuditError as exc:
@@ -999,6 +1046,7 @@ async def _apply_desired_state(
     except Exception as exc:
         failure = progress.failure(exc)
         unwound, unwind_errors = await unwind_plan(tool_plan)
+        failure.details["rollback_contract"] = details["rollback_contract"]
         record_unwind_outcome(failure, unwound, unwind_errors, tool_plan.touched)
         raise failure
 
@@ -1009,12 +1057,14 @@ async def _run_control_plane_self_audit_for_apply(
     settings: Settings,
     *,
     services: ApplyServices,
+    tools: ToolScope = ToolScope.HOST,
 ) -> dict[str, Any]:
     attempts = settings.transient_command_retry_attempts + 1
     retry_count = 0
 
     async def run_audit() -> dict[str, Any]:
-        return await asyncio.to_thread(services.run_control_plane_self_audit, settings)
+        kwargs = {} if tools is ToolScope.HOST else {"tools": tools}
+        return await asyncio.to_thread(services.run_control_plane_self_audit, settings, **kwargs)
 
     def should_retry(exc: Exception) -> bool:
         return isinstance(exc, ControlPlaneSelfAuditError) and exc.blocks_apply
@@ -1110,9 +1160,9 @@ def _format_apply_error_details(error: Exception) -> dict[str, Any]:
     ).as_details()
 
 
-def _apply_rollback_contract() -> dict[str, object]:
+def _apply_rollback_contract(tools: ToolScope = ToolScope.HOST) -> dict[str, object]:
     return {
-        "phase_order": list(APPLY_PHASE_ORDER),
+        "phase_order": _phase_order(tools),
         "ingress_cutover_after": [
             "app_runtime",
             "ssh_access",

@@ -83,13 +83,13 @@ async def update_input(
         raise ValidationError("Cloudflare Tunnel is available for domain inputs only")
     if next_connection != item.connection and item.cloudflare_dns_enabled:
         raise ValidationError("Review the domain's Cloudflare changes before switching its managed DNS connection")
+    if "backend_ids" in values:
+        item.backends = await load_backends(session, values.pop("backend_ids") or [])
     if "value" in values or "kind" in values:
         item.hostname = ensure_input_value(
             next_kind, str(values.pop("value", item.hostname))
         )
         item.kind = next_kind
-    if "backend_ids" in values:
-        item.backends = await load_backends(session, values.pop("backend_ids") or [])
     for key, value in values.items():
         setattr(item, key, value)
     if commit:

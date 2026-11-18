@@ -26,7 +26,7 @@ from app.services.cloudflare_api import CloudflareError
 from app.services.cloudflare_connection import configure_connection, connection_summary
 from app.services.cloudflare_domains import build_domain_preview
 from app.services.input_commands import require_input
-from app.services.operations import active_host_mutation_blocker, create_operation
+from app.services.operations import active_host_mutation_blocker
 
 router = APIRouter(tags=["ui"])
 _tunnel_workers = BoundedThreadWorker(1)
@@ -200,17 +200,11 @@ async def apply_cloudflare_domain(
             },
             409,
         )
-    operation = await create_operation(
+    operation = await enqueue_mutation(
         settings,
-        kind="cloudflare_domain",
-        actor="ui",
+        "cloudflare_domain",
         phase="Checking preview",
         details={"input_id": input_id},
-    )
-    await enqueue_mutation(
-        settings,
-        operation.id,
-        "cloudflare_domain",
         input_id=input_id,
         preview_id=preview_id,
     )

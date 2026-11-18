@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import AsyncExitStack
 from weakref import WeakKeyDictionary
 import copy
 from datetime import UTC, datetime
@@ -2067,87 +2068,129 @@ async def create_backend_backup(
         scope="metadata_only",
         notes="backup queued",
     )
-    session.add(record)
-    await session.commit()
-    await session.refresh(record)
+    lifecycle = HostMutationLifecycle(_runtime_workers)
 
-    bundle_path = (
-        settings.backend_backup_dir
-        / backend_name
-        / f"{_timestamp_slug()}-{record.id}{_bundle_extension(settings)}"
-    )
-    record.bundle_path = str(bundle_path)
-    await session.commit()
-    await session.refresh(record)
-    try:
-        host_operation = None
-        if operation is not None:
-            host_operation = operation.with_deferred_db_updates()
-        elif operation_id is not None:
-            host_operation = OperationHandle(
-                id=operation_id, kind="backup_backend", settings=settings
-            )
-        async with host_mutation_operation(
-            settings,
-            kind="backup_backend",
-            backend_id=backend_id,
-            phase="backup",
-            details={"backup_id": record.id, "backend": backend_name},
-            operation=host_operation,
-        ) as mutation_operation:
-            if record.operation_id is None and mutation_operation.id is not None:
-                record.operation_id = mutation_operation.id
-                await session.commit()
-                await session.refresh(record)
-            artifact_payload = await asyncio.to_thread(
-                _write_backup_bundle,
-                backend=loaded_backend,
-                bundle_path=bundle_path,
-                settings=settings,
-                progress_callback=progress_callback,
-            )
+    async def save_backup_plan() -> Path:
+        session.add(record)
+        await session.flush()
+        path = (
+            settings.backend_backup_dir
+            / backend_name
+            / f"{_timestamp_slug()}-{record.id}{_bundle_extension(settings)}"
+        )
+        record.bundle_path = str(path)
+        await session.commit()
+        await session.refresh(record)
+        return path
 
-            def _verify_created_bundle() -> dict[str, Any]:
-                _report_backup_progress(progress_callback, 90, "Verifying backup.")
-                verification = _verify_bundle_contents(
-                    bundle_path,
-                    expected_sha256=str(artifact_payload["bundle_sha256"]),
-                )
-                _report_backup_progress(progress_callback, 96, "Backup verified.")
-                return verification
+    bundle_path = await lifecycle.finish(save_backup_plan())
+    backup_id = record.id
+    success_details: dict[str, Any] = {"backup_id": backup_id, "backend": backend_name}
 
-            await asyncio.to_thread(_verify_created_bundle)
-            record.status = "success"
-            record.scope = str(artifact_payload["scope"])
-            record.bundle_path = str(artifact_payload["bundle_path"])
-            record.bundle_sha256 = str(artifact_payload["bundle_sha256"])
-            record.size_bytes = int(artifact_payload["size_bytes"])
-            record.notes = f"{artifact_payload['notes']}; verified"
-            record.error = None
-            await session.commit()
-            await session.refresh(record)
-            await mutation_operation.complete(
-                "success",
-                phase="completed",
-                details={
-                    "backup_id": record.id,
-                    "backend": backend_name,
-                    **artifact_payload,
-                },
-            )
-    except Exception as exc:
+    async def record_failure(error: str) -> bool:
         await session.rollback()
-        _unlink_backup_bundle(settings, bundle_path)
-        record.status = "error"
-        record.error = str(exc)
-        record.notes = "backup failed"
-    try:
-        if record.status != "success":
-            await session.commit()
-    except Exception:
+        await session.refresh(record)
         if record.status == "success":
-            _unlink_backup_bundle(settings, bundle_path)
-        raise
+            return False
+        await lifecycle.run(_unlink_backup_bundle, settings, bundle_path)
+        record.status = "error"
+        record.error = error
+        record.notes = "backup failed"
+        await session.commit()
+        return True
+
+    host_operation = None
+    if operation is not None:
+        host_operation = operation.with_deferred_db_updates()
+    elif operation_id is not None:
+        host_operation = OperationHandle(
+            id=operation_id, kind="backup_backend", settings=settings
+        )
+    recorded_failure = False
+    try:
+        async with AsyncExitStack() as stack:
+            mutation_operation = host_operation
+            try:
+                lifecycle.raise_if_cancelled()
+                mutation_operation = await stack.enter_async_context(
+                    host_mutation_operation(
+                        settings,
+                        kind="backup_backend",
+                        backend_id=backend_id,
+                        phase="backup",
+                        details=success_details,
+                        operation=host_operation,
+                    )
+                )
+                if record.operation_id is None and mutation_operation.id is not None:
+                    record.operation_id = mutation_operation.id
+                    await session.commit()
+                    await session.refresh(record)
+                artifact_payload = await lifecycle.run(
+                    _write_backup_bundle,
+                    backend=loaded_backend,
+                    bundle_path=bundle_path,
+                    settings=settings,
+                    progress_callback=progress_callback,
+                )
+
+                def verify_created_bundle() -> None:
+                    _report_backup_progress(progress_callback, 90, "Verifying backup.")
+                    _verify_bundle_contents(
+                        bundle_path,
+                        expected_sha256=str(artifact_payload["bundle_sha256"]),
+                    )
+                    _report_backup_progress(progress_callback, 96, "Backup verified.")
+
+                await lifecycle.run(verify_created_bundle)
+                record.status = "success"
+                record.scope = str(artifact_payload["scope"])
+                record.bundle_path = str(artifact_payload["bundle_path"])
+                record.bundle_sha256 = str(artifact_payload["bundle_sha256"])
+                record.size_bytes = int(artifact_payload["size_bytes"])
+                record.notes = f"{artifact_payload['notes']}; verified"
+                record.error = None
+                success_details.update(artifact_payload)
+                await lifecycle.commit(session.commit())
+                await lifecycle.finish(session.refresh(record))
+                await lifecycle.finish(
+                    mutation_operation.complete(
+                        "success", phase="completed", details=success_details
+                    )
+                )
+                lifecycle.raise_if_cancelled()
+            except (Exception, asyncio.CancelledError) as exc:
+                cancelled = isinstance(exc, asyncio.CancelledError)
+                if not lifecycle.committed:
+                    error = "backup cancelled" if cancelled else str(exc)
+                    recorded_failure = await lifecycle.finish(record_failure(error))
+                cancelled = cancelled or lifecycle.cancel_requested
+                if cancelled and mutation_operation is not None:
+                    mutation_operation.defer_db_updates = False
+                    await lifecycle.finish(
+                        mutation_operation.complete(
+                            "cancelled" if recorded_failure else "success",
+                            phase="backup" if recorded_failure else "completed",
+                            error="backup cancelled" if recorded_failure else None,
+                            details=None if recorded_failure else success_details,
+                        )
+                    )
+                if cancelled:
+                    raise asyncio.CancelledError from exc
+                if recorded_failure:
+                    raise
+                if mutation_operation is not None:
+                    logger.warning(
+                        "backup.create.post_commit_error",
+                        backup_id=backup_id,
+                        error=str(exc),
+                    )
+                    await mutation_operation.complete(
+                        "success", phase="completed", details=success_details
+                    )
+    except Exception:
+        if not recorded_failure:
+            raise
     if record.status == "success":
         mirror_result = await mirror_backend_backup_to_cluster(
             session,
@@ -2603,12 +2646,12 @@ async def restore_backend_backup(
         journal = HostJournal.begin(
             settings, kind="restore_backend", subject=backend_name
         )
-    except BaseException:
-        await operation_context.__aexit__(None, None, None)
+        restore_txn = _RestoreBundleTransaction(
+            metadata, bundle_path, token=journal.id[:12]
+        )
+    except BaseException as exc:
+        await operation_context.__aexit__(type(exc), exc, exc.__traceback__)
         raise
-    restore_txn = _RestoreBundleTransaction(
-        metadata, bundle_path, token=journal.id[:12]
-    )
     convergence_details: dict[str, Any] = {}
     committed = False
     lifecycle = HostMutationLifecycle(_runtime_workers)

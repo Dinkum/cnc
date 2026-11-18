@@ -52,6 +52,37 @@ PROTECTED_HOST_PATHS = (
     "/sys",
 )
 PROTECTED_CONTAINER_PATHS = ("/cnc", "/var/lib/cnc")
+NGINX_PROTECTED_HOST_PATHS = (
+    "/etc",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/var/lib/containers",
+    "/var/lib/private",
+    "/var/lib/tailscale",
+    "/var/log/cnc",
+    *(
+        f"{prefix}/{name}"
+        for prefix in ("/usr", "/usr/local")
+        for name in ("bin", "etc", "lib", "lib32", "lib64", "libexec", "sbin")
+    ),
+    *(
+        f"/var/lib/cnc/{name}"
+        for name in (
+            "apps",
+            "backend-backup-mirrors",
+            "cluster-ingress",
+            "cluster-transfers",
+            "current",
+            "data",
+            "locks",
+            "releases",
+            "updater",
+        )
+    ),
+)
 
 
 class ValidationError(CNCError):
@@ -275,6 +306,32 @@ def _settings_protected_host_paths(settings: Settings) -> tuple[str, ...]:
         if candidate.startswith("/"):
             protected.add(_normalize_posix_absolute_path(candidate))
     return tuple(sorted(protected))
+
+
+def resolve_nginx_static_root(value: str, settings: Settings) -> Path:
+    path = Path(ensure_absolute_path(value, "NGINX static root")).resolve(strict=True)
+    if not path.is_dir():
+        raise ValidationError(f"NGINX static root must be a directory: {value}")
+
+    protected = (
+        *map(Path, _settings_protected_host_paths(settings)),
+        *map(Path, NGINX_PROTECTED_HOST_PATHS),
+        settings.app_control_dir.parent / "cloudflare-tunnel",
+        settings.resolved_host_journal_dir,
+        settings.apply_lock_path,
+        *(
+            path
+            for path in (Path(settings.sqlite_path), settings.log_path)
+            if not path.is_absolute()
+        ),
+    )
+    for entry in protected:
+        resolved = entry.resolve()
+        if path.is_relative_to(resolved) or resolved.is_relative_to(path):
+            raise ValidationError(
+                f"NGINX static root overlaps protected host path {resolved}: {value}"
+            )
+    return path
 
 
 def _ensure_path_is_not_protected(

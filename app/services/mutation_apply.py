@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -17,9 +18,10 @@ from app.services.apply_service import (
     invalidate_apply_convergence,
     run_apply,
 )
+from app.services.change_scope import Scope, ToolScope
 from app.services.control_events import emit_control_event
 from app.services.error_reporting import ErrorCode, ensure_cnc_error
-from app.services.host_journal import durable_row_exists
+from app.services.host_journal import commit_verified
 from app.services.operations import (
     OperationHandle,
     host_mutation_lock,
@@ -143,17 +145,44 @@ async def _apply_then_commit(
     logger.info("mutation_apply.applying", operation=operation, state="applying")
     try:
         validate_operation_handle_contract(operation_handle)
-        apply_response = await _run_apply_runner(
-            apply_runner,
-            session,
-            settings,
-            apply_services=apply_services,
-            operation_handle=operation_handle,
-            operation_kind=operation,
-            actor=actor,
-            scope=scope,
-            recovery=recovery,
-        )
+        if isinstance(scope, Scope) and scope.tools == ToolScope.NONE:
+            from app.services.backend_commands import validate_config_graph
+
+            await validate_config_graph(session)
+            details = {
+                **scope.as_details(),
+                "selected_tools": [],
+                "changed_tools": [],
+                "host_changed": False,
+            }
+            run = ApplyRun(
+                status="success",
+                message="Configuration saved",
+                operation_id=operation_handle.id,
+                details_json=json.dumps(details),
+            )
+            session.add(run)
+            await session.flush()
+            apply_response = ApplyResponse(
+                status="success",
+                message=run.message,
+                details=details,
+                created_at=run.created_at,
+                run_id=run.id,
+                host_changed=False,
+            )
+        else:
+            apply_response = await _run_apply_runner(
+                apply_runner,
+                session,
+                settings,
+                apply_services=apply_services,
+                operation_handle=operation_handle,
+                operation_kind=operation,
+                actor=actor,
+                scope=scope,
+                recovery=recovery,
+            )
     except asyncio.CancelledError:
         # The edited rows were never committed, so the host goes back too.
         await run_to_completion(unwind_recovery(recovery))
@@ -184,58 +213,58 @@ async def _apply_then_commit(
         "applied" if apply_response.status == "success" else "apply_failed"
     )
     if state == "applied":
-        try:
-            await session.commit()
-        except Exception as exc:
-            rollback_error = await _rollback_quietly(session)
-            _log_quietly(
-                "mutation_apply.commit_failed_after_apply",
-                operation=operation,
-                apply_run_id=apply_response.run_id,
-                error=str(exc),
+        commit = await commit_verified(
+            session, settings, ApplyRun, apply_response.run_id
+        )
+        if commit.error:
+            apply_response.details.update(
+                commit_outcome=commit.outcome, commit_error=commit.error
             )
+            if commit.rollback_error:
+                apply_response.details["commit_rollback_error"] = commit.rollback_error
+        if commit.outcome == "persisted":
             try:
-                unwind_details = await _resolve_commit_then_unwind(
-                    settings, apply_response, recovery
+                await _emit_deferred_apply_completed_event(settings, apply_response)
+            except Exception as exc:
+                apply_response.details["post_commit_reporting_error"] = str(exc)
+                logger.exception(
+                    "mutation_apply.completion_reporting_failed", error=str(exc)
                 )
-            except Exception as resolve_error:
-                _log_quietly(
-                    "mutation_apply.commit_outcome_resolution_failed",
-                    operation=operation,
-                    error=str(resolve_error),
+        else:
+            details = dict(apply_response.details)
+            if commit.outcome == "rolled_back":
+                details.update(await unwind_recovery(recovery, "commit_"))
+            else:
+                details.update(
+                    failure_mode="partial",
+                    manual_review_required=True,
+                    operator_action="compare the saved configuration against the host before rerunning",
                 )
-                unwind_details = {
-                    "commit_outcome": "unknown",
-                    "commit_unwind": "skipped; outcome resolution itself failed",
-                    "commit_resolution_error": str(resolve_error),
-                    "failure_mode": "partial",
-                    "manual_review_required": True,
-                    "operator_action": (
-                        "compare the saved configuration against the host "
-                        "before rerunning"
-                    ),
-                }
-            if rollback_error is not None:
-                unwind_details["commit_rollback_error"] = rollback_error
             try:
                 apply_response = await _record_deferred_commit_failure(
                     settings,
                     apply_response,
-                    exc,
+                    RuntimeError(commit.error),
                     operation_handle=operation_handle,
-                    resolution_details=unwind_details,
+                    resolution_details=details,
                 )
-            except Exception as record_error:
-                _log_quietly(
-                    "mutation_apply.commit_failure_record_failed",
-                    operation=operation,
-                    error=str(record_error),
+            except Exception as exc:
+                logger.exception(
+                    "mutation_apply.failure_reporting_failed", error=str(exc)
                 )
-                unwind_details["commit_record_error"] = str(record_error)
-            apply_response.details.update(unwind_details)
+                apply_response = ApplyResponse(
+                    status="error",
+                    message="Database commit failed",
+                    run_id=apply_response.run_id,
+                    details={
+                        **details,
+                        "phase": "database_commit",
+                        "error": commit.error,
+                        "commit_record_error": str(exc),
+                    },
+                )
+
             state = "apply_failed"
-        else:
-            await _emit_deferred_apply_completed_event(settings, apply_response)
     else:
         await session.rollback()
         apply_response.details.setdefault("commit_outcome", "rolled_back")
@@ -262,50 +291,6 @@ async def _rollback_quietly(session: AsyncSession) -> str | None:
     except Exception as exc:
         return str(exc)
     return None
-
-
-def _log_quietly(event: str, **fields: Any) -> None:
-    try:
-        logger.exception(event, **fields)
-    except Exception:
-        pass
-
-
-async def _resolve_commit_then_unwind(
-    settings: Settings,
-    apply_response: ApplyResponse,
-    recovery: list[Any],
-) -> dict[str, Any]:
-    outcome = await _durable_commit_outcome(settings, apply_response)
-    if outcome == "persisted":
-        return {
-            "commit_outcome": "persisted",
-            "commit_unwind": "skipped; the database kept this change",
-            "failure_mode": "partial",
-            "manual_review_required": True,
-        }
-    if outcome == "unknown":
-        return {
-            "commit_outcome": "unknown",
-            "commit_unwind": "skipped; could not determine what the database kept",
-            "failure_mode": "partial",
-            "manual_review_required": True,
-            "operator_action": (
-                "compare the saved configuration against the host before rerunning"
-            ),
-        }
-    return {
-        "commit_outcome": "rolled_back",
-        **await unwind_recovery(recovery, "commit_"),
-    }
-
-
-async def _durable_commit_outcome(
-    settings: Settings, apply_response: ApplyResponse
-) -> str:
-    if apply_response.run_id is None:
-        return "rolled_back"
-    return await durable_row_exists(settings, ApplyRun, apply_response.run_id)
 
 
 async def _run_apply_runner(
@@ -345,7 +330,8 @@ async def _record_deferred_commit_failure(
     convergence_invalidated = False
     convergence_invalidation_error = ""
     try:
-        convergence_invalidated = await _invalidate_apply_convergence_durably(settings)
+        if apply_response.host_changed is not False:
+            convergence_invalidated = await _invalidate_apply_convergence_durably(settings)
     except Exception as invalidation_exc:
         convergence_invalidation_error = str(invalidation_exc)
         logger.exception(
@@ -376,11 +362,7 @@ async def _record_deferred_commit_failure(
         settings,
         kind="apply_failed",
         source="apply",
-        summary=(
-            "Configuration saved; final confirmation failed"
-            if presentation.status_label == "saved"
-            else "Save failed during database commit"
-        ),
+        summary="Save failed during database commit",
         severity="error",
         scope="host",
         affects_all=True,
@@ -393,11 +375,7 @@ async def _record_deferred_commit_failure(
     )
     return ApplyResponse(
         status="error",
-        message=(
-            "configuration saved; final confirmation failed"
-            if presentation.status_label == "saved"
-            else "save failed during database commit"
-        ),
+        message="save failed during database commit",
         details=details,
         created_at=apply_response.created_at,
         run_id=apply_response.run_id,

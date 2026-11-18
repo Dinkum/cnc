@@ -18,7 +18,7 @@ from app.config import Settings
 from app.database import create_configured_async_engine
 from app.logger import get_logger
 from app.models.entities import HostJournalCommit
-from app.services.thread_workers import run_to_completion
+from app.services.thread_workers import HostMutationLifecycle, run_to_completion
 
 
 logger = get_logger("host_journal")
@@ -94,7 +94,13 @@ class UnwindReport:
         }
 
 
-async def durable_row_exists(settings: Settings, model: type, key: Any) -> CommitOutcome:
+async def durable_row_exists(
+    settings: Settings,
+    model: type,
+    key: Any,
+    *,
+    matches: Callable[[Any], bool] | None = None,
+) -> CommitOutcome:
     """Read on a connection of its own, because a raised commit does not prove the write was discarded."""
     try:
         engine = create_configured_async_engine(settings.database_url)
@@ -102,12 +108,71 @@ async def durable_row_exists(settings: Settings, model: type, key: Any) -> Commi
             maker = async_sessionmaker(bind=engine, expire_on_commit=False)
             async with maker() as probe:
                 found = await probe.get(model, key)
-                return "persisted" if found is not None else "rolled_back"
+                return "persisted" if found is not None and (matches is None or matches(found)) else "rolled_back"
         finally:
             await engine.dispose()
     except Exception as exc:
         logger.warning("host_journal.commit_outcome_unresolved", error=str(exc))
         return "unknown"
+
+
+@dataclass(frozen=True)
+class CommitResult:
+    outcome: CommitOutcome
+    error: str = ""
+    rollback_error: str = ""
+
+
+async def commit_verified(
+    session: AsyncSession,
+    settings: Settings,
+    model: type,
+    key: Any,
+    *,
+    matches: Callable[[Any], bool] | None = None,
+) -> CommitResult:
+    """The witness must be a new row written by this transaction."""
+
+    async def commit_or_resolve() -> CommitResult:
+        try:
+            await session.commit()
+        except Exception as exc:
+            rollback_error = ""
+            try:
+                await session.rollback()
+            except Exception as rollback_exc:
+                rollback_error = str(rollback_exc)
+                try:
+                    await session.reset()
+                except Exception as reset_exc:
+                    logger.warning(
+                        "host_journal.session_reset_failed", error=str(reset_exc)
+                    )
+            outcome: CommitOutcome = "unknown"
+            if key is not None:
+                kwargs = {"matches": matches} if matches is not None else {}
+                outcome = await durable_row_exists(settings, model, key, **kwargs)
+            logger.warning(
+                "host_journal.commit_raised",
+                witness=model.__name__,
+                key=key,
+                outcome=outcome,
+                error=str(exc),
+                rollback_error=rollback_error,
+            )
+            return CommitResult(outcome, str(exc), rollback_error)
+        return CommitResult("persisted")
+
+    # Once COMMIT starts, the durable result decides whether a caller may undo.
+    return await HostMutationLifecycle().finish(commit_or_resolve())
+
+
+async def commit_with_marker(
+    session: AsyncSession, settings: Settings, marker: str, kind: str
+) -> tuple[CommitOutcome, str]:
+    session.add(HostJournalCommit(journal_id=marker, kind=kind))
+    result = await commit_verified(session, settings, HostJournalCommit, marker)
+    return result.outcome, result.error
 
 
 @dataclass
@@ -218,35 +283,19 @@ class HostJournal:
         self._persist()
 
     async def commit(self, session: AsyncSession) -> CommitOutcome:
-        session.add(HostJournalCommit(journal_id=self.id, kind=self.kind))
         self.state = "committing"
         self._persist()
-        try:
-            await session.commit()
-        except Exception as exc:
-            self.error = str(exc)
-            try:
-                await session.rollback()
-            except Exception:
-                pass
-            outcome = await durable_row_exists(self.settings, HostJournalCommit, self.id)
-            logger.warning(
-                "host_journal.commit_raised",
-                journal_id=self.id,
-                kind=self.kind,
-                outcome=outcome,
-                error=str(exc),
-            )
-            if outcome == "unknown":
-                self.state = "unknown"
-                self._persist()
-            elif outcome == "rolled_back":
-                self.state = "running"
-            else:
-                await self.finalize()
-            return outcome
-        await self.finalize()
-        return "persisted"
+        outcome, self.error = await commit_with_marker(
+            session, self.settings, self.id, self.kind
+        )
+        if outcome == "persisted":
+            await self.finalize()
+        elif outcome == "unknown":
+            self.state = "unknown"
+            self._persist()
+        else:
+            self.state = "running"
+        return outcome
 
     async def finalize(self) -> None:
         self.state = "committed"

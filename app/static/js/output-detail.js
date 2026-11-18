@@ -631,6 +631,13 @@
     paintTransferCard();
   };
 
+  const showTransferFailure = (operation) => {
+    const progress = operationProgress(operation, 100, "transferOutput");
+    const headline = operation.status === "partial" ? "Verify transfer" : "Transfer failed";
+    transferPending = false;
+    setTransferProgress(100, headline, progress.flashError || progress.message || headline, "error");
+  };
+
   transferTrigger?.addEventListener("click", () => {
     transferPending = false;
     transferMinimised = false;
@@ -740,11 +747,7 @@
           setTransferProgress(100, "Transfer complete", progress.flashSuccess || progress.message || "Output transferred.", "success");
           window.setTimeout(() => window.location.reload(), 900);
         },
-        onFailure: (operation) => {
-          const progress = operationProgress(operation, 100, "transferOutput");
-          transferPending = false;
-          setTransferProgress(100, "Transfer failed", progress.flashError || progress.message || "Transfer failed.", "error");
-        },
+        onFailure: showTransferFailure,
         onError: (error) => {
           transferPending = false;
           setTransferProgress(100, "Transfer failed", error instanceof Error ? error.message : "Transfer failed.", "error");
@@ -791,11 +794,7 @@
           setTransferProgress(100, "Transfer complete", progress.flashSuccess || progress.message || "Output transferred.", "success");
           window.setTimeout(() => window.location.reload(), 900);
         },
-        onFailure: (payload) => {
-          const progress = operationProgress(payload, 100, "transferOutput");
-          transferPending = false;
-          setTransferProgress(100, "Transfer failed", progress.flashError || progress.message || "Transfer failed.", "error");
-        },
+        onFailure: showTransferFailure,
         onError: (error) => {
           transferPending = false;
           setTransferProgress(100, "Transfer failed", error instanceof Error ? error.message : "Transfer failed.", "error");

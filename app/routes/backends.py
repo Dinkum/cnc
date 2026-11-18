@@ -23,7 +23,7 @@ from app.schemas.backends import (
     BackendUpdate,
 )
 from app.services import backend_commands
-from app.services.config_change import converge_change, output_change
+from app.services.config_change import converge_change, output_edit
 from app.services.operations import host_mutation_operation
 from app.services.status_service import invalidate_status_cache
 from app.services.validators import ValidationError
@@ -74,7 +74,7 @@ async def create_backend(
             result = await converge_change(
                 session,
                 settings,
-                change=output_change("api.backend.create", backend.name),
+                change=output_edit("api.backend.create", backend, membership_change=True),
                 operation_handle=operation,
             )
         if not result.applied:
@@ -138,7 +138,7 @@ async def update_backend(
             result = await converge_change(
                 session,
                 settings,
-                change=output_change("api.backend.update", backend.name),
+                change=output_edit("api.backend.update", backend, requested_fields=payload.model_fields_set),
                 operation_handle=operation,
             )
         if not result.applied:
@@ -212,7 +212,7 @@ async def toggle_backend(
             result = await converge_change(
                 session,
                 settings,
-                change=output_change("api.backend.toggle", backend.name),
+                change=output_edit("api.backend.toggle", backend, requested_fields={"enabled"}),
                 operation_handle=operation,
             )
         if not result.applied:

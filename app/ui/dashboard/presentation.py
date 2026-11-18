@@ -13,6 +13,7 @@ from app.services.backend_metric_history import (
     DEFAULT_TIMEFRAME_KEY,
     TIMEFRAME_SPECS,
 )
+from app.services.nginx_runtime import active_routes_directory
 from app.services.operation_runtime import (
     create_backend_progress_steps,
     input_progress_pipelines,
@@ -308,7 +309,7 @@ def _dashboard_settings_sections(
             "title": "Paths",
             "rows": [
                 ("Managed env", str(settings.managed_env_file_path)),
-                ("Nginx generated", str(settings.nginx_generated_dir)),
+                ("Nginx generated", str(active_routes_directory(settings))),
                 ("Apply backup dir", str(settings.apply_backup_dir)),
                 ("Backend backup dir", str(settings.backend_backup_dir)),
                 ("Backend backup format", settings.backend_backup_archive_format),

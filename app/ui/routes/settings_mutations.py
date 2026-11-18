@@ -22,7 +22,8 @@ from app.access import (
     set_access_cookie,
 )
 from app.config import Settings
-from app.services.config_change import full_reconcile
+from app.services.change_scope import ToolScope
+from app.services.config_change import ConfigChange
 from app.dependencies import (
     db_session_dependency,
     settings_dependency,
@@ -438,7 +439,7 @@ async def update_beta_settings_form(
                 next_settings,
                 operation_kind="ui.settings.netdata",
                 actor="ui",
-                scope=full_reconcile("ui.settings.netdata").scope(),
+                scope=ConfigChange("ui.settings.netdata", tools=ToolScope.NETDATA | ToolScope.TAILSCALE).scope(),
             )
             if apply_response.status != "success":
                 flash_success = None

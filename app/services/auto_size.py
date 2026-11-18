@@ -15,7 +15,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
-from app.services.config_change import converge_change, full_reconcile
+from app.services.change_scope import ToolScope
+from app.services.config_change import ConfigChange, converge_change
 from app.logger import Operation as LogOperation, get_logger
 from app.models.entities import Backend, BackendResourceSample, HostResourceSample
 from app.schemas.apply import ApplyResponse
@@ -267,11 +268,19 @@ async def run_auto_size_tick(
             changed_backends=changed_names,
             change_count=len(changed),
         )
+        # A weight change redistributes the shared budget across enabled apps.
         with session.no_autoflush:
             mutation = await converge_change(
                 session,
                 settings,
-                full_reconcile("auto_size", actor="auto_size", source="tick"),
+                ConfigChange(
+                    "auto_size",
+                    actor="auto_size",
+                    outputs=frozenset(changed_names),
+                    tools=ToolScope.PODMAN,
+                    rebalance_resources=True,
+                    detail={"source": "tick"},
+                ),
                 apply_runner=run_apply,
             )
         apply_response = mutation.apply_response

@@ -24,6 +24,7 @@ from app.services.app_containers import (
     configured_app_dns_servers,
 )
 from app.services.inter_app_interfaces import RuntimeInterAppInterface
+from app.services.nginx_contract import GATEWAY, NETWORK_NAME, nginx_gateway_enabled
 from app.services.resource_profile import ResourceProfile, backend_resource_profile
 from app.services.renderers import container_name, network_name
 from app.services.validators import parse_volumes_json
@@ -181,6 +182,7 @@ def render_quadlet_container(
     inter_app_interfaces: tuple[RuntimeInterAppInterface, ...] = (),
     rootfs_path: Path | str | None = None,
     publish_host: str = "127.0.0.1",
+    nginx_container: bool = False,
 ) -> str:
     resource_profile = backend_resource_profile(backend, base_profile)
     sandbox_profile = get_app_sandbox_profile(backend.sandbox_profile)
@@ -196,6 +198,16 @@ def render_quadlet_container(
         raise ValueError(f"app backend {backend.name} requires allocated port")
     rootfs = rootfs_path or app_sandbox_rootfs_path(settings, backend.name)
     publish_address = str(publish_host or "127.0.0.1").strip() or "127.0.0.1"
+    publish_addresses = [publish_address]
+    unit_dependencies: list[str] = []
+    if publish_address == "127.0.0.1" and nginx_gateway_enabled(
+        settings, container_mode=nginx_container
+    ):
+        publish_addresses.append(GATEWAY)
+        unit_dependencies = [
+            f"Requires={NETWORK_NAME}-network.service",
+            f"After={NETWORK_NAME}-network.service",
+        ]
 
     policy = read_hardening_policy(backend)
     podman_args = [
@@ -210,6 +222,7 @@ def render_quadlet_container(
         "",
         "[Unit]",
         f"Description=CNC app backend {backend.name}",
+        *unit_dependencies,
         "",
         "[Container]",
         f"ContainerName={container}",
@@ -228,7 +241,10 @@ def render_quadlet_container(
             for link in sorted(source_interfaces, key=lambda item: item.network)
         ),
         "LogDriver=journald",
-        f"PublishPort={publish_address}:{backend.port}:{backend.handoff_port}/tcp",
+        *(
+            f"PublishPort={address}:{backend.port}:{backend.handoff_port}/tcp"
+            for address in publish_addresses
+        ),
         "Label=io.cnc.managed=true",
         f"Label=io.cnc.backend={backend.name}",
         f"Exec={' '.join(sandbox_profile.init_command)}",
@@ -520,6 +536,7 @@ def write_app_quadlet_assets(
     *,
     base_profile: ResourceProfile,
     inter_app_interfaces: tuple[RuntimeInterAppInterface, ...] = (),
+    nginx_container: bool = False,
 ) -> dict[str, Any]:
     network_path = quadlet_network_path(settings, backend.name)
     container_path = quadlet_container_path(settings, backend.name)
@@ -550,6 +567,7 @@ def write_app_quadlet_assets(
         settings,
         base_profile=base_profile,
         inter_app_interfaces=related_interfaces,
+        nginx_container=nginx_container,
     )
     try:
         previous_container_content = container_path.read_text(encoding="utf-8")
@@ -627,9 +645,16 @@ def managed_quadlet_backend_names(settings: Settings) -> set[str]:
     return backend_names
 
 
-def managed_quadlet_interface_network_names(settings: Settings) -> set[str]:
+def managed_quadlet_interface_network_names(
+    settings: Settings, *, scoped_to: set[str] | None = None
+) -> set[str]:
     if not settings.app_quadlet_dir.exists():
         return set()
+    owner_labels = {
+        f"Label=io.cnc.{endpoint}_backend={name}"
+        for name in scoped_to or ()
+        for endpoint in ("source", "target")
+    }
     network_names: set[str] = set()
     for path in settings.app_quadlet_dir.iterdir():
         if (
@@ -639,9 +664,11 @@ def managed_quadlet_interface_network_names(settings: Settings) -> set[str]:
         ):
             continue
         try:
-            first_line = path.read_text(encoding="utf-8").splitlines()[0]
+            lines = path.read_text(encoding="utf-8").splitlines()
         except (IndexError, OSError, UnicodeDecodeError):
             continue
-        if first_line == QUADLET_HEADER:
+        if lines[:1] != [QUADLET_HEADER]:
+            continue
+        if scoped_to is None or not owner_labels.isdisjoint(lines):
             network_names.add(path.name.removesuffix(".network"))
     return network_names

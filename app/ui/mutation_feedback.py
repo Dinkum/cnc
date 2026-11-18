@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 from app.config import Settings
-from app.models.entities import Backend
-from app.schemas.backends import BackendUpdate
 from app.services.error_reporting import ErrorCode
 from app.services.operations import (
     HostMutationBlocker,
@@ -30,17 +28,6 @@ HOST_MUTATION_BLOCKER_LABELS = {
     "ui.input.update": "Input save",
     "update_control_plane": "A CNC update",
 }
-
-
-def backend_update_changed_keys(backend: Backend, payload: BackendUpdate) -> set[str]:
-    values = payload.model_dump(exclude_unset=True)
-    changed: set[str] = set()
-    for key, value in values.items():
-        if key == "kind" and value == backend.kind:
-            continue
-        if getattr(backend, key) != value:
-            changed.add(key)
-    return changed
 
 
 def host_mutation_blocked_message(action: str, blocker: HostMutationBlocker) -> str:

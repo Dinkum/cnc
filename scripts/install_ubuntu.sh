@@ -1241,6 +1241,9 @@ EOF
 }
 
 setup_nginx_include() {
+  if nginx_container_configured; then
+    return 0
+  fi
   if [[ -L /etc/nginx/sites-enabled/default || -f /etc/nginx/sites-enabled/default ]]; then
     run_cmd rm -f /etc/nginx/sites-enabled/default || return $?
   fi
@@ -1964,6 +1967,7 @@ write_systemd_unit() {
   install_packaged_systemd_asset "${PACKAGED_BACKEND_ALERTS_SERVICE_PATH}" "${BACKEND_ALERTS_SERVICE_NAME}.service" || return $?
   install_packaged_systemd_asset "${PACKAGED_BACKEND_ALERTS_TIMER_PATH}" "${BACKEND_ALERTS_SERVICE_NAME}.timer" || return $?
   install_packaged_systemd_asset "packaging/cnc-cloudflare-tunnel.service" "cnc-cloudflare-tunnel.service" || return $?
+  install_packaged_systemd_asset "packaging/cnc-ingress-firewall.service" "cnc-ingress-firewall.service" || return $?
   install_packaged_systemd_asset "packaging/cnc-cloudflare-domains.service" "cnc-cloudflare-domains.service" || return $?
   install_packaged_systemd_asset "packaging/cnc-cloudflare-domains.timer" "cnc-cloudflare-domains.timer" || return $?
   install_packaged_systemd_asset "packaging/cnc-origin-tls.service" "cnc-origin-tls.service" || return $?
@@ -2081,9 +2085,48 @@ verify_ssh_firewall_rules() {
   verify_http_firewall_rules
 }
 
+nginx_container_configured() {
+  local app_control_dir
+  app_control_dir="$(read_env_key_or_default "APP_CONTROL_DIR" "/var/lib/cnc/app-control")"
+  [[ -f "${app_control_dir}/nginx-container-active" ]]
+}
+
+setup_nginx_container() {
+  run_cmd "${CURRENT_LINK}/.venv/bin/python" -c '
+import asyncio
+from app.cli.common import load_env_defaults
+from app.config import get_settings
+
+load_env_defaults()
+settings = get_settings()
+if settings.multi_node_enabled:
+    raise SystemExit(0)
+
+from app.database import SessionLocal
+from app.services.apply_service import run_apply
+from app.services.change_scope import Scope, ToolScope
+
+async def apply_ingress():
+    async with SessionLocal() as session:
+        result = await run_apply(session, settings, scope=Scope(
+            reason="installer ingress", tools=ToolScope.PODMAN | ToolScope.SHIELD | ToolScope.NGINX,
+        ))
+        if result.status != "success":
+            raise SystemExit(result.model_dump_json())
+
+asyncio.run(apply_ingress())
+'
+}
+
 verify_nginx_runtime() {
-  systemctl is-active --quiet nginx || return 1
-  run_cmd nginx -t || return $?
+  if nginx_container_configured; then
+    systemctl is-active --quiet cnc-nginx.service || return 1
+    run_cmd "${CURRENT_LINK}/.venv/bin/python" -c \
+      'import subprocess; from app.services.nginx_runtime import validate_command; subprocess.run(validate_command(True), check=True)' || return $?
+  else
+    systemctl is-active --quiet nginx || return 1
+    run_cmd nginx -t || return $?
+  fi
 }
 
 verify_podman_basic_run() {
@@ -2211,7 +2254,11 @@ render_summary() {
   local total_elapsed=$(( finish_ts - START_TS ))
 
   local nginx_version
-  nginx_version="$(nginx -v 2>&1 | head -n1 || echo "nginx unavailable")"
+  if nginx_container_configured; then
+    nginx_version="$(podman exec cnc-nginx nginx -v 2>&1 | head -n1 || echo "nginx unavailable")"
+  else
+    nginx_version="$(nginx -v 2>&1 | head -n1 || echo "nginx unavailable")"
+  fi
   local podman_version
   podman_version="$(podman --version 2>/dev/null || echo "podman unavailable")"
   local python_version
@@ -2388,6 +2435,7 @@ main() {
   run_step "cli.health" "Verify cnc-admin CLI wrapper" verify_cli_wrapper
   run_step "ssh.health" "Verify backend SSH assets" verify_backend_ssh_assets
   run_step "network.ssh-rules" "Verify SSH and HTTP firewall rules are live" verify_ssh_firewall_rules
+  run_step "nginx.container" "Converge public ingress container" setup_nginx_container
   run_step "nginx.health" "Verify nginx runtime health" verify_nginx_runtime
   run_step "podman.basic" "Verify Podman basic container run health" verify_podman_basic_run
   run_step "network.app-smoke" "Verify isolated app container networking" verify_isolated_app_network

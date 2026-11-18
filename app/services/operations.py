@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 import json
 import os
@@ -101,6 +101,16 @@ class HostMutationBlocker:
 
 
 @dataclass
+class _HostMutationReservation:
+    lock: FileLock | None
+
+
+_HOST_MUTATION_RESERVATION: ContextVar[_HostMutationReservation | None] = ContextVar(
+    "host_mutation_reservation", default=None
+)
+
+
+@dataclass
 class _OperationSessionOwner:
     database_url: str
     loop: asyncio.AbstractEventLoop
@@ -174,15 +184,41 @@ class OperationHandle:
     settings: Settings
     completed: bool = False
     defer_db_updates: bool = False
+    _is_step: bool = False
+
+    def as_step(self) -> "OperationHandle":
+        """Link nested work to this ID. The owner publishes progress and completion."""
+        return replace(self, completed=False, _is_step=True)
 
     def with_deferred_db_updates(self) -> "OperationHandle":
-        return OperationHandle(
-            id=self.id,
-            kind=self.kind,
-            settings=self.settings,
-            completed=self.completed,
-            defer_db_updates=True,
-        )
+        return replace(self, defer_db_updates=True)
+
+    def publish_progress(
+        self,
+        *,
+        status: OperationStatus | None,
+        phase: str | None,
+        details: dict[str, Any] | None,
+        error: str | None = None,
+    ) -> None:
+        if self.id is None or self._is_step:
+            return
+        try:
+            write_operation_progress(
+                self.settings,
+                self.id,
+                status=status,
+                phase=phase,
+                details=details,
+                error=error,
+            )
+        except OSError as exc:
+            logger.warning(
+                "operation.progress_snapshot_skipped",
+                operation_id=self.id,
+                kind=self.kind,
+                error=str(exc),
+            )
 
     async def update(
         self,
@@ -195,7 +231,7 @@ class OperationHandle:
         details: dict[str, Any] | None = None,
         finished: bool = False,
     ) -> None:
-        if self.id is None:
+        if self.id is None or self._is_step:
             if finished:
                 self.completed = True
             return
@@ -205,22 +241,9 @@ class OperationHandle:
             or status is not None
             or error is not None
         ):
-            try:
-                write_operation_progress(
-                    self.settings,
-                    self.id,
-                    status=status,
-                    phase=phase,
-                    details=details,
-                    error=error,
-                )
-            except OSError as exc:
-                logger.warning(
-                    "operation.progress_snapshot_skipped",
-                    operation_id=self.id,
-                    kind=self.kind,
-                    error=str(exc),
-                )
+            self.publish_progress(
+                status=status, phase=phase, details=details, error=error
+            )
         if self.defer_db_updates:
             if finished:
                 self.completed = True
@@ -580,13 +603,28 @@ async def fail_interrupted_operations(settings: Settings) -> int:
         finished_at = datetime.now(UTC)
         interrupted = 0
         for operation in operations:
-            try:
-                details = json.loads(operation.details_json or "{}")
-            except json.JSONDecodeError:
-                details = {"raw": operation.details_json}
+            details = _json_loads_details(operation.details_json)
             if operation.status == "queued" and job_awaiting_dispatch(details):
                 continue
             interrupted += 1
+            if operation.kind == "transfer_backend" and operation.status == "running":
+                saved = await _operation_has_successful_apply_run(
+                    session, operation, details
+                )
+                message = (
+                    "Placement was saved before CNC restarted. Verify the target and source cleanup."
+                    if saved
+                    else "CNC restarted during transfer. Check placement and both runtimes before retrying."
+                )
+                operation.status = "partial"
+                operation.phase = "Verify transfer"
+                operation.error = message
+                operation.finished_at = finished_at
+                operation.details_json = _json_dumps({
+                    **details, "message": message, "interrupted": True,
+                    "manual_review_required": True, "operator_action": message,
+                })
+                continue
             if (
                 operation.kind == "auto_size"
                 and operation.status == "running"
@@ -722,18 +760,45 @@ def try_acquire_host_mutation_lock(settings: Settings) -> FileLock | None:
 
 
 @asynccontextmanager
+async def reserve_host_mutation_lock(settings: Settings) -> AsyncIterator[bool]:
+    lock = try_acquire_host_mutation_lock(settings)
+    if lock is None:
+        yield False
+        return
+    reservation = _HostMutationReservation(lock)
+    try:
+        if await _active_update_run_blocker(settings) is not None:
+            yield False
+            return
+        token = _HOST_MUTATION_RESERVATION.set(reservation)
+        try:
+            yield True
+        finally:
+            _HOST_MUTATION_RESERVATION.reset(token)
+    finally:
+        if reservation.lock is not None:
+            reservation.lock.__exit__(None, None, None)
+            reservation.lock = None
+
+
+def _take_host_mutation_reservation() -> FileLock | None:
+    reservation = _HOST_MUTATION_RESERVATION.get()
+    if reservation is None:
+        return None
+    # A runner can enter its mutation scope in a child task with a copied context.
+    lock = reservation.lock
+    reservation.lock = None
+    return lock
+
+
+@asynccontextmanager
 async def host_mutation_lock(settings: Settings):
     if _LOCK_DEPTH.get() > 0:
         yield
         return
-    lock_path = _host_lock_path(settings)
-    lock = FileLock(lock_path, blocking=False, lock_path=lock_path)
-    try:
-        lock.__enter__()
-    except BlockingIOError as exc:
-        raise HostMutationLockError(
-            "another host mutation is already running"
-        ) from exc
+    lock = _take_host_mutation_reservation() or try_acquire_host_mutation_lock(settings)
+    if lock is None:
+        raise HostMutationLockError("another host mutation is already running")
     token = _LOCK_DEPTH.set(_LOCK_DEPTH.get() + 1)
     try:
         yield
@@ -822,6 +887,8 @@ async def host_mutation_operation(
 
         try:
             if _LOCK_DEPTH.get() == 0:
+                lock = _take_host_mutation_reservation()
+            if _LOCK_DEPTH.get() == 0 and lock is None:
                 if kind != "update_control_plane":
                     update_blocker = await _active_update_run_blocker(settings)
                     if update_blocker is not None:

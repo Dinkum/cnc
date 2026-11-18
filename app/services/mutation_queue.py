@@ -7,6 +7,7 @@ from contextlib import suppress
 from datetime import UTC, datetime
 import json
 from typing import Any
+from uuid import uuid4
 
 from pydantic import BaseModel
 from sqlalchemy import select, text
@@ -14,15 +15,16 @@ from sqlalchemy import select, text
 from app.config import Settings
 from app.logger import get_logger
 from app.models.entities import Operation
+from app.services.host_journal import commit_verified
 from app.services.operations import (
+    OperationHandle,
     QUEUED_JOB_KEY,
-    _active_update_run_blocker,
     _json_dumps,
     _json_loads_details,
     _operation_session,
     job_awaiting_dispatch,
     queued_job,
-    try_acquire_host_mutation_lock,
+    reserve_host_mutation_lock,
 )
 
 
@@ -61,7 +63,7 @@ def load_runners() -> None:
 _wake = asyncio.Event()
 # Secrets never reach the operation row, which is retained and shown in history.
 # A job whose secrets were lost to a restart fails rather than running without them.
-_SECRETS: dict[int, dict[str, Any]] = {}
+_SECRETS: dict[str, dict[str, Any]] = {}
 
 
 def mutation_runner(
@@ -87,38 +89,60 @@ def _encode(value: Any) -> Any:
 
 async def enqueue_mutation(
     settings: Settings,
-    operation_id: int,
     runner: str,
     *,
+    kind: str | None = None,
+    phase: str = "queued",
+    details: dict[str, Any] | None = None,
     secret_kwargs: dict[str, Any] | None = None,
     **kwargs: Any,
-) -> None:
+) -> OperationHandle:
     load_runners()
     if runner not in _RUNNERS:
         raise RuntimeError(f"mutation runner {runner} is not registered")
     secrets = {key: v for key, v in (secret_kwargs or {}).items() if v}
+    submission_id = uuid4().hex
     job = {
+        "submission_id": submission_id,
         "runner": runner,
         "kwargs": {key: _encode(v) for key, v in kwargs.items()},
         "secret_keys": sorted(secrets),
+        "enqueued_at": datetime.now(UTC).isoformat(),
     }
-    json.dumps(job)
-    if secrets:
-        _SECRETS[operation_id] = secrets
+    operation = Operation(
+        kind=kind or runner,
+        status="queued",
+        actor="ui",
+        phase=phase,
+        backend_id=kwargs.get("backend_id"),
+        details_json=json.dumps({**(details or {}), QUEUED_JOB_KEY: job}),
+    )
     async with _operation_session(settings.database_url) as session:
         await session.execute(text("PRAGMA busy_timeout=5000"))
-        operation = await session.get(Operation, operation_id)
-        if operation is None:
-            raise LookupError(f"operation {operation_id} not found")
-        details = _json_loads_details(operation.details_json)
-        details[QUEUED_JOB_KEY] = {**job, "enqueued_at": datetime.now(UTC).isoformat()}
-        operation.details_json = _json_dumps(details)
-        await session.commit()
+        session.add(operation)
+        await session.flush()
+        operation_id = operation.id
+        if secrets:
+            _SECRETS[submission_id] = secrets
+
+        def same_submission(row: Operation) -> bool:
+            saved = queued_job(_json_loads_details(row.details_json))
+            return bool(saved and saved.get("submission_id") == submission_id)
+
+        commit = await commit_verified(
+            session, settings, Operation, operation_id, matches=same_submission
+        )
+        if commit.outcome == "rolled_back":
+            _SECRETS.pop(submission_id, None)
+            raise RuntimeError(f"Could not queue {runner}: {commit.error}")
+        if commit.outcome == "unknown":
+            raise RuntimeError(f"Could not confirm operation {operation_id}. Check its status before submitting again.")
     _wake.set()
     logger.info("mutation_queue.enqueued", operation_id=operation_id, runner=runner)
+    return OperationHandle(id=operation_id, kind=kind or runner, settings=settings)
 
 
-async def _next_job(settings: Settings) -> tuple[int, dict[str, Any]] | None:
+async def _next_waiting_job(settings: Settings) -> int | None:
     async with _operation_session(settings.database_url) as session:
         await session.execute(text("PRAGMA busy_timeout=5000"))
         rows = (
@@ -134,16 +158,26 @@ async def _next_job(settings: Settings) -> tuple[int, dict[str, Any]] | None:
         )
         for operation in rows:
             details = _json_loads_details(operation.details_json)
-            if not job_awaiting_dispatch(details):
-                continue
-            job = queued_job(details)
-            assert job is not None
-            job["dispatched_at"] = datetime.now(UTC).isoformat()
-            details[QUEUED_JOB_KEY] = job
-            operation.details_json = _json_dumps(details)
-            await session.commit()
-            return int(operation.id), job
+            if job_awaiting_dispatch(details):
+                return int(operation.id)
     return None
+
+
+async def _claim_job(settings: Settings, operation_id: int) -> dict[str, Any] | None:
+    async with _operation_session(settings.database_url) as session:
+        await session.execute(text("PRAGMA busy_timeout=5000"))
+        operation = await session.get(Operation, operation_id)
+        if operation is None or operation.status != "queued":
+            return None
+        details = _json_loads_details(operation.details_json)
+        if not job_awaiting_dispatch(details):
+            return None
+        job = queued_job(details)
+        assert job is not None
+        job["dispatched_at"] = datetime.now(UTC).isoformat()
+        operation.details_json = _json_dumps(details)
+        await session.commit()
+        return job
 
 
 async def _fail_undispatchable(
@@ -160,23 +194,20 @@ async def _fail_undispatchable(
         await session.commit()
 
 
-async def _host_is_free(settings: Settings) -> bool:
-    if await _active_update_run_blocker(settings) is not None:
-        return False
-    lock = try_acquire_host_mutation_lock(settings)
-    if lock is None:
-        return False
-    lock.__exit__(None, None, None)
-    return True
-
-
 async def run_one(settings: Settings) -> bool:
-    if not await _host_is_free(settings):
+    operation_id = await _next_waiting_job(settings)
+    if operation_id is None:
         return False
-    claimed = await _next_job(settings)
-    if claimed is None:
+    async with reserve_host_mutation_lock(settings) as admitted:
+        if not admitted:
+            return False
+        return await _dispatch_job(settings, operation_id)
+
+
+async def _dispatch_job(settings: Settings, operation_id: int) -> bool:
+    job = await _claim_job(settings, operation_id)
+    if job is None:
         return False
-    operation_id, job = claimed
     registered = _RUNNERS.get(str(job["runner"]))
     if registered is None:
         await _fail_undispatchable(
@@ -185,7 +216,7 @@ async def run_one(settings: Settings) -> bool:
         return True
     kwargs = dict(job.get("kwargs") or {})
     secret_keys = list(job.get("secret_keys") or [])
-    secrets = _SECRETS.pop(operation_id, {})
+    secrets = _SECRETS.pop(job.get("submission_id", ""), {})
     if any(key not in secrets for key in secret_keys):
         await _fail_undispatchable(
             settings,
