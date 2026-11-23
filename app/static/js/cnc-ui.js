@@ -1,5 +1,6 @@
 (() => {
   const deferredScripts = new Map();
+  const assetQuery = globalThis.document?.currentScript?.getAttribute("src")?.split("?")[1];
 
   const escapeHtml = (value) => String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -31,6 +32,32 @@
     } finally {
       window.clearTimeout(timer);
     }
+  };
+
+  const refreshCsrfTokens = async () => {
+    const response = await fetch("/api/csrf", {
+      credentials: "same-origin",
+      headers: { Accept: "application/json" },
+    });
+    const payload = await response.json().catch(() => ({}));
+    const token = String(payload.csrf_token || "").trim();
+    if (!response.ok || !token) return "";
+    document.querySelectorAll("input[name='csrf_token']").forEach((input) => {
+      input.value = token;
+    });
+    return token;
+  };
+
+  const syncResourceSizeControls = (form, backendKind = "app") => {
+    const select = form.querySelector("[data-resource-size-control]");
+    if (!select) return;
+    form.querySelectorAll("[data-custom-resource-limit]").forEach((section) => {
+      const sectionKind = section.dataset.backendKindSection;
+      section.hidden = select.value !== "custom" || Boolean(sectionKind && sectionKind !== backendKind);
+      section.querySelectorAll("input, select, textarea").forEach((field) => {
+        field.disabled = section.hidden;
+      });
+    });
   };
 
   const readJsonScript = (id, fallback = {}) => {
@@ -72,10 +99,10 @@
     return promise;
   };
 
-  const ensureMetricChartAssets = async () => {
-    await loadDeferredScript("/static/vendor/chart-4.4.7.umd.min.js");
-    await loadDeferredScript("/static/js/metric-event-markers.js");
-  };
+  const ensureMetricChartAssets = () => Promise.all([
+    loadDeferredScript("/static/vendor/chart-4.4.7.umd.min.js"),
+    loadDeferredScript(`/static/js/metric-event-markers.js${assetQuery ? `?${assetQuery}` : ""}`),
+  ]);
 
   const metricNumber = (value) => {
     if (value == null || typeof value === "boolean" || (typeof value === "string" && !value.trim())) return null;
@@ -209,7 +236,9 @@
     normalizeTimestampValue,
     readJsonResponse,
     readJsonScript,
+    refreshCsrfTokens,
     renderLocalTimes,
+    syncResourceSizeControls,
     withRequestDeadline,
   });
 })();

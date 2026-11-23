@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal
 
-from sqlalchemy import event, select, text
+from sqlalchemy import event, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -22,6 +22,7 @@ from app.services.file_locks import FileLock
 from app.services.history_retention import prune_control_plane_history
 from app.services.operation_progress import (
     clear_operation_progress,
+    read_operation_progress,
     write_operation_progress,
 )
 
@@ -183,15 +184,11 @@ class OperationHandle:
     kind: str
     settings: Settings
     completed: bool = False
-    defer_db_updates: bool = False
     _is_step: bool = False
 
     def as_step(self) -> "OperationHandle":
         """Link nested work to this ID. The owner publishes progress and completion."""
         return replace(self, completed=False, _is_step=True)
-
-    def with_deferred_db_updates(self) -> "OperationHandle":
-        return replace(self, defer_db_updates=True)
 
     def publish_progress(
         self,
@@ -244,17 +241,10 @@ class OperationHandle:
             self.publish_progress(
                 status=status, phase=phase, details=details, error=error
             )
-        if self.defer_db_updates:
-            if finished:
-                self.completed = True
-            return
         attempts = TERMINAL_UPDATE_RETRY_ATTEMPTS if finished else 1
         for attempt in range(1, attempts + 1):
             try:
                 async with _operation_session(self.settings.database_url) as session:
-                    await session.execute(
-                        text(f"PRAGMA busy_timeout={5000 if finished else 0}")
-                    )
                     operation = await session.get(Operation, self.id)
                     if operation is None:
                         return
@@ -274,7 +264,6 @@ class OperationHandle:
                         )
                     if finished:
                         operation.finished_at = datetime.now(UTC)
-                        await prune_control_plane_history(session)
                     await session.commit()
                     if finished:
                         self.completed = True
@@ -300,6 +289,26 @@ class OperationHandle:
                 )
                 if attempt < attempts:
                     await asyncio.sleep(TERMINAL_UPDATE_RETRY_BACKOFF_SEC * attempt)
+        if finished and status in {"success", "failed", "partial", "cancelled"}:
+            try:
+                write_operation_progress(
+                    self.settings,
+                    self.id,
+                    status=status,
+                    phase=phase,
+                    details=details,
+                    error=error,
+                    pending_terminal_write=True,
+                    config_revision=config_revision,
+                    desired_state_hash=desired_state_hash,
+                )
+            except OSError as exc:
+                logger.error(
+                    "operation.terminal_write_failed",
+                    operation_id=self.id,
+                    error=str(exc),
+                )
+            self.completed = True
 
     async def complete(
         self,
@@ -335,18 +344,11 @@ class OperationHandleProxy:
     def completed(self, value: bool) -> None:
         self.operation.completed = value
 
-    @property
-    def defer_db_updates(self) -> bool:
-        return self.operation.defer_db_updates
-
     def __getattr__(self, name: str) -> Any:
         return getattr(self.operation, name)
 
     def _wrap_operation(self, operation: OperationHandle) -> "OperationHandleProxy":
         return type(self)(operation)
-
-    def with_deferred_db_updates(self) -> "OperationHandleProxy":
-        return self._wrap_operation(self.operation.with_deferred_db_updates())
 
     async def update(
         self,
@@ -382,7 +384,7 @@ class OperationHandleProxy:
 
 def validate_operation_handle_contract(operation_handle: object) -> None:
     required_data = ("id", "kind", "settings", "completed")
-    required_methods = ("update", "complete", "with_deferred_db_updates")
+    required_methods = ("update", "complete")
     for name in required_data:
         try:
             getattr(operation_handle, name)
@@ -402,20 +404,6 @@ def validate_operation_handle_contract(operation_handle: object) -> None:
         raise OperationHandleContractError(
             "operation handle must allow completed state updates"
         ) from exc
-    deferred = operation_handle.with_deferred_db_updates()
-    for name in required_data:
-        try:
-            getattr(deferred, name)
-        except AttributeError as exc:
-            raise OperationHandleContractError(
-                f"deferred operation handle missing required attribute: {name}"
-            ) from exc
-    for name in required_methods:
-        member = getattr(deferred, name, None)
-        if not callable(member):
-            raise OperationHandleContractError(
-                f"deferred operation handle missing required method: {name}"
-            )
 
 
 async def create_operation(
@@ -469,16 +457,21 @@ async def active_host_mutation_blocker(
     if database_url:
         try:
             async with _operation_session(str(database_url)) as session:
-                operation = (
-                    await session.execute(
+                while True:
+                    operation = await session.scalar(
                         select(Operation)
                         .where(Operation.status.in_(ACTIVE_OPERATION_STATUSES))
                         .where(Operation.kind.in_(HOST_MUTATION_OPERATION_KINDS))
                         .order_by(Operation.id.asc())
                         .limit(1)
                     )
-                ).scalar_one_or_none()
-                if operation is not None:
+                    if operation is None:
+                        break
+                    if _recover_terminal_operation(settings, operation):
+                        operation_id = operation.id
+                        await session.commit()
+                        _clear_terminal_operation_snapshot(settings, operation_id)
+                        continue
                     return HostMutationBlocker(
                         id=operation.id,
                         kind=operation.kind,
@@ -506,6 +499,43 @@ async def active_host_mutation_blocker(
     else:
         lock.__exit__(None, None, None)
     return None
+
+
+def _recover_terminal_operation(settings: Settings, operation: Operation) -> bool:
+    snapshot = read_operation_progress(settings, operation.id)
+    if not snapshot or snapshot.get("pending_terminal_write") is not True:
+        return False
+    status = snapshot.get("status")
+    if status not in {"success", "failed", "partial", "cancelled"}:
+        return False
+    try:
+        finished_at = datetime.fromisoformat(snapshot.get("updated_at"))
+    except (TypeError, ValueError):
+        return False
+    if finished_at.replace(tzinfo=None) < operation.started_at.replace(tzinfo=None):
+        return False
+    operation.status = status
+    for field in ("phase", "error", "config_revision", "desired_state_hash"):
+        if isinstance(snapshot.get(field), str):
+            setattr(operation, field, snapshot[field])
+    details = snapshot.get("details")
+    if isinstance(details, dict):
+        operation.details_json = _json_dumps(
+            {**_json_loads_details(operation.details_json), **details}
+        )
+    operation.finished_at = finished_at
+    return True
+
+
+def _clear_terminal_operation_snapshot(settings: Settings, operation_id: int) -> None:
+    try:
+        clear_operation_progress(settings, operation_id)
+    except OSError as exc:
+        logger.warning(
+            "operation.progress_snapshot_cleanup_skipped",
+            operation_id=operation_id,
+            error=str(exc),
+        )
 
 
 async def _reconcile_update_run_for_blocker(
@@ -602,7 +632,11 @@ async def fail_interrupted_operations(settings: Settings) -> int:
             return 0
         finished_at = datetime.now(UTC)
         interrupted = 0
+        recovered_ids = []
         for operation in operations:
+            if _recover_terminal_operation(settings, operation):
+                recovered_ids.append(operation.id)
+                continue
             details = _json_loads_details(operation.details_json)
             if operation.status == "queued" and job_awaiting_dispatch(details):
                 continue
@@ -670,6 +704,8 @@ async def fail_interrupted_operations(settings: Settings) -> int:
                 operation.details_json = _json_dumps(details)
         await prune_control_plane_history(session)
         await session.commit()
+        for operation_id in recovered_ids:
+            _clear_terminal_operation_snapshot(settings, operation_id)
         if interrupted:
             logger.warning("operations.interrupted_marked_failed", count=interrupted)
         return interrupted
@@ -796,15 +832,27 @@ async def host_mutation_lock(settings: Settings):
     if _LOCK_DEPTH.get() > 0:
         yield
         return
-    lock = _take_host_mutation_reservation() or try_acquire_host_mutation_lock(settings)
+    lock = _take_host_mutation_reservation()
+    reserved = lock is not None
     if lock is None:
-        raise HostMutationLockError("another host mutation is already running")
-    token = _LOCK_DEPTH.set(_LOCK_DEPTH.get() + 1)
+        lock = try_acquire_host_mutation_lock(settings)
     try:
-        yield
+        if not reserved:
+            blocker = await _active_update_run_blocker(settings)
+            if blocker is not None:
+                raise HostMutationLockError(
+                    "a control-plane update is already running", blocker=blocker
+                )
+        if lock is None:
+            raise HostMutationLockError("another host mutation is already running")
+        token = _LOCK_DEPTH.set(_LOCK_DEPTH.get() + 1)
+        try:
+            yield
+        finally:
+            _LOCK_DEPTH.reset(token)
     finally:
-        _LOCK_DEPTH.reset(token)
-        lock.__exit__(None, None, None)
+        if lock is not None:
+            lock.__exit__(None, None, None)
 
 
 @asynccontextmanager
@@ -892,29 +940,22 @@ async def host_mutation_operation(
                 if kind != "update_control_plane":
                     update_blocker = await _active_update_run_blocker(settings)
                     if update_blocker is not None:
-                        blocker_error = await complete_update_blocker(update_blocker)
-                        raise blocker_error
-                lock_path = _host_lock_path(settings)
-                lock = FileLock(lock_path, blocking=False, lock_path=lock_path)
-                try:
-                    lock.__enter__()
-                except BlockingIOError as exc:
-                    if kind != "update_control_plane":
-                        update_blocker = await _active_update_run_blocker(settings)
-                        if update_blocker is not None:
-                            blocker_error = await complete_update_blocker(
-                                update_blocker
-                            )
-                            raise blocker_error from exc
+                        raise await complete_update_blocker(update_blocker)
+                lock = try_acquire_host_mutation_lock(settings)
+                if kind != "update_control_plane":
+                    update_blocker = await _active_update_run_blocker(settings)
+                    if update_blocker is not None:
+                        raise await complete_update_blocker(update_blocker)
+                if lock is None:
                     await complete_safely(
                         "failed",
                         complete_phase=phase or "lock",
                         error="another host mutation is already running",
-                        details={"lock_path": str(lock_path)},
+                        details={"lock_path": str(_host_lock_path(settings))},
                     )
                     raise HostMutationLockError(
                         "another host mutation is already running"
-                    ) from exc
+                    )
             token = _LOCK_DEPTH.set(_LOCK_DEPTH.get() + 1)
             await operation.update(status="running", phase=phase)
             yield operation

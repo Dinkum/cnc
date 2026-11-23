@@ -52,17 +52,12 @@ BACKUP_EXACT_SUBSTATES = {
     "backup requested": "Backup requested",
     "gathering app data": "Gathering app data",
     "collecting mounted paths": "Collecting mounted paths",
-    "exporting container snapshot": "Exporting container snapshot",
     "verifying backup": "Verifying backup",
     "backup verified": "Backup verified",
     "saving backup record": "Saving backup record",
 }
 
 BACKUP_PREFIX_SUBSTATES = (
-    (
-        ("capturing container snapshot", "container snapshot"),
-        "Capturing container snapshot",
-    ),
     (("measured ",), "Measuring source data"),
     (("exporting path ", "exported path "), "Exporting mounted paths"),
     (("compressing backup bundle",), "Compressing backup bundle"),

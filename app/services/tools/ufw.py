@@ -24,6 +24,38 @@ def applies(plan: Plan) -> bool:
     return bool(getattr(plan.settings, "nginx_cloudflare_only", False))
 
 
+def check(plan: Plan) -> None:
+    if not applies(plan):
+        return
+    cidrs = tuple(plan.extra("cloudflare_cidrs") or plan.settings.cloudflare_ip_list)
+    if not cidrs:
+        return
+    v4 = Path(plan.extra("ufw_user_rules_path") or UFW_USER_RULES_PATH)
+    v6 = Path(plan.extra("ufw_user6_rules_path") or UFW_USER6_RULES_PATH)
+    if not v4.exists() or not v6.exists():
+        return
+    before = (v4.read_text(encoding="utf-8"), v6.read_text(encoding="utf-8"))
+    if not _rules_files_are_ours_to_edit(before):
+        return
+    policy = build_cloudflare_ingress_policy(cidrs)
+    if _would_change_rules(policy, before):
+        _require_active(plan)
+
+
+def _would_change_rules(policy, before: tuple[str, str]) -> bool:
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="cnc-ufw-check-") as temp_dir:
+        tmp_v4 = Path(temp_dir) / "user.rules"
+        tmp_v6 = Path(temp_dir) / "user6.rules"
+        tmp_v4.write_text(before[0], encoding="utf-8")
+        tmp_v6.write_text(before[1], encoding="utf-8")
+        result = rewrite_cloudflare_http_firewall_files(
+            policy, user_rules_path=tmp_v4, user6_rules_path=tmp_v6
+        )
+        return _rewrote_anything(result)
+
+
 def ufw(plan: Plan) -> bool:
     if not applies(plan):
         return False

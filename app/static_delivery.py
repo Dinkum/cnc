@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from functools import lru_cache
+from hashlib import sha256
 from pathlib import Path
 import re
 from urllib.parse import parse_qs
@@ -20,11 +22,26 @@ _VERSIONED_VENDOR_PATH_RE = re.compile(
 
 def stylesheet_asset_version(static_files_dir: Path) -> str:
     version = current_app_version()
-    try:
-        css_path = Path(static_files_dir) / "css" / "app.css"
-        return f"{version}-{int(css_path.stat().st_mtime)}"
-    except OSError:
-        return version
+    digest = sha256()
+    assets = 0
+    for directory, extension in (("css", ".css"), ("js", ".js")):
+        for path in sorted((static_files_dir / directory).glob(f"*{extension}")):
+            try:
+                info = path.stat()
+                content_digest = _asset_digest(
+                    path, info.st_mtime_ns, info.st_ctime_ns, info.st_size
+                )
+            except OSError:
+                continue
+            digest.update(f"{directory}/{path.name}\0".encode())
+            digest.update(content_digest)
+            assets += 1
+    return f"{version}-{digest.hexdigest()[:16]}" if assets else version
+
+
+@lru_cache(maxsize=128)
+def _asset_digest(path: Path, _mtime_ns: int, _ctime_ns: int, _size: int) -> bytes:
+    return sha256(path.read_bytes()).digest()
 
 
 class StaticAssetCacheMiddleware:

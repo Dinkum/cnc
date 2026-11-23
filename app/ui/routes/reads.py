@@ -47,6 +47,7 @@ from app.services.debug_bundle import (
 )
 from app.services.error_reporting import ErrorCode
 from app.services.resource_profile import build_resource_profile
+from app.services.startup_state import snapshot_startup_state
 from app.services.status_service import peek_cached_status
 from app.ui.cluster import cluster_nodes
 from app.ui.diagnostics import (
@@ -403,11 +404,17 @@ async def download_error_debug_bundle(
 
 @router.get("/api/support/bundle.zip")
 async def download_support_debug_bundle(
+    request: Request,
     settings: Settings = Depends(settings_dependency),
     session: AsyncSession = Depends(db_session_dependency),
 ) -> Response:
     await flush_logging_pipeline_async()
-    bundle = await build_support_debug_bundle(session, settings)
+    bundle = await build_support_debug_bundle(
+        session,
+        settings,
+        startup=snapshot_startup_state(request.app),
+        cached_status=peek_cached_status(),
+    )
     return Response(
         bundle.content,
         media_type="application/zip",
@@ -436,9 +443,11 @@ async def output_hardening_phase2_events(
                 )
             ).scalar_one_or_none()
             if backend is None:
+                await session.rollback()
                 yield 'event: error\ndata: {"error":"output not found"}\n\n'
                 break
             payload = await latest_hardening_summary(session, backend_id)
+            await session.rollback()
             payload_json = json.dumps(payload, separators=(",", ":"), default=str)
             now = asyncio.get_running_loop().time()
             if payload_json != last_payload_json:
@@ -453,7 +462,6 @@ async def output_hardening_phase2_events(
             )
             if str(phase2.get("status") or "").lower() not in {"queued", "running"}:
                 break
-            await session.rollback()
             await asyncio.sleep(1)
 
     return StreamingResponse(

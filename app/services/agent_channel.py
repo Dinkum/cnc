@@ -9,7 +9,6 @@ import fcntl
 import json
 import os
 import pty
-import shlex
 import signal
 import struct
 import termios
@@ -43,6 +42,8 @@ AGENT_CHANNEL_PATH = "/api/agent/channel"
 AGENT_CHANNEL_VERSION = "beta.2"
 MAX_FRAME_BYTES = 64 * 1024
 MAX_OUTPUT_CHUNK_BYTES = 16 * 1024
+PTY_INPUT_TIMEOUT_SEC = 2
+PROCESS_CLEANUP_TIMEOUT_SEC = 2
 DEFAULT_EXEC_TIMEOUT_SEC = 60
 MAX_EXEC_TIMEOUT_SEC = 60 * 30
 DEFAULT_PTY_IDLE_TIMEOUT_SEC = 60 * 15
@@ -121,8 +122,10 @@ class PtySession:
         self.process: asyncio.subprocess.Process | None = None
         self.pump_task: asyncio.Task[None] | None = None
         self.wait_task: asyncio.Task[None] | None = None
+        self.write_task: asyncio.Task[None] | None = None
         self.last_activity = time.monotonic()
         self.closed = False
+        self._closing = False
         self.started_at: float | None = None
         self.close_reason = "unknown"
         self.lifecycle_closed_logged = False
@@ -207,12 +210,27 @@ class PtySession:
             raise AgentChannelFrameError("pty_closed", "pty session is closed")
         self.last_activity = time.monotonic()
         payload = data.encode("utf-8", errors="replace")
+        task = asyncio.create_task(_write_nonblocking(self.master_fd, payload))
+        self.write_task = task
         try:
-            await _write_nonblocking(self.master_fd, payload)
+            await task
+        except TimeoutError:
+            raise AgentChannelFrameError(
+                "pty_input_timeout", "pty did not accept input before the deadline"
+            ) from None
+        except asyncio.CancelledError:
+            caller = asyncio.current_task()
+            if not self.closed or (caller is not None and caller.cancelling()):
+                raise
+            raise AgentChannelFrameError(
+                "pty_closed", "pty session is closed"
+            ) from None
         except OSError:
             raise AgentChannelFrameError(
                 "pty_closed", "pty session is closed"
             ) from None
+        finally:
+            self.write_task = None
 
     async def resize(self, cols: int, rows: int) -> None:
         if self.closed or self.master_fd is None:
@@ -234,38 +252,38 @@ class PtySession:
         await self._shutdown(reason=reason)
 
     async def _shutdown(self, *, reason: str) -> None:
+        if self._closing:
+            return
+        self._closing = True
         self.close_reason = reason
         self.closed = True
-        self._close_master_fd()
-        tasks = self._background_tasks()
-        for task in tasks:
-            if task is not self.wait_task:
-                task.cancel()
         try:
-            if self.process is not None and self.process.returncode is None:
-                await _terminate_process(self.process)
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-        except BaseException:
-            for task in tasks:
-                task.cancel()
-            raise
-        finally:
             try:
-                if tasks:
-                    await asyncio.gather(*tasks, return_exceptions=True)
+                await self._stop_io_tasks()
             finally:
                 self._close_master_fd()
+                if self.process is not None and self.process.returncode is None:
+                    await _terminate_process(self.process)
+        finally:
+            try:
+                waiter = self.wait_task
+                if waiter is not None and waiter is not asyncio.current_task():
+                    waiter.cancel()
+                    await asyncio.gather(waiter, return_exceptions=True)
+            finally:
                 self._release_guest_guard()
 
-    def _background_tasks(self) -> list[asyncio.Task[None]]:
+    async def _stop_io_tasks(self) -> None:
         current = asyncio.current_task()
-        return [
+        tasks = [
             task
-            for task in (self.pump_task, self.wait_task)
+            for task in (self.pump_task, self.write_task)
             if task is not None and task is not current and not task.done()
         ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def _close_master_fd(self) -> None:
         if self.master_fd is None:
@@ -377,8 +395,12 @@ class PtySession:
                     {"id": self.frame_id, "type": "pty.exit", "code": code}
                 )
         finally:
-            self._close_master_fd()
-            self._release_guest_guard()
+            if not self._closing:
+                try:
+                    await self._stop_io_tasks()
+                finally:
+                    self._close_master_fd()
+                    self._release_guest_guard()
 
 
 async def authenticate_agent_websocket(
@@ -1072,10 +1094,19 @@ async def _finish_exec_process(
     *,
     terminate: bool = False,
 ) -> None:
-    if terminate and process is not None and process.returncode is None:
-        await _terminate_process(process)
-    if stream_tasks:
-        await asyncio.gather(*stream_tasks, return_exceptions=True)
+    try:
+        if terminate and process is not None and process.returncode is None:
+            await _terminate_process(process)
+    finally:
+        if stream_tasks:
+            try:
+                async with asyncio.timeout(PROCESS_CLEANUP_TIMEOUT_SEC):
+                    await asyncio.gather(*stream_tasks, return_exceptions=True)
+            except TimeoutError:
+                if not terminate:
+                    raise RuntimeError(
+                        "exec output did not close before the deadline"
+                    ) from None
 
 
 async def _stream_reader(
@@ -1224,13 +1255,14 @@ async def _wait_for_fd(
 
 async def _write_nonblocking(fd: int, payload: bytes) -> None:
     remaining = memoryview(payload)
-    while remaining:
-        try:
-            written = os.write(fd, remaining)
-        except BlockingIOError:
-            await _wait_for_fd(fd, writable=True)
-            continue
-        remaining = remaining[written:]
+    async with asyncio.timeout(PTY_INPUT_TIMEOUT_SEC):
+        while remaining:
+            try:
+                written = os.write(fd, remaining)
+            except BlockingIOError:
+                await _wait_for_fd(fd, writable=True)
+                continue
+            remaining = remaining[written:]
 
 
 async def _terminate_process(process: asyncio.subprocess.Process) -> None:
@@ -1244,7 +1276,7 @@ async def _terminate_process(process: asyncio.subprocess.Process) -> None:
     except ProcessLookupError:
         return
     try:
-        await asyncio.wait_for(process.wait(), timeout=2)
+        await asyncio.wait_for(process.wait(), timeout=PROCESS_CLEANUP_TIMEOUT_SEC)
     except TimeoutError:
         try:
             if process.pid:
@@ -1253,27 +1285,13 @@ async def _terminate_process(process: asyncio.subprocess.Process) -> None:
                 process.kill()
         except ProcessLookupError:
             return
-        await process.wait()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=PROCESS_CLEANUP_TIMEOUT_SEC)
+        except TimeoutError:
+            logger.warning(
+                "agent_channel.process_cleanup_timeout", process_pid=process.pid
+            )
 
 
 def _duration_ms(started_at: float) -> int:
     return int((time.monotonic() - started_at) * 1000)
-
-
-def agent_channel_client_example(host: str) -> str:
-    endpoint = f"wss://{host}{AGENT_CHANNEL_PATH}"
-    frame = json.dumps(
-        {
-            "id": "1",
-            "type": "exec",
-            "output": "<output>",
-            "argv": ["python3", "--version"],
-        },
-        separators=(",", ":"),
-    )
-    return (
-        "websocat "
-        "-H 'Authorization: Bearer <admin-access-key>' "
-        f"{shlex.quote(endpoint)} "
-        f"<<< {shlex.quote(frame)}"
-    )

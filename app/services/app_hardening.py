@@ -9,6 +9,7 @@ import math
 from pathlib import Path
 import re
 import shutil
+import time
 from typing import Any
 
 from sqlalchemy import select
@@ -28,6 +29,7 @@ from app.services.commands import CommandError, CommandResult, run_command
 from app.services.container_runtime import container_presence, inspect_container
 from app.services.observation import Absent, Present, Unknown
 from app.services.control_events import emit_control_event
+from app.services.operations import _operation_session, operation_session_scope
 from app.services.renderers import container_name, network_name, safe_slug
 from app.services.resource_profile import build_resource_profile
 
@@ -1015,6 +1017,11 @@ async def _run_phase1_monitor_async(
 async def _run_phase2_test_async(
     settings: Settings, run_id: int, backend_id: int
 ) -> None:
+    async with operation_session_scope(settings.database_url):
+        await _run_phase2_test(settings, run_id, backend_id)
+
+
+async def _run_phase2_test(settings: Settings, run_id: int, backend_id: int) -> None:
     ratings: dict[str, str] = {}
     details: dict[str, Any] = {"tested": [], "skipped": []}
     completed_names: set[str] = set()
@@ -1178,6 +1185,7 @@ async def _run_phase2_test_async(
             substate="creating_network",
         )
         _create_test_network(clone_backend.name, evidence_dir, settings)
+        loop = asyncio.get_running_loop()
         for setting in STRICT_SETTINGS:
             if await _run_was_cancelled(settings, run_id):
                 logger.info(
@@ -1252,17 +1260,19 @@ async def _run_phase2_test_async(
             )
 
             def publish_substate(substate: str) -> None:
-                _record_phase2_progress_sync(
-                    settings,
-                    run_id,
-                    ratings,
-                    details,
-                    total=total_settings,
-                    completed=completed_settings,
-                    state="testing",
-                    substate=substate,
-                    current_setting=setting.name,
-                )
+                asyncio.run_coroutine_threadsafe(
+                    _record_phase2_substate(
+                        settings,
+                        run_id,
+                        ratings,
+                        details,
+                        total=total_settings,
+                        completed=completed_settings,
+                        substate=substate,
+                        current_setting=setting.name,
+                    ),
+                    loop,
+                ).result()
 
             rating = await asyncio.to_thread(
                 _test_strict_setting,
@@ -1859,7 +1869,7 @@ async def _record_phase2_progress(
     substate: str,
     current_setting: str | None = None,
 ) -> None:
-    async with _session(settings) as session:
+    async with _operation_session(settings.database_url) as session:
         run = await session.get(BackendHardeningRun, run_id)
         if run is None or run.status not in {"queued", "running"}:
             return
@@ -1877,7 +1887,7 @@ async def _record_phase2_progress(
         await session.commit()
 
 
-def _record_phase2_progress_sync(
+async def _record_phase2_substate(
     settings: Settings,
     run_id: int,
     ratings: dict[str, str],
@@ -1885,29 +1895,26 @@ def _record_phase2_progress_sync(
     *,
     total: int,
     completed: int,
-    state: str,
     substate: str,
-    current_setting: str | None = None,
+    current_setting: str,
 ) -> None:
     try:
-        asyncio.run(
-            _record_phase2_progress(
-                settings,
-                run_id,
-                ratings,
-                details,
-                total=total,
-                completed=completed,
-                state=state,
-                substate=substate,
-                current_setting=current_setting,
-            )
+        await _record_phase2_progress(
+            settings,
+            run_id,
+            ratings,
+            details,
+            total=total,
+            completed=completed,
+            state="testing",
+            substate=substate,
+            current_setting=current_setting,
         )
     except Exception as exc:
         logger.warning(
             "app_hardening.phase2.progress_update_failed",
             run_id=run_id,
-            state=state,
+            state="testing",
             substate=substate,
             error=str(exc),
         )
@@ -2109,10 +2116,10 @@ def _watch_container(
     settings: Settings,
     start_ts: datetime,
 ) -> tuple[bool, str]:
-    deadline = datetime.now(UTC).timestamp() + settings.hardening_phase2_test_sec
+    deadline = time.monotonic() + settings.hardening_phase2_test_sec
     lines: list[str] = []
-    ok = True
-    while datetime.now(UTC).timestamp() < deadline:
+    ok = False
+    while time.monotonic() < deadline:
         observation = inspect_container(
             container, timeout_sec=settings.command_timeout_status_sec
         )
@@ -2124,9 +2131,8 @@ def _watch_container(
             status = "unknown"
         lines.append(f"{datetime.now(UTC).isoformat()} state={status}")
         if status in {"exited", "dead", "missing"}:
-            ok = False
             break
-        if backend.port is not None:
+        if status == "running" and backend.port is not None:
             probe = probe_backend_health(
                 backend,
                 host="127.0.0.1",
@@ -2136,9 +2142,10 @@ def _watch_container(
             lines.append(
                 f"probe ok={probe.ok} status={probe.http_status} error={probe.error}"
             )
-            if probe.ok:
+            if probe.checked and probe.ok:
+                ok = True
                 break
-        asyncio.run(asyncio.sleep(3))
+        time.sleep(max(0.0, min(3.0, deadline - time.monotonic())))
     logs = run_command(
         ["podman", "logs", "--since", start_ts.isoformat(), container],
         timeout_sec=settings.command_timeout_status_sec,

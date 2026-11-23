@@ -1,3 +1,5 @@
+{% set initial_tab = active_tab if (active_tab in ["home", "inputs", "outputs", "settings"] or (active_tab == "routing" and beta_routing)) else "home" %}
+{% if not panel_only %}
 <!doctype html>
 <html lang="en">
 <head>
@@ -8,7 +10,6 @@
   <link rel="stylesheet" href="/static/css/app.css?v={{ asset_version }}">
   <link rel="stylesheet" href="/static/css/cloudflare.css?v={{ asset_version }}">
 </head>
-{% set initial_tab = active_tab if (active_tab in ["home", "inputs", "outputs", "settings"] or (active_tab == "routing" and beta_routing)) else "home" %}
 <body data-update-status="{{ status.last_update.status if status.last_update else '' }}" data-initial-tab="{{ initial_tab }}">
   <main class="shell">
     <header class="site-header card">
@@ -24,6 +25,7 @@
       <button class="tab{% if initial_tab == 'outputs' %} is-active{% endif %}" type="button" data-tab="outputs" aria-selected="{{ 'true' if initial_tab == 'outputs' else 'false' }}">outputs</button>
       <button class="tab{% if initial_tab == 'settings' %} is-active{% endif %}" type="button" data-tab="settings" aria-selected="{{ 'true' if initial_tab == 'settings' else 'false' }}">settings</button>
     </nav>
+{% endif %}
 
     {% if flash_error %}
       <section class="banner error">
@@ -39,6 +41,7 @@
     {% endif %}
 
 
+    {% if not panel_only or initial_tab == "home" %}
     <section class="panel" data-panel="home" data-loaded="{{ '1' if initial_tab == 'home' else '0' }}"{% if initial_tab != "home" %} hidden{% endif %}>
       <article class="card">
         <div class="section-head">
@@ -115,7 +118,9 @@
         </div>
       </article>
     </section>
+    {% endif %}
 
+    {% if not panel_only or initial_tab == "inputs" %}
     <section class="panel" data-panel="inputs" data-loaded="{{ '1' if initial_tab == 'inputs' else '0' }}"{% if initial_tab != "inputs" %} hidden{% endif %}>
       {% if initial_tab == "inputs" %}
       <article class="card">
@@ -355,8 +360,9 @@
       </article>
       {% endif %}
     </section>
+    {% endif %}
 
-    {% if beta_routing %}
+    {% if beta_routing and (not panel_only or initial_tab == "routing") %}
     <section class="panel" data-panel="routing" data-loaded="{{ '1' if initial_tab == 'routing' else '0' }}"{% if initial_tab != "routing" %} hidden{% endif %}>
       <article class="card">
         <div class="section-head">
@@ -373,6 +379,7 @@
     </section>
     {% endif %}
 
+    {% if not panel_only or initial_tab == "outputs" %}
     <section class="panel" data-panel="outputs" data-loaded="{{ '1' if initial_tab == 'outputs' else '0' }}"{% if initial_tab != "outputs" %} hidden{% endif %}>
       {% if initial_tab == "outputs" %}
       <article class="card">
@@ -556,8 +563,15 @@
       </article>
       {% endif %}
     </section>
+    {% endif %}
 
+    {% if not panel_only or initial_tab == "settings" %}
     <section class="panel" data-panel="settings" data-loaded="{{ '1' if initial_tab == 'settings' else '0' }}"{% if initial_tab != "settings" %} hidden{% endif %}>
+      {% if startup_warnings %}
+        <aside class="banner pending" role="status" data-startup-warning>
+          <span>{{ startup_warnings | join(" ") }} See the support bundle for details.</span>
+        </aside>
+      {% endif %}
       <div class="panel-grid apply-grid">
         <article class="card span-2">
           <div class="section-head">
@@ -948,6 +962,7 @@
               </table>
             </div>
           </section>
+    {% endif %}
           <div class="settings-sections">
             {% for section in settings_sections %}
               <section class="settings-section">
@@ -1082,6 +1097,7 @@
         </form>
       </dialog>
     </section>
+{% if not panel_only %}
   </main>
 
   <dialog class="confirm-modal" id="confirm-modal">
@@ -1245,3 +1261,4 @@
   <script src="/static/js/cloudflare-tunnel.js?v={{ asset_version }}"></script>
 </body>
 </html>
+{% endif %}

@@ -99,8 +99,12 @@
     if (form?.matches('[data-cf-domain-form]')) updateConnectionFields(form);
     if (form?.matches('[data-input-create-form]')) updateCreateConnection(form);
   });
-  document.querySelectorAll('[data-cf-domain-form]').forEach(updateConnectionFields);
-  document.querySelectorAll('[data-input-create-form]').forEach(updateCreateConnection);
+  const bind = root => {
+    root.querySelectorAll('[data-cf-domain-form]').forEach(updateConnectionFields);
+    root.querySelectorAll('[data-input-create-form]').forEach(updateCreateConnection);
+  };
+  window.CNCCloudflare = { bind };
+  bind(document);
   document.addEventListener('submit', async event => {
     const form = event.target;
     if (!form.matches('[data-cf-connect-form], [data-cf-domain-form]')) return;

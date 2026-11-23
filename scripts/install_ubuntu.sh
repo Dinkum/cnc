@@ -413,7 +413,7 @@ verify_staged_podman() {
 snapshot_managed_podman_activation() {
   local snapshot="$1"
   : >"${snapshot}"
-  local path
+  local path file_number=0
   for path in \
     "${MANAGED_PODMAN_COMMAND_PATH}" \
     "${MANAGED_PODMAN_LOCAL_COMMAND_PATH}" \
@@ -421,7 +421,9 @@ snapshot_managed_podman_activation() {
     if [[ -L "${path}" ]]; then
       printf 'link\t%s\t%s\n' "${path}" "$(readlink "${path}")" >>"${snapshot}"
     elif [[ -e "${path}" ]]; then
-      printf 'file\t%s\t\n' "${path}" >>"${snapshot}"
+      file_number=$((file_number + 1))
+      cp -p "${path}" "${snapshot}.file-${file_number}" || return $?
+      printf 'file\t%s\t%s\n' "${path}" "${file_number}" >>"${snapshot}"
     else
       printf 'absent\t%s\t\n' "${path}" >>"${snapshot}"
     fi
@@ -455,6 +457,15 @@ restore_managed_podman_activation() {
           || log "restore: could not relink ${path}"
         ;;
       file)
+        if [[ -L "${path}" || ! -e "${path}" ]]; then
+          local restored result=0
+          restored="$(mktemp "${path}.cnc-rollback.XXXXXX")" || return $?
+          cp -p "${snapshot}.file-${value}" "${restored}" && mv -f "${restored}" "${path}" || result=$?
+          if (( result )); then
+            rm -f "${restored}"
+            return "${result}"
+          fi
+        fi
         ;;
       absent)
         rm -f "${path}" 2>/dev/null || log "restore: could not remove ${path}"
@@ -478,7 +489,12 @@ restore_managed_podman_activation() {
         ;;
     esac
   done <"${snapshot}"
-  rm -f "${snapshot}" "${snapshot}.conf"
+  cleanup_managed_podman_activation_snapshot "${snapshot}"
+}
+
+cleanup_managed_podman_activation_snapshot() {
+  local snapshot="$1"
+  rm -f "${snapshot}" "${snapshot}.conf" "${snapshot}".file-*
 }
 
 activate_managed_podman() {
@@ -504,7 +520,7 @@ activate_managed_podman() {
     log "the previous runtime was restored. Until the reason above is fixed on this host, app guests cannot start."
     return 1
   fi
-  rm -f "${snapshot}" "${snapshot}.conf"
+  cleanup_managed_podman_activation_snapshot "${snapshot}"
 }
 
 report_command_output() {
@@ -917,12 +933,17 @@ setup_directories() {
 }
 
 install_tailscale() {
-  local tailscale_installer="/tmp/tailscale-install.sh"
-
   if ! command -v tailscale >/dev/null 2>&1; then
-    run_cmd curl -fsSL https://tailscale.com/install.sh -o "${tailscale_installer}" || return $?
-    run_cmd sh "${tailscale_installer}" || return $?
+    local tailscale_installer result=0
+    tailscale_installer="$(mktemp -t cnc-tailscale-install.XXXXXX)" || return $?
+    {
+      run_cmd curl -fsSL https://tailscale.com/install.sh -o "${tailscale_installer}" &&
+        run_cmd sh "${tailscale_installer}"
+    } || result=$?
     rm -f "${tailscale_installer}"
+    if (( result )); then
+      return "${result}"
+    fi
   fi
 
   if ! systemctl is-enabled --quiet tailscaled >/dev/null 2>&1; then
@@ -1323,8 +1344,8 @@ set_env_key_value() {
   local value="$2"
   local tmp_file
   tmp_file="$(mktemp "${ENV_FILE}.tmp.XXXXXX")"
-  awk -v k="${key}" -v v="${value}" '
-    BEGIN { updated=0 }
+  CNC_INSTALL_ENV_VALUE="${value}" awk -v k="${key}" '
+    BEGIN { updated=0; v=ENVIRON["CNC_INSTALL_ENV_VALUE"] }
     {
       if ($0 ~ "^" k "=") {
         print k "=" v

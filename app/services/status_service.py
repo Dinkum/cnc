@@ -69,6 +69,7 @@ _status_cache_lock_loop: asyncio.AbstractEventLoop | None = None
 _status_cache_payload: dict[str, Any] | None = None
 _status_cache_expires_at: float = 0.0
 _status_cache_generation: int = 0
+STATUS_STALE_GRACE_SEC = 30
 _status_cache_prefill_task: asyncio.Task[None] | None = None
 _status_cache_prefill_loop: asyncio.AbstractEventLoop | None = None
 _status_cache_prefill_pending: tuple[Settings, bool, float] | None = None
@@ -82,6 +83,7 @@ _network_isolation_cache_signature: tuple[tuple[str, int], ...] | None = None
 _network_isolation_cache_expires_at: float = 0.0
 _network_isolation_event_signature: str | None = None
 _network_isolation_refresh_task: asyncio.Task[None] | None = None
+_network_isolation_generation = 0
 NETWORK_ISOLATION_STATUS_CACHE_TTL_SEC = 300
 _SINGLE_OUTPUT_INPUT_KINDS = {"shield", "tailnet_path", "tailnet_service"}
 
@@ -556,23 +558,31 @@ async def _show_app_container(
 
 
 def invalidate_status_cache(
-    settings: Settings | None = None, *, prefill: bool = False
+    settings: Settings | None = None,
+    *,
+    prefill: bool = False,
+    isolation_changed: bool = True,
 ) -> None:
     global \
         _network_isolation_event_signature, \
         _network_isolation_cache_expires_at, \
         _network_isolation_cache_signature, \
-        _network_isolation_cache_payload
+        _network_isolation_cache_payload, \
+        _network_isolation_generation
     global _status_cache_generation, _status_cache_payload, _status_cache_expires_at
     _status_cache_generation += 1
     _status_cache_payload = None
     _status_cache_expires_at = 0.0
-    _network_isolation_cache_payload = None
-    _network_isolation_cache_signature = None
-    _network_isolation_cache_expires_at = 0.0
-    _network_isolation_event_signature = None
+    if isolation_changed:
+        _network_isolation_generation += 1
+        _network_isolation_cache_payload = None
+        _network_isolation_cache_signature = None
+        _network_isolation_cache_expires_at = 0.0
+        _network_isolation_event_signature = None
     if prefill and settings is not None:
-        schedule_status_cache_prefill(settings, force_refresh=True)
+        schedule_status_cache_prefill(
+            settings, force_refresh=isolation_changed, queue_if_running=True
+        )
 
 
 def _collect_app_backend_diagnostics(
@@ -611,6 +621,7 @@ def schedule_status_cache_prefill(
     *,
     force_refresh: bool = False,
     delay_seconds: float = 0.05,
+    queue_if_running: bool = False,
 ) -> bool:
     global _status_cache_prefill_loop, _status_cache_prefill_task
     global _status_cache_prefill_pending, _status_cache_prefill_reschedule_attached
@@ -638,8 +649,11 @@ def schedule_status_cache_prefill(
         and _status_cache_prefill_loop is loop
         and not _status_cache_prefill_task.done()
     ):
-        if force_refresh:
-            _status_cache_prefill_pending = (settings, True, delay_seconds)
+        if force_refresh or queue_if_running:
+            pending = _status_cache_prefill_pending
+            _status_cache_prefill_pending = (
+                settings, force_refresh or (pending is not None and pending[1]), delay_seconds
+            )
             if not _status_cache_prefill_reschedule_attached:
                 _status_cache_prefill_reschedule_attached = True
                 _status_cache_prefill_task.add_done_callback(
@@ -660,18 +674,16 @@ def schedule_status_cache_prefill(
 async def cancel_status_cache_prefill() -> None:
     global _status_cache_prefill_loop, _status_cache_prefill_task
     global _status_cache_prefill_pending, _status_cache_prefill_reschedule_attached
-    task = _status_cache_prefill_task
+    tasks = (_status_cache_prefill_task, _network_isolation_refresh_task)
     _status_cache_prefill_task = None
     _status_cache_prefill_loop = None
     _status_cache_prefill_pending = None
     _status_cache_prefill_reschedule_attached = False
-    if task is None or task.done():
-        return
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        return
+    active = [task for task in tasks if task is not None and not task.done()]
+    for task in active:
+        task.cancel()
+    if active:
+        await asyncio.gather(*active, return_exceptions=True)
 
 
 def _parse_int_value(raw: str | None) -> int | None:
@@ -1145,8 +1157,12 @@ async def collect_status(
         and now < _status_cache_expires_at
     ):
         return _status_cache_payload
-    if allow_stale and not force_refresh and _status_cache_payload is not None:
-        return _status_cache_payload
+    if (
+        allow_stale and not force_refresh and _status_cache_payload is not None
+        and now < _status_cache_expires_at + STATUS_STALE_GRACE_SEC
+    ):
+        schedule_status_cache_prefill(settings)
+        return {**_status_cache_payload, "status_cache": "stale"}
 
     async with _get_status_cache_lock():
         now = time.monotonic()
@@ -1156,8 +1172,12 @@ async def collect_status(
             and now < _status_cache_expires_at
         ):
             return _status_cache_payload
-        if allow_stale and not force_refresh and _status_cache_payload is not None:
-            return _status_cache_payload
+        if (
+            allow_stale and not force_refresh and _status_cache_payload is not None
+            and now < _status_cache_expires_at + STATUS_STALE_GRACE_SEC
+        ):
+            schedule_status_cache_prefill(settings)
+            return {**_status_cache_payload, "status_cache": "stale"}
 
         collection_generation = _status_cache_generation
         payload = await _collect_status_uncached(
@@ -1256,14 +1276,17 @@ async def _collect_status_uncached(
                 "error_type": type(exc).__name__,
             }
 
-    app_statuses = await asyncio.gather(
-        *[_show_app_container_or_failure(backend) for backend in enabled_app_backends]
-    )
-    service_statuses = list(app_statuses)
+    service_probes = []
     if settings.shield_enabled or any(backend.kind == "shield" for backend in backends):
-        service_statuses.append(await _show_shield_container(settings))
+        service_probes.append(_show_shield_container(settings))
     if settings.netdata_enabled:
-        service_statuses.append(await _show_netdata_service(settings))
+        service_probes.append(_show_netdata_service(settings))
+    app_statuses, nginx_status, *other_statuses = await asyncio.gather(
+        asyncio.gather(*map(_show_app_container_or_failure, enabled_app_backends)),
+        _show_service("nginx.service", settings),
+        *service_probes,
+    )
+    service_statuses = [*app_statuses, *other_statuses]
     unique_services: list[str] = []
     for service_status in service_statuses:
         metric_service = service_status.get("metric_service") or service_status.get(
@@ -1401,7 +1424,6 @@ async def _collect_status_uncached(
     _cpu_usage_samples = active_samples
     _network_usage_samples = active_network_samples
 
-    nginx_status = await _show_service("nginx.service", settings)
     network_isolation = await _network_isolation_status(
         enabled_app_backends, settings, force_refresh=force_refresh
     )
@@ -1775,6 +1797,7 @@ async def _refresh_network_isolation(
         _network_isolation_cache_expires_at, \
         _network_isolation_cache_signature, \
         _network_isolation_cache_payload
+    generation = _network_isolation_generation
     try:
         payload = await _diagnostic_workers.run(
             collect_app_network_isolation_canary, backends, settings
@@ -1798,7 +1821,10 @@ async def _refresh_network_isolation(
             "error": str(exc),
             "error_type": type(exc).__name__,
         }
-        await _maybe_emit_network_isolation_event(backends, settings, payload)
+        if generation == _network_isolation_generation:
+            await _maybe_emit_network_isolation_event(backends, settings, payload)
+        return payload
+    if generation != _network_isolation_generation:
         return payload
     _network_isolation_cache_payload = dict(payload)
     _network_isolation_cache_signature = cache_key

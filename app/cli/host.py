@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
+from pathlib import Path
 
 from app.cli.apply import apply_async, format_apply_text
 from app.cli.common import CommandResult, bind_command
@@ -39,12 +41,21 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
         needs_settings=True,
     )
 
-    reconcile_host = subparsers.add_parser("reconcile-host")
-    reconcile_host.add_argument("--json", action="store_true", dest="json_output")
+    audit = host_subparsers.add_parser("audit")
+    audit.add_argument("--json", action="store_true", dest="json_output")
     bind_command(
-        reconcile_host,
-        handler=_run_reconcile_host_command,
-        formatter=format_reconcile_host_text,
+        audit,
+        handler=_run_host_audit_command,
+        formatter=format_host_audit_text,
+        needs_settings=True,
+    )
+    support_bundle = host_subparsers.add_parser("support-bundle")
+    support_bundle.add_argument("--output", type=Path)
+    support_bundle.add_argument("--json", action="store_true", dest="json_output")
+    bind_command(
+        support_bundle,
+        handler=_run_host_support_bundle_command,
+        formatter=lambda payload: f"Support bundle saved to {payload.get('path', '')}",
         needs_settings=True,
     )
 
@@ -233,3 +244,70 @@ async def _run_host_apply_command(
 ) -> CommandResult:
     assert settings is not None
     return await apply_async(settings)
+
+
+def format_host_audit_text(payload: dict[str, object]) -> str:
+    findings = payload.get("findings")
+    if not isinstance(findings, list) or not findings:
+        return "Host audit passed."
+    lines = ["Host audit findings"]
+    for finding in findings:
+        if isinstance(finding, dict):
+            lines.append(
+                f"- {finding.get('check', finding.get('name', 'Host check'))} — "
+                f"{finding.get('error', finding.get('message', 'Review required'))}"
+            )
+    return "\n".join(lines)
+
+
+def _host_audit(settings: Settings) -> tuple[int, dict[str, object]]:
+    from app.logger import redact_sensitive_text
+    from app.services.self_audit import ControlPlaneSelfAuditError, run_control_plane_self_audit
+
+    try:
+        return 0, {"status": "ok", "details": run_control_plane_self_audit(settings)}
+    except ControlPlaneSelfAuditError as exc:
+        payload = exc.as_details()
+        for finding in exc.findings:
+            finding["message"] = redact_sensitive_text(finding.get("message"))
+        return (1 if exc.blocks_apply else 0), {
+            **payload,
+            "status": "failed" if exc.blocks_apply else "warning",
+        }
+
+
+async def _run_host_audit_command(
+    args: argparse.Namespace, settings: Settings | None
+) -> CommandResult:
+    assert settings is not None
+    code, payload = await asyncio.to_thread(_host_audit, settings)
+    return code, payload, None
+
+
+async def _run_host_support_bundle_command(
+    args: argparse.Namespace, settings: Settings | None
+) -> CommandResult:
+    from app.database import isolated_database_session
+    from app.services.debug_bundle import build_support_debug_bundle
+    from app.services.runtime_assets import inspect_managed_systemd_assets
+
+    assert settings is not None
+    _, audit = await asyncio.to_thread(_host_audit, settings)
+    try:
+        assets = await asyncio.to_thread(inspect_managed_systemd_assets, settings)
+    except OSError as exc:
+        assets = {"status": "unavailable", "error": str(exc)}
+    async with isolated_database_session(settings.database_url) as session:
+        bundle = await build_support_debug_bundle(
+            session,
+            settings,
+            startup={"live_self_audit": audit, "runtime_assets": assets},
+        )
+    path = args.output or Path(bundle.filename)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(bundle.content)
+    except OSError as exc:
+        return 1, {}, str(exc)
+    return 0, {"path": str(path.resolve())}, None

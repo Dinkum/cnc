@@ -1061,7 +1061,24 @@ async def load_backend_metric_history(
         .all()
     )
     previous_network_sample = None
-    if metric.key == "network":
+    first_network_sample = (
+        next(
+            (
+                sample
+                for sample in samples
+                if _sample_rollup(sample, metric) is not None
+            ),
+            None,
+        )
+        if metric.key == "network"
+        else None
+    )
+    if (
+        first_network_sample is not None
+        and _field(first_network_sample, "network_rx_bytes") is not None
+        and _field(first_network_sample, "network_tx_bytes") is not None
+        and _sample_direction_rollups(first_network_sample) is None
+    ):
         previous_network_sample = (
             (
                 await session.execute(
@@ -1130,7 +1147,7 @@ def _render_backend_metric_history(data: MetricHistoryData) -> dict[str, object]
     for sample in samples:
         memory_percent_rollup = (
             _sample_rollup(sample, METRIC_SPECS["memory"])
-            if metric.key == "memory"
+            if metric.key == "memory" and metric.unit_kind == "bytes"
             else None
         )
         if metric.key == "memory" and metric.unit_kind == "bytes":

@@ -1,22 +1,20 @@
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 import json
 from typing import Any, Iterable
 
 from sqlalchemy import and_, case, exists, func, or_, select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
-from app.database import create_configured_async_engine
 from app.logger import get_logger
 from app.models.entities import ControlEvent
 from app.services.notifications import (
     admin_dashboard_url,
     send_pushover_notification_async,
 )
-from app.services.history_retention import prune_control_plane_history
+from app.services.operations import _operation_session
 
 
 logger = get_logger("control.events")
@@ -175,19 +173,6 @@ def _render_event_notification_message(
     return "\n".join(lines)
 
 
-@asynccontextmanager
-async def _isolated_event_session(database_url: str):
-    engine = create_configured_async_engine(database_url, future=True, echo=False)
-    factory = async_sessionmaker(
-        bind=engine, expire_on_commit=False, class_=AsyncSession
-    )
-    try:
-        async with factory() as session:
-            yield session
-    finally:
-        await engine.dispose()
-
-
 def _normalize_string_list(values: Iterable[object] | None) -> list[str]:
     if values is None:
         return []
@@ -280,7 +265,7 @@ async def emit_control_event(
         details=normalized_details,
     )
     try:
-        async with _isolated_event_session(settings.database_url) as session:
+        async with _operation_session(settings.database_url) as session:
             session.add(
                 ControlEvent(
                     kind=kind,
@@ -296,8 +281,6 @@ async def emit_control_event(
                     created_at=event_time,
                 )
             )
-            await session.flush()
-            await prune_control_plane_history(session)
             await session.commit()
     except Exception as exc:
         logger.warning(

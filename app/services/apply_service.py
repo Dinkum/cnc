@@ -54,7 +54,6 @@ from app.services.commands import (
 from app.services.control_events import emit_control_event
 from app.services.error_reporting import CNCError, ErrorCode
 from app.services.host_journal import commit_verified
-from app.services.history_retention import prune_control_plane_history
 from app.services.notifications import (
     admin_dashboard_url,
     build_operator_message,
@@ -352,35 +351,92 @@ async def invalidate_apply_convergence(session: AsyncSession) -> bool:
     return had_marker
 
 
+async def restore_host_to_desired_state(
+    previous_desired: DesiredState,
+    settings: Settings,
+    *,
+    services: ApplyServices,
+    scope: Scope,
+    created_backend_names: frozenset[str] = frozenset(),
+) -> dict[str, Any]:
+    """Converge the host straight back to the committed DB state after a failed live write."""
+    restore_outputs = (
+        None
+        if scope.is_full
+        else (scope.outputs or frozenset()) | frozenset(created_backend_names)
+    )
+    restore_scope = Scope(
+        outputs=restore_outputs,
+        reason=f"restore after failed {scope.reason}",
+        tools=scope.tools,
+        rebalance_resources=scope.rebalance_resources,
+    )
+    restore_services = ApplyServices(
+        preflight_app_storage=services.preflight_app_storage,
+        runtime_services=services.runtime_services,
+        apply_app_backends=services.apply_app_backends,
+        reconcile_backend_ssh_access=services.reconcile_backend_ssh_access,
+        reconcile_managed_systemd_assets=services.reconcile_managed_systemd_assets,
+        reconcile_cluster_followers=services.reconcile_cluster_followers,
+        verify_tailscale_admin_exposure=services.verify_tailscale_admin_exposure,
+        run_control_plane_self_audit=services.run_control_plane_self_audit,
+        cleanup_deleted_app_filesystem=False,
+    )
+    restore_plan = Plan(
+        desired=previous_desired,
+        settings=settings,
+        services=restore_services,
+        details={},
+        scope=restore_scope,
+    )
+    tools = [
+        tool for tool in TOOLS if restore_scope.tools.includes(tool.tool_name)
+    ]
+    try:
+        restored_tools = await converge(tools, restore_plan)
+    except Exception as exc:
+        logger.exception("apply.restore_to_previous_state_failed", error=str(exc))
+        return {
+            "host_restored": False,
+            "restore_error": str(exc),
+            "failure_mode": "partial",
+            "manual_review_required": True,
+            "operator_action": "Host could not be restored to the previous configuration; retry.",
+        }
+    return {
+        "host_restored": True,
+        "restored_tools": restored_tools,
+        "failure_mode": "clean",
+        "manual_review_required": False,
+    }
+
+
 async def run_apply(
     session: AsyncSession,
     settings: Settings,
     *,
     services: ApplyServices | None = None,
-    commit_on_success: bool = True,
+    persist_run: bool = True,
     operation_kind: str = "apply_host",
     actor: str = "system",
     operation_handle: OperationHandle | None = None,
     emit_success_event: bool = True,
     scope: Scope | None = None,
     recovery: list[Any] | None = None,
+    desired: DesiredState | None = None,
+    previous_desired: DesiredState | None = None,
 ) -> ApplyResponse:
     services = services or default_apply_services()
     scope = scope or Scope.everything()
     if recovery is None:
         recovery = []
-    apply_operation = (
-        operation_handle.with_deferred_db_updates()
-        if operation_handle is not None
-        else None
-    )
     try:
         async with host_mutation_operation(
             settings,
             kind=operation_kind,
             actor=actor,
             phase="apply",
-            operation=apply_operation,
+            operation=operation_handle,
         ) as operation:
             desired_record: DesiredStateRecord | None = None
             live_apply_completed = False
@@ -390,7 +446,10 @@ async def run_apply(
                     await _emit_apply_progress(
                         services, "Save desired state", "Building host plan"
                     )
-                    desired = await build_desired_state(session, settings, scope=scope)
+                    if desired is None:
+                        desired = await build_desired_state(
+                            session, settings, scope=scope
+                        )
                     log_operation.step(
                         "apply.desired_state.ready",
                         nginx_files=len(desired.nginx_files),
@@ -465,6 +524,7 @@ async def run_apply(
                         scope=scope,
                         recovery=recovery,
                         operation_id=operation.id,
+                        previous_desired=previous_desired,
                     )
                     live_apply_completed = True
                     response_details = {
@@ -501,25 +561,26 @@ async def run_apply(
                     )
                     response_details.update(output_event)
                     response_details["apply_event_summary"] = success_summary
-                    run = ApplyRun(
-                        status="success",
-                        message=success_message,
-                        details_json=json.dumps(response_details),
-                        **desired_record.apply_run_fields(operation.id),
-                    )
-                    session.add(run)
-                    await session.flush()
-                    await session.refresh(run)
-                    if scope.tools is ToolScope.HOST and scope.is_full:
-                        await _record_last_applied_state(
-                            session,
-                            run=run,
-                            operation_id=operation.id,
-                            desired_state=desired_record,
+                    run_id: int | None = None
+                    created_at: datetime | None = None
+                    if persist_run:
+                        run = ApplyRun(
+                            status="success",
+                            message=success_message,
+                            details_json=json.dumps(response_details),
+                            **desired_record.apply_run_fields(operation.id),
                         )
-                    await prune_control_plane_history(session)
-                    run_id, created_at = run.id, run.created_at
-                    if commit_on_success:
+                        session.add(run)
+                        await session.flush()
+                        await session.refresh(run)
+                        if scope.tools is ToolScope.HOST and scope.is_full:
+                            await _record_last_applied_state(
+                                session,
+                                run=run,
+                                operation_id=operation.id,
+                                desired_state=desired_record,
+                            )
+                        run_id, created_at = run.id, run.created_at
                         commit = await commit_verified(
                             session, settings, ApplyRun, run_id
                         )
@@ -565,8 +626,15 @@ async def run_apply(
                             run_id=run_id,
                         )
                     else:
-                        await session.flush()
-                    invalidate_status_cache(settings, prefill=False)
+                        response_details["_apply_run_fields"] = (
+                            desired_record.apply_run_fields(operation.id)
+                        )
+                    if persist_run:
+                        invalidate_status_cache(
+                            settings,
+                            prefill=True,
+                            isolation_changed=ToolScope.PODMAN in scope.tools,
+                        )
                     logger.info(
                         "apply.run.succeeded",
                         app_healthcheck_status=response_details.get(
@@ -580,7 +648,7 @@ async def run_apply(
                             "app_healthcheck_status"
                         ),
                     }
-                    if commit_on_success:
+                    if persist_run:
                         await operation.complete(
                             "success",
                             phase="completed",
@@ -590,13 +658,8 @@ async def run_apply(
                         await operation.update(
                             status="running",
                             phase="database_commit",
-                            details={
-                                **operation_success_details,
-                                "deferred_completion": True,
-                            },
+                            details=operation_success_details,
                         )
-                        response_details["deferred_operation_id"] = operation.id
-                        response_details["deferred_operation_kind"] = operation.kind
                         operation.completed = True
                     success_subevents = _apply_success_event_subevents(
                         run_id=run_id,
@@ -677,11 +740,25 @@ async def run_apply(
                     else:
                         details = {"error": str(exc), "phase": "unknown"}
                     if live_apply_completed:
-                        restored = await unwind_recovery(recovery)
+                        if previous_desired is not None:
+                            created_names = frozenset(
+                                {b.name for b in desired.known_app_backends}
+                                - {b.name for b in previous_desired.known_app_backends}
+                            )
+                            restored = await restore_host_to_desired_state(
+                                previous_desired,
+                                settings,
+                                services=services,
+                                scope=scope,
+                                created_backend_names=created_names,
+                            )
+                        else:
+                            restored = await run_to_completion(unwind_recovery(recovery))
                         details = {**details, **restored}
                         if restored.get("manual_review_required"):
-                            details["operator_action"] = (
-                                "rerun apply to reconcile durable desired state"
+                            details.setdefault(
+                                "operator_action",
+                                "Host could not be restored to the previous configuration; retry.",
                             )
                     details.update(scope.as_details())
                     if desired_record is not None:
@@ -714,7 +791,6 @@ async def run_apply(
                     )
                     session.add(run)
                     await session.flush()
-                    await prune_control_plane_history(session)
                     await session.commit()
                     await session.refresh(run)
                     invalidate_status_cache(settings, prefill=False)
@@ -930,7 +1006,6 @@ def _skipped_app_runtime_details(
         "app_containers_removed": [],
         "app_networks_removed": [],
         "app_quadlet_files_removed": [],
-        "app_legacy_reboot_bridges_removed": [],
         "app_filesystem_artifacts_removed": [],
         "app_disabled_runtime_cleanup": [],
         "app_container_dns": {},
@@ -953,6 +1028,7 @@ async def _apply_desired_state(
     scope: Scope | None = None,
     operation_id: int | None = None,
     recovery: list[Any] | None = None,
+    previous_desired: DesiredState | None = None,
 ) -> dict[str, Any]:
     scope = scope or Scope.everything()
     settings.apply_backup_dir.mkdir(parents=True, exist_ok=True)
@@ -1041,13 +1117,42 @@ async def _apply_desired_state(
         progress.completed("control_plane_self_audit")
         details.update(progress.as_details())
     except asyncio.CancelledError:
-        await run_to_completion(unwind_plan(tool_plan))
+        if tool_plan.touched and previous_desired is not None:
+            created_names = frozenset(
+                {b.name for b in desired.known_app_backends}
+                - {b.name for b in previous_desired.known_app_backends}
+            )
+            await run_to_completion(
+                restore_host_to_desired_state(
+                    previous_desired,
+                    settings,
+                    services=services,
+                    scope=scope,
+                    created_backend_names=created_names,
+                )
+            )
+        else:
+            await run_to_completion(unwind_plan(tool_plan))
         raise
     except Exception as exc:
         failure = progress.failure(exc)
-        unwound, unwind_errors = await unwind_plan(tool_plan)
         failure.details["rollback_contract"] = details["rollback_contract"]
-        record_unwind_outcome(failure, unwound, unwind_errors, tool_plan.touched)
+        if tool_plan.touched and previous_desired is not None:
+            created_names = frozenset(
+                {b.name for b in desired.known_app_backends}
+                - {b.name for b in previous_desired.known_app_backends}
+            )
+            restored = await restore_host_to_desired_state(
+                previous_desired,
+                settings,
+                services=services,
+                scope=scope,
+                created_backend_names=created_names,
+            )
+            failure.details.update(restored)
+        else:
+            unwound, unwind_errors = await run_to_completion(unwind_plan(tool_plan))
+            record_unwind_outcome(failure, unwound, unwind_errors, tool_plan.touched)
         raise failure
 
     return details

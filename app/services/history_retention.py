@@ -3,10 +3,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import delete, or_, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.entities import ApplyRun, ControlEvent, HostApplyState, Operation
+from app.models.entities import (
+    ApplyRun,
+    BackendHardeningRun,
+    ControlEvent,
+    HostApplyState,
+    Operation,
+    UpdateCheck,
+    UpdateRun,
+)
 
 
 ACTIVE_OPERATION_STATUSES = ("queued", "running")
@@ -30,6 +38,10 @@ class HistoryRetentionPolicy:
     operation_rows: int = 1_000
     control_event_days: int = 90
     control_event_rows: int = 5_000
+    diagnostic_days: int = 90
+    update_check_rows: int = 1_000
+    update_run_rows: int = 50
+    hardening_rows_per_phase: int = 20
 
 
 DEFAULT_HISTORY_RETENTION = HistoryRetentionPolicy()
@@ -135,5 +147,101 @@ async def prune_control_plane_history(
                 ControlEvent.created_at < event_cutoff,
                 ~ControlEvent.id.in_(recent_event_ids),
             )
+        )
+    )
+    await _prune_diagnostic_history(session, timestamp, policy)
+
+
+async def _prune_diagnostic_history(
+    session: AsyncSession, timestamp: datetime, policy: HistoryRetentionPolicy
+) -> None:
+    cutoff = timestamp - timedelta(days=policy.diagnostic_days)
+    update_checks = select(UpdateCheck.id).order_by(
+        UpdateCheck.checked_at.desc(), UpdateCheck.id.desc()
+    )
+    await session.execute(
+        delete(UpdateCheck)
+        .where(UpdateCheck.id.not_in(update_checks.limit(1)))
+        .where(
+            or_(
+                UpdateCheck.checked_at < cutoff,
+                UpdateCheck.id.not_in(
+                    update_checks.limit(max(1, policy.update_check_rows))
+                ),
+            )
+        )
+    )
+
+    update_finished = UpdateRun.status.in_(("success", "error"))
+    finished_update_runs = (
+        select(UpdateRun.id).where(update_finished).order_by(UpdateRun.id.desc())
+    )
+    latest_successful_update = (
+        select(UpdateRun.id)
+        .where(UpdateRun.status == "success")
+        .order_by(UpdateRun.id.desc())
+        .limit(1)
+    )
+    await session.execute(
+        delete(UpdateRun)
+        .where(
+            update_finished,
+            UpdateRun.id.not_in(finished_update_runs.limit(1)),
+            UpdateRun.id.not_in(latest_successful_update),
+        )
+        .where(
+            or_(
+                UpdateRun.created_at < cutoff,
+                UpdateRun.id.not_in(
+                    finished_update_runs.limit(max(1, policy.update_run_rows))
+                ),
+            )
+        )
+    )
+
+    hardening_run = BackendHardeningRun
+    newest_hardening = (hardening_run.started_at.desc(), hardening_run.id.desc())
+    finished_hardening_runs = (
+        select(
+            hardening_run.id,
+            hardening_run.finished_at,
+            func.row_number()
+            .over(
+                partition_by=(hardening_run.backend_id, hardening_run.phase),
+                order_by=newest_hardening,
+            )
+            .label("position"),
+        )
+        .where(
+            hardening_run.finished_at.is_not(None),
+            hardening_run.status.not_in(ACTIVE_OPERATION_STATUSES),
+        )
+        .subquery()
+    )
+    successful_phase1_runs = (
+        select(
+            hardening_run.id,
+            func.row_number()
+            .over(partition_by=hardening_run.backend_id, order_by=newest_hardening)
+            .label("position"),
+        )
+        .where(hardening_run.phase == "phase1", hardening_run.status == "success")
+        .subquery()
+    )
+    old_hardening_runs = select(finished_hardening_runs.c.id).where(
+        finished_hardening_runs.c.position > 1,
+        or_(
+            finished_hardening_runs.c.finished_at < cutoff,
+            finished_hardening_runs.c.position
+            > max(1, policy.hardening_rows_per_phase),
+        ),
+    )
+    latest_phase1_runs = select(successful_phase1_runs.c.id).where(
+        successful_phase1_runs.c.position == 1
+    )
+    await session.execute(
+        delete(BackendHardeningRun).where(
+            BackendHardeningRun.id.in_(old_hardening_runs),
+            BackendHardeningRun.id.not_in(latest_phase1_runs),
         )
     )

@@ -2,15 +2,14 @@
 from __future__ import annotations
 
 import inspect
-import os
 import stat
-import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping
 
 from app.logger import get_logger
+from app.services.atomic_files import replace_bytes
 from app.services.change_scope import Scope
 
 if TYPE_CHECKING:
@@ -57,19 +56,7 @@ class Plan:
 
 
 def _write_atomic(path: Path, content: str, mode: int) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        mode="w", encoding="utf-8", dir=path.parent, delete=False
-    ) as stream:
-        temporary = Path(stream.name)
-        try:
-            stream.write(content)
-            stream.flush()
-            os.fchmod(stream.fileno(), mode)
-            os.replace(temporary, path)
-        except BaseException:
-            temporary.unlink(missing_ok=True)
-            raise
+    replace_bytes(path, content.encode("utf-8"), mode=mode)
 
 
 def _owned(directory: Path, prefix: str) -> dict[Path, str]:
@@ -204,6 +191,22 @@ class ApplyFailed(Exception):
 
 
 async def converge(tools: list[Tool], plan: Plan, *, progress: Any = None) -> list[str]:
+    # Run every tool's read-only preflight before any tool mutates the host.
+    for tool in tools:
+        check_fn = getattr(tool, "check", None)
+        if check_fn is None:
+            continue
+        name = getattr(tool, "tool_name", tool.__name__)
+        tool_phases = getattr(tool, "phases", (name,))
+        if progress is not None:
+            progress.enter(tool_phases[0])
+        try:
+            checked = check_fn(plan)
+            if inspect.isawaitable(checked):
+                await checked
+        except Exception as exc:
+            raise _as_apply_failure(exc, name, tool_phases[0]) from exc
+
     changed: list[str] = []
     for tool in tools:
         name = getattr(tool, "tool_name", tool.__name__)

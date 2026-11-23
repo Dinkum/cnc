@@ -28,6 +28,7 @@ def _tool(module) -> Tool:
     fn = getattr(module, module.tool_name)
     fn.tool_name = module.tool_name
     fn.phases = module.phases
+    fn.check = getattr(module, "check", None)
     return fn
 
 

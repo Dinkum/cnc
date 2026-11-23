@@ -21,14 +21,12 @@ def register(
 ) -> argparse._SubParsersAction[argparse.ArgumentParser]:
     app = subparsers.add_parser(name)
     app_subparsers = app.add_subparsers(dest="app_command", required=True)
-    register_runtime_commands(app_subparsers, legacy_aliases=True)
+    register_runtime_commands(app_subparsers)
     return app_subparsers
 
 
 def register_runtime_commands(
     app_subparsers: argparse._SubParsersAction[argparse.ArgumentParser],
-    *,
-    legacy_aliases: bool = False,
 ) -> None:
     doctor = app_subparsers.add_parser("doctor")
     doctor.add_argument("backend")
@@ -46,17 +44,6 @@ def register_runtime_commands(
     bind_command(
         fix, handler=_run_fix_command, formatter=format_fix_text, needs_settings=True
     )
-
-    if legacy_aliases:
-        repair = app_subparsers.add_parser("repair", help="Alias for fix")
-        repair.add_argument("backend")
-        repair.add_argument("--json", action="store_true", dest="json_output")
-        bind_command(
-            repair,
-            handler=_run_fix_command,
-            formatter=format_fix_text,
-            needs_settings=True,
-        )
 
     migrate_runtime = app_subparsers.add_parser("migrate-runtime")
     migrate_runtime.add_argument("backend")

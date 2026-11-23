@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, Request
@@ -17,12 +18,14 @@ from app.services.cluster_nodes import (
     install_script,
     register_node,
 )
+from app.services.remote_node import NODE_EXEC_SOURCE
 
 
 router = APIRouter()
 logger = get_logger("routes.join")
 JOIN_CONFIRM_DB_BUSY_ATTEMPTS = 3
 JOIN_CONFIRM_DB_BUSY_BACKOFF_SEC = 0.25
+_INSTALLER_SOURCE = Path(__file__).resolve().parents[2] / "scripts" / "install_ubuntu.sh"
 
 
 def _multi_node_disabled_json() -> JSONResponse:
@@ -38,6 +41,30 @@ async def node_join_install_script(
     return PlainTextResponse(
         install_script(current_node_version_label(settings)),
         media_type="text/x-shellscript",
+    )
+
+
+@router.get("/join/runtime-installer.sh", response_class=PlainTextResponse)
+async def node_join_runtime_installer(
+    settings: Settings = Depends(settings_dependency),
+) -> PlainTextResponse:
+    if not settings.multi_node_enabled:
+        return PlainTextResponse("not found", status_code=404)
+    return PlainTextResponse(
+        _INSTALLER_SOURCE.read_text(encoding="utf-8"),
+        media_type="text/x-shellscript",
+    )
+
+
+@router.get("/join/node-exec", response_class=PlainTextResponse)
+async def node_join_node_exec(
+    settings: Settings = Depends(settings_dependency),
+) -> PlainTextResponse:
+    if not settings.multi_node_enabled:
+        return PlainTextResponse("not found", status_code=404)
+    return PlainTextResponse(
+        NODE_EXEC_SOURCE.read_text(encoding="utf-8"),
+        media_type="text/x-python",
     )
 
 

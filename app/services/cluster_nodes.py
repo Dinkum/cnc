@@ -327,7 +327,27 @@ source /etc/os-release
 export DEBIAN_FRONTEND=noninteractive
 log "installing node dependencies"
 apt-get -qq update
-apt-get -qq install -y ca-certificates curl jq iproute2 iputils-ping util-linux >/dev/null
+apt-get -qq install -y ca-certificates curl jq iproute2 iputils-ping util-linux apparmor python3 >/dev/null
+
+log "installing CNC pinned container runtime"
+runtime_installer="$(mktemp)"
+trap 'rm -f "${runtime_installer}"' EXIT
+curl -fsS --retry 3 --connect-timeout 15 \
+  "${CNC_LEADER_URL%/}/join/runtime-installer.sh" >"${runtime_installer}"
+(
+  set -Eeuo pipefail
+  # shellcheck disable=SC1090
+  source "${runtime_installer}"
+  ensure_supported_podman
+)
+rm -f "${runtime_installer}"
+
+log "installing CNC node entrypoint"
+node_exec_tmp="$(mktemp)"
+curl -fsS --retry 3 --connect-timeout 15 \
+  "${CNC_LEADER_URL%/}/join/node-exec" >"${node_exec_tmp}"
+install -m 0755 "${node_exec_tmp}" /usr/local/bin/cnc-node-exec
+rm -f "${node_exec_tmp}"
 
 install -d -m 0755 /etc/cnc
 node_uid_path="/etc/cnc/node-id"
@@ -565,10 +585,6 @@ def _latency_sample_prune_due(now: datetime) -> bool:
 def _current_git_hash() -> str:
     result = run_command(["git", "rev-parse", "--short=7", "HEAD"], timeout_sec=2)
     return result.stdout.strip() if result.ok else ""
-
-
-def _is_tailnet_host(value: str) -> bool:
-    return is_tailnet_host(value)
 
 
 def _require_tailnet_ip(value: Any) -> str:

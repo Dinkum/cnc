@@ -1,31 +1,22 @@
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
+from contextlib import AbstractAsyncContextManager
 
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import Settings
-from app.database import create_configured_async_engine
+from app.database import isolated_database_session
 from app.models.entities import Backend
 from app.services.operations import OperationHandle
 
 
-@asynccontextmanager
-async def background_db_session(settings: Settings):
-    engine = create_configured_async_engine(
-        settings.database_url, future=True, echo=False
-    )
-    factory = async_sessionmaker(
-        bind=engine, expire_on_commit=False, class_=AsyncSession
-    )
-    try:
-        async with factory() as session:
-            yield session
-    finally:
-        await engine.dispose()
+def background_db_session(
+    settings: Settings,
+) -> AbstractAsyncContextManager[AsyncSession]:
+    return isolated_database_session(settings.database_url)
 
 
 async def operation_backend(session: AsyncSession, backend_id: int) -> Backend:

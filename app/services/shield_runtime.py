@@ -6,6 +6,7 @@ from typing import Any
 
 from app.config import Settings
 from app.services.app_quadlet import QUADLET_HEADER
+from app.services.atomic_files import replace_bytes
 from app.services.cluster_topology import leader_tailnet_ip
 from app.services.nginx_contract import GATEWAY, NETWORK_NAME, nginx_gateway_enabled
 from app.services.renderers import SHIELD_BACKEND_NAME, SHIELD_PORT
@@ -162,10 +163,5 @@ def _write_text_atomic(path: Path, content: str, *, mode: int) -> bool:
     if path.exists() and path.read_bytes() == encoded:
         path.chmod(mode)
         return False
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_name(f".{path.name}.tmp")
-    temp_path.write_bytes(encoded)
-    temp_path.chmod(mode)
-    temp_path.replace(path)
-    path.chmod(mode)
+    replace_bytes(path, encoded, mode=mode)
     return True

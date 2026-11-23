@@ -504,11 +504,9 @@ OPERATION_PROGRESS_TREES: dict[str, tuple[ProgressState, ...]] = {
             (
                 ("Backup requested", 1),
                 ("Gathering app data", 1),
-                ("Capturing container snapshot", 1),
                 ("Collecting mounted paths", 1),
                 ("Measuring source data", 1),
                 ("Exporting mounted paths", 1),
-                ("Exporting container snapshot", 1),
                 ("Compressing backup bundle", 1),
                 ("Writing backup bundle", 1),
                 ("Verifying backup", 1),

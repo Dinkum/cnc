@@ -4,6 +4,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+import json
 import os
 from pathlib import Path
 import shutil
@@ -23,9 +24,15 @@ from app.schemas.apply import ApplyResponse
 from app.services.app_containers import app_sandbox_dir
 from app.services.apply_service import invalidate_apply_convergence, run_apply
 from app.services.cgroup_diagnostics import collect_container_cgroup_diagnostics
-from app.services.container_runtime import inspect_container, read_container_stats
+from app.services.container_runtime import (
+    inspect_container,
+    inspect_container_batch,
+    read_container_stats,
+    read_container_stats_batch,
+)
 from app.services.observation import present_value
 from app.services.control_events import emit_control_event
+from app.services.history_retention import prune_control_plane_history
 from app.services.resource_profile import (
     backend_resource_profile,
     build_resource_profile,
@@ -144,10 +151,20 @@ async def run_auto_size_tick(
             sample_now,
         )
         samples_written = metric_write.written
-        host_sample_written = await _write_host_metric_sample(
-            session, resource_profile, sample_now
+        previous_host_sample = await _load_previous_host_sample(
+            session, _bucket_start(sample_now)
         )
-        pruned_samples = await _prune_old_samples(session, sample_now)
+        host_sample_written = await _write_host_metric_sample(
+            session, resource_profile, sample_now, previous_host_sample
+        )
+        pruned_samples = 0
+        sample_hour = sample_now.replace(minute=0, second=0, microsecond=0)
+        if (
+            previous_host_sample is None
+            or _as_utc(previous_host_sample.bucket_start) < sample_hour
+        ):
+            pruned_samples = await _prune_old_samples(session, sample_now)
+            await prune_control_plane_history(session, now=sample_now)
         result: dict[str, Any] = {
             "bucket_start": _bucket_start(sample_now).isoformat(),
             "sampled_backends": len(enabled_app_backends),
@@ -476,26 +493,37 @@ async def _collect_lightweight_backend_metrics(
 ) -> dict[str, dict[str, Any]]:
     base_profile = build_resource_profile(settings, backends)
     sample_disk_usage = _disk_sample_due(sample_now or datetime.now(UTC))
+    container_names = [container_name(backend.name) for backend in backends]
+    timeout_sec = settings.command_timeout_status_sec
+    stats_by_name, inspect_by_name = (
+        await asyncio.gather(
+            asyncio.to_thread(read_container_stats_batch, container_names, timeout_sec),
+            asyncio.to_thread(inspect_container_batch, container_names, timeout_sec),
+        )
+        if len(container_names) > 1
+        else ({}, {})
+    )
     metrics_by_backend: dict[str, dict[str, Any]] = {}
-    for backend in backends:
+    for backend, name in zip(backends, container_names):
         resource_profile = backend_resource_profile(backend, base_profile)
         memory_max_bytes = _parse_bytes(resource_profile.memory_max)
-        stats_result = await read_container_stats(
-            container_name(backend.name),
-            timeout_sec=settings.command_timeout_status_sec,
-        )
         metrics: dict[str, Any] = {}
-        if not stats_result.ok:
-            logger.info(
-                "auto_size.sample.skipped",
-                backend=backend.name,
-                reason="container_stats_unavailable",
-                returncode=stats_result.returncode,
-            )
+        if name in stats_by_name:
+            stats_output = json.dumps(stats_by_name[name])
         else:
+            stats_result = await read_container_stats(name, timeout_sec=timeout_sec)
+            stats_output = stats_result.stdout if stats_result.ok else None
+            if not stats_result.ok:
+                logger.info(
+                    "auto_size.sample.skipped",
+                    backend=backend.name,
+                    reason="container_stats_unavailable",
+                    returncode=stats_result.returncode,
+                )
+        if stats_output is not None:
             metrics.update(
                 _parse_podman_stats_metrics(
-                    stats_result.stdout,
+                    stats_output,
                     fallback_memory_max_bytes=memory_max_bytes,
                 )
             )
@@ -511,13 +539,11 @@ async def _collect_lightweight_backend_metrics(
                 resource_profile.host_cpu_count,
             )
 
-        inspect_payload = present_value(
-            await asyncio.to_thread(
-                inspect_container,
-                container_name(backend.name),
-                settings.command_timeout_status_sec,
+        inspect_payload = inspect_by_name.get(name)
+        if inspect_payload is None:
+            inspect_payload = present_value(
+                await asyncio.to_thread(inspect_container, name, timeout_sec)
             )
-        )
         cgroup = await asyncio.to_thread(
             collect_container_cgroup_diagnostics,
             inspect_payload,
@@ -877,9 +903,9 @@ async def _write_host_metric_sample(
     session: AsyncSession,
     resource_profile: Any,
     now: datetime,
+    previous_sample: HostResourceSample | None,
 ) -> bool:
     bucket_start = _bucket_start(now)
-    previous_sample = await _load_previous_host_sample(session, bucket_start)
     sample = await _load_host_sample(session, bucket_start)
     if sample is None:
         sample = HostResourceSample(bucket_start=bucket_start)
@@ -1065,39 +1091,6 @@ def _network_rates_from_sample_delta(
         "network_tx_bps": tx_bps,
         "network_total_bps": rx_bps + tx_bps,
     }
-
-
-async def _load_sample(
-    session: AsyncSession,
-    backend_id: int,
-    bucket_start: datetime,
-) -> BackendResourceSample | None:
-    return (
-        await session.execute(
-            select(BackendResourceSample).where(
-                BackendResourceSample.backend_id == backend_id,
-                BackendResourceSample.bucket_start == bucket_start,
-            )
-        )
-    ).scalar_one_or_none()
-
-
-async def _load_previous_sample(
-    session: AsyncSession,
-    backend_id: int,
-    bucket_start: datetime,
-) -> BackendResourceSample | None:
-    return (
-        await session.execute(
-            select(BackendResourceSample)
-            .where(
-                BackendResourceSample.backend_id == backend_id,
-                BackendResourceSample.bucket_start < bucket_start,
-            )
-            .order_by(BackendResourceSample.bucket_start.desc())
-            .limit(1)
-        )
-    ).scalar_one_or_none()
 
 
 async def _load_host_sample(

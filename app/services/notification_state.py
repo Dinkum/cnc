@@ -6,29 +6,12 @@ from typing import Any
 
 from app.config import Settings
 from app.logger import get_logger
-from app.services.host_state import (
-    LockedStateSectionTransaction,
-    read_host_state_unlocked,
-)
+from app.services.host_state import LockedStateSectionTransaction
 
 
 logger = get_logger("notifications.state")
 HOST_STATE_SECTION = "notification_state"
 PUSHOVER_DELIVERY_EVENT_KEY = "pushover_delivery"
-
-
-def _read_notification_state_unlocked(path: Path) -> dict[str, Any]:
-    payload = read_host_state_unlocked(path)
-    section = payload.get(HOST_STATE_SECTION)
-    if section is None:
-        return {"events": {}}
-    if not isinstance(section, dict):
-        logger.warning("notification.state.invalid_payload", path=str(path))
-        return {"events": {}}
-    if not isinstance(section.get("events"), dict):
-        logger.warning("notification.state.invalid_events", path=str(path))
-        return {"events": {}}
-    return dict(section)
 
 
 def _log_notification_state_written(path: Path, payload: dict[str, Any]) -> None:
@@ -110,6 +93,13 @@ class NotificationStateTransaction(
         entry = self._mapping("pushover_receipts").get(emergency_key)
         return dict(entry) if isinstance(entry, dict) else {}
 
+    def pending_pushover_cancellations(self) -> list[str]:
+        return [
+            key
+            for key, entry in self._mapping("pushover_receipts").items()
+            if isinstance(entry, dict) and entry.get("cancel_requested")
+        ]
+
     def set_pushover_receipt(self, emergency_key: str, entry: dict[str, Any]) -> None:
         self._mapping("pushover_receipts")[emergency_key] = dict(entry)
         self._state.mark_dirty()
@@ -186,11 +176,6 @@ class NotificationStateTransaction(
 def read_notification_state(settings: Settings) -> dict[str, Any]:
     with NotificationStateTransaction(settings) as transaction:
         return dict(transaction._payload or {"events": {}})
-
-
-def write_notification_state(settings: Settings, payload: dict[str, Any]) -> None:
-    with NotificationStateTransaction(settings) as transaction:
-        transaction.replace(payload)
 
 
 def get_notification_event(settings: Settings, event_key: str) -> dict[str, Any]:

@@ -1,7 +1,12 @@
 
 from __future__ import annotations
 
-from app.services.ssh_access import reconcile_backend_ssh_access
+import asyncio
+from app.services.ssh_access import (
+    _sudoers_config,
+    _validate_sudoers_config,
+    reconcile_backend_ssh_access,
+)
 from app.services.tools.core import Plan
 
 tool_name = "ssh"
@@ -16,6 +21,20 @@ def wanted_access(plan: Plan) -> list[dict[str, object]]:
         }
         for backend in plan.desired.enabled_app_backends
     ]
+
+
+async def check(plan: Plan) -> None:
+    if not plan.desired.known_app_backends:
+        return
+    reconcile = getattr(
+        plan.services, "reconcile_backend_ssh_access", reconcile_backend_ssh_access
+    )
+    if reconcile is not reconcile_backend_ssh_access:
+        return
+    if not plan.settings.ssh_backend_sudoers_path.parent.exists():
+        return
+    content = _sudoers_config(plan.settings)
+    await asyncio.to_thread(_validate_sudoers_config, plan.settings, content)
 
 
 async def ssh(plan: Plan) -> bool:

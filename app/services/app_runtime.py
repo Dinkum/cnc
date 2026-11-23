@@ -25,10 +25,13 @@ from app.services.app_containers import (
     app_sandbox_profile_state_path,
     app_sandbox_rootfs_path,
     configured_app_dns_servers,
+    container_contract_hash,
     container_ipv4_address,
+    container_is_paused,
+    container_is_running,
     control_dir,
     network_uses_bridge_dns,
-    read_saved_spec,
+    runtime_contract_hash,
     runtime_spec,
     write_app_control_assets,
 )
@@ -39,6 +42,7 @@ from app.services.app_healthchecks import (
 )
 from app.services.app_memory_slice import APPS_SLICE_UNIT, reconcile_apps_slice
 from app.services.app_network_isolation import reconcile_app_network_isolation
+from app.services.atomic_files import replace_bytes_if_changed
 from app.services.app_quadlet import (
     AppQuadletWriteError,
     managed_quadlet_backend_names,
@@ -112,6 +116,7 @@ from app.services.validators import ensure_backend_name, parse_volumes_json
 
 logger = get_logger("apply.runtime")
 _filesystem_workers = BoundedThreadWorker(2)
+_runtime_workers = BoundedThreadWorker(4)
 
 _RUNTIME_GUEST_EXEC_GUARD_WAIT_SEC = 0.25
 _TERMINAL_GUEST_EXEC_OUTCOMES = {
@@ -226,7 +231,6 @@ async def apply_app_backends(
             "containers_removed": [],
             "networks_removed": [],
             "quadlet_files_removed": [],
-            "legacy_reboot_bridges_removed": [],
             "filesystem_artifacts_removed": [],
         }
         interface_cleanup = await _cleanup_stale_interface_runtime(
@@ -242,7 +246,6 @@ async def apply_app_backends(
     containers_removed.extend(cleanup["containers_removed"])
     networks_removed.extend(cleanup["networks_removed"])
     quadlet_files_removed = list(cleanup["quadlet_files_removed"])
-    legacy_reboot_bridges_removed = list(cleanup["legacy_reboot_bridges_removed"])
     filesystem_artifacts_removed = list(cleanup["filesystem_artifacts_removed"])
 
     try:
@@ -366,7 +369,6 @@ async def apply_app_backends(
         "app_containers_removed": sorted(containers_removed),
         "app_networks_removed": sorted(networks_removed),
         "app_quadlet_files_removed": sorted(quadlet_files_removed),
-        "app_legacy_reboot_bridges_removed": sorted(legacy_reboot_bridges_removed),
         "app_filesystem_artifacts_removed": sorted(filesystem_artifacts_removed),
         "app_disabled_runtime_cleanup": sorted(
             disabled_runtime_cleanup, key=lambda item: str(item.get("backend") or "")
@@ -406,7 +408,8 @@ async def _cleanup_deleted_app_runtime(
     )
 
     for entry in _managed_podman_entries(
-        services.run_command(
+        await _runtime_workers.run(
+            services.run_command,
             [
                 "podman",
                 "ps",
@@ -432,12 +435,20 @@ async def _cleanup_deleted_app_runtime(
         if not target:
             continue
         await _stop_app_quadlet_backend(backend_name, settings, services=services)
-        _remove_podman_container(target, settings, services=services)
+        await _runtime_workers.run(
+            _remove_podman_container, target, settings, services=services
+        )
         containers_removed.append(target)
-        _clear_runtime_artifacts_for_recreate(settings, backend_name, clear_lock=True)
+        await _filesystem_workers.run(
+            _clear_runtime_artifacts_for_recreate,
+            settings,
+            backend_name,
+            clear_lock=True,
+        )
 
     for entry in _managed_podman_entries(
-        services.run_command(
+        await _runtime_workers.run(
+            services.run_command,
             [
                 "podman",
                 "network",
@@ -464,7 +475,9 @@ async def _cleanup_deleted_app_runtime(
         target = _entry_primary_name(entry) or _entry_id(entry)
         if not target:
             continue
-        _stop_app_quadlet_network(backend_name, settings, services=services)
+        await _runtime_workers.run(
+            _stop_app_quadlet_network, backend_name, settings, services=services
+        )
         await services.run_command_checked_async(
             ["podman", "network", "rm", target],
             timeout_sec=settings.command_timeout_apply_sec,
@@ -472,7 +485,6 @@ async def _cleanup_deleted_app_runtime(
         networks_removed.append(target)
 
     quadlet_files_removed: list[str] = []
-    legacy_reboot_bridges_removed: list[str] = []
     deleted_backend_names.update(
         backend_name
         for backend_name in managed_quadlet_backend_names(settings)
@@ -486,24 +498,18 @@ async def _cleanup_deleted_app_runtime(
     quadlet_files_removed.extend(interface_cleanup["quadlet_files_removed"])
     for backend_name in sorted(deleted_backend_names):
         quadlet_files_removed.extend(remove_app_quadlet_assets(settings, backend_name))
-        bridge_path = _legacy_reboot_bridge_path(settings, container_name(backend_name))
-        if bridge_path.exists():
-            await services.run_command_checked_async(
-                ["systemctl", "disable", bridge_path.name],
-                timeout_sec=settings.command_timeout_apply_sec,
-            )
-            bridge_path.unlink()
-            legacy_reboot_bridges_removed.append(str(bridge_path))
     if (
         containers_removed
         or networks_removed
         or quadlet_files_removed
-        or legacy_reboot_bridges_removed
     ):
         await _systemctl_daemon_reload(settings, services=services)
     filesystem_artifacts_removed = (
-        _cleanup_deleted_app_filesystem_artifacts(
-            desired_app_names, settings, removable=removable_backend_names
+        await _filesystem_workers.run(
+            _cleanup_deleted_app_filesystem_artifacts,
+            desired_app_names,
+            settings,
+            removable=removable_backend_names,
         )
         if cleanup_filesystem
         else []
@@ -513,7 +519,6 @@ async def _cleanup_deleted_app_runtime(
         "containers_removed": containers_removed,
         "networks_removed": networks_removed,
         "quadlet_files_removed": quadlet_files_removed,
-        "legacy_reboot_bridges_removed": legacy_reboot_bridges_removed,
         "filesystem_artifacts_removed": filesystem_artifacts_removed,
     }
 
@@ -528,7 +533,8 @@ async def _cleanup_stale_interface_runtime(
     networks_removed: list[str] = []
     quadlet_files_removed: list[str] = []
     for entry in _managed_podman_entries(
-        services.run_command(
+        await _runtime_workers.run(
+            services.run_command,
             [
                 "podman",
                 "network",
@@ -551,7 +557,9 @@ async def _cleanup_stale_interface_runtime(
         target = _entry_primary_name(entry) or _entry_id(entry)
         if not target or target in desired_interface_network_names:
             continue
-        _stop_interface_quadlet_network(target, settings, services=services)
+        await _runtime_workers.run(
+            _stop_interface_quadlet_network, target, settings, services=services
+        )
         await services.run_command_checked_async(
             ["podman", "network", "rm", target],
             timeout_sec=settings.command_timeout_apply_sec,
@@ -741,49 +749,8 @@ async def _systemctl_daemon_reload(
     )
 
 
-def _legacy_reboot_bridge_service_name(container: str) -> str:
-    return f"{container}-legacy-restart.service"
-
-
-def _legacy_reboot_bridge_path(settings: Settings, container: str) -> Path:
-    return settings.systemd_generated_dir / _legacy_reboot_bridge_service_name(
-        container
-    )
-
-
-def _render_legacy_reboot_bridge(container: str) -> str:
-    return "\n".join(
-        [
-            "# Managed by CNC. Do not edit by hand.",
-            "",
-            "[Unit]",
-            f"Description=CNC legacy app container boot bridge {container}",
-            "Wants=network-online.target podman.service",
-            "After=network-online.target podman.service",
-            "",
-            "[Service]",
-            "Type=oneshot",
-            "RemainAfterExit=yes",
-            f"ExecStart=/usr/bin/podman start {container}",
-            f"ExecStop=/usr/bin/podman stop -t 10 {container}",
-            "",
-            "[Install]",
-            "WantedBy=multi-user.target",
-            "",
-        ]
-    )
-
-
 def _write_text_atomic(path: Path, content: str) -> bool:
-    encoded = content.encode("utf-8")
-    if path.exists() and path.read_bytes() == encoded:
-        return False
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_name(f".{path.name}.tmp")
-    temp_path.write_bytes(encoded)
-    temp_path.chmod(0o644)
-    temp_path.replace(path)
-    return True
+    return replace_bytes_if_changed(path, content.encode("utf-8"), mode=0o644)
 
 
 async def _reconcile_app_quadlet_assets(
@@ -932,7 +899,8 @@ async def _stop_app_quadlet_backend(
     *,
     services: AppRuntimeServices,
 ) -> None:
-    result = services.run_command(
+    result = await _runtime_workers.run(
+        services.run_command,
         ["systemctl", "stop", quadlet_container_service_name(backend_name)],
         timeout_sec=settings.command_timeout_apply_sec,
     )
@@ -1026,32 +994,45 @@ async def _cleanup_failed_new_app_runtimes(
         except Exception as exc:
             errors.append(f"container_stop_failed: {exc}")
         try:
-            _remove_podman_container(reconciler.container, settings, services=services)
+            await _runtime_workers.run(
+                _remove_podman_container,
+                reconciler.container,
+                settings,
+                services=services,
+            )
             actions.append(f"removed {reconciler.container}")
         except Exception as exc:
             errors.append(f"container_remove_failed: {exc}")
         try:
-            _stop_app_quadlet_network(backend_name, settings, services=services)
+            await _runtime_workers.run(
+                _stop_app_quadlet_network, backend_name, settings, services=services
+            )
             actions.append(f"stopped {quadlet_network_service_name(backend_name)}")
         except Exception as exc:
             errors.append(f"network_stop_failed: {exc}")
         try:
-            _remove_podman_network(reconciler.network, settings, services=services)
+            await _runtime_workers.run(
+                _remove_podman_network, reconciler.network, settings, services=services
+            )
             actions.append(f"removed {reconciler.network}")
         except Exception as exc:
             errors.append(f"network_remove_failed: {exc}")
         removed_files = remove_app_quadlet_assets(settings, backend_name)
         if removed_files:
             actions.extend(f"removed {path}" for path in removed_files)
-        removed_artifacts = _clear_runtime_artifacts_for_recreate(
-            settings, backend_name, clear_lock=True, preserve_failure=True
+        removed_artifacts = await _filesystem_workers.run(
+            _clear_runtime_artifacts_for_recreate,
+            settings,
+            backend_name,
+            clear_lock=True,
+            preserve_failure=True,
         )
         if removed_artifacts:
             actions.extend(f"removed {name}" for name in removed_artifacts)
         sandbox_dir = app_sandbox_rootfs_path(settings, backend_name).parent
         try:
             if sandbox_dir.exists():
-                _remove_tree_or_path(sandbox_dir)
+                await _filesystem_workers.run(_remove_tree_or_path, sandbox_dir)
                 actions.append(f"removed {sandbox_dir}")
         except Exception as exc:
             errors.append(f"sandbox_remove_failed: {exc}")
@@ -1301,8 +1282,13 @@ async def _provision_guest_rootfs(
     profile = get_app_sandbox_profile(backend.sandbox_profile)
     provisioned_steps: list[str] = []
     if not profile.provision_steps:
-        _record_guest_seed_step(
-            settings, backend, "profile_provision", "succeeded", skipped=True
+        await _filesystem_workers.run(
+            _record_guest_seed_step,
+            settings,
+            backend,
+            "profile_provision",
+            "succeeded",
+            skipped=True,
         )
         return provisioned_steps
     for step in profile.provision_steps:
@@ -1317,14 +1303,20 @@ async def _provision_guest_rootfs(
             step.command,
         ]
         started_at = time.monotonic()
-        _record_guest_seed_step(
-            settings, backend, step.step_id, "running", label=step.label
+        await _filesystem_workers.run(
+            _record_guest_seed_step,
+            settings,
+            backend,
+            step.step_id,
+            "running",
+            label=step.label,
         )
         await services.run_command_checked_async(
             command,
             timeout_sec=settings.command_timeout_apply_sec,
         )
-        _record_guest_seed_step(
+        await _filesystem_workers.run(
+            _record_guest_seed_step,
             settings,
             backend,
             step.step_id,
@@ -1346,8 +1338,13 @@ async def _self_test_guest_rootfs(
     profile = get_app_sandbox_profile(backend.sandbox_profile)
     self_test_steps: list[str] = []
     if not profile.self_test_command:
-        _record_guest_seed_step(
-            settings, backend, "profile_self_test", "succeeded", skipped=True
+        await _filesystem_workers.run(
+            _record_guest_seed_step,
+            settings,
+            backend,
+            "profile_self_test",
+            "succeeded",
+            skipped=True,
         )
         return self_test_steps
     command = [
@@ -1359,12 +1356,15 @@ async def _self_test_guest_rootfs(
         *profile.self_test_command,
     ]
     started_at = time.monotonic()
-    _record_guest_seed_step(settings, backend, "profile_self_test", "running")
+    await _filesystem_workers.run(
+        _record_guest_seed_step, settings, backend, "profile_self_test", "running"
+    )
     await services.run_command_checked_async(
         command,
         timeout_sec=settings.command_timeout_apply_sec,
     )
-    _record_guest_seed_step(
+    await _filesystem_workers.run(
+        _record_guest_seed_step,
         settings,
         backend,
         "profile_self_test",
@@ -1415,7 +1415,9 @@ async def _seed_persistent_guest_rootfs(
     rootfs_reseed_required = False
     if _guest_rootfs_ready(settings, backend):
         if _profile_state_matches(current_profile, expected_profile):
-            _record_guest_seed_step(settings, backend, "rootfs_reuse", "succeeded")
+            await _filesystem_workers.run(
+                _record_guest_seed_step, settings, backend, "rootfs_reuse", "succeeded"
+            )
             return {
                 "seeded": False,
                 "rootfs": str(rootfs_dir),
@@ -1425,7 +1427,8 @@ async def _seed_persistent_guest_rootfs(
                 "preserved_steps": [],
             }
         if not allow_reseed:
-            _record_guest_seed_step(
+            await _filesystem_workers.run(
+                _record_guest_seed_step,
                 settings,
                 backend,
                 "rootfs_reseed_available",
@@ -1478,7 +1481,8 @@ async def _seed_persistent_guest_rootfs(
         extracted_rootfs = temp_dir / "rootfs"
         extracted_rootfs.mkdir(parents=True, exist_ok=True)
         if rootfs_reseed_required:
-            _record_app_reconcile_step(
+            await _filesystem_workers.run(
+                _record_app_reconcile_step,
                 settings,
                 backend,
                 phase="create",
@@ -1487,7 +1491,8 @@ async def _seed_persistent_guest_rootfs(
                 kind="seed",
                 preserved_steps=preserved_steps,
             )
-        _record_guest_seed_step(
+        await _filesystem_workers.run(
+            _record_guest_seed_step,
             settings,
             backend,
             "seed_container_create",
@@ -1505,26 +1510,58 @@ async def _seed_persistent_guest_rootfs(
             ],
             timeout_sec=settings.command_timeout_apply_sec,
         )
-        _record_guest_seed_step(settings, backend, "seed_container_create", "succeeded")
+        await _filesystem_workers.run(
+            _record_guest_seed_step,
+            settings,
+            backend,
+            "seed_container_create",
+            "succeeded",
+        )
         try:
-            _record_guest_seed_step(settings, backend, "seed_image_export", "running")
+            await _filesystem_workers.run(
+                _record_guest_seed_step,
+                settings,
+                backend,
+                "seed_image_export",
+                "running",
+            )
             await services.run_command_checked_async(
                 ["podman", "export", "-o", str(export_tar), temp_container],
                 timeout_sec=settings.command_timeout_apply_sec,
             )
-            _record_guest_seed_step(settings, backend, "seed_image_export", "succeeded")
+            await _filesystem_workers.run(
+                _record_guest_seed_step,
+                settings,
+                backend,
+                "seed_image_export",
+                "succeeded",
+            )
         finally:
-            _record_guest_seed_step(
-                settings, backend, "seed_container_remove", "running"
+            await _filesystem_workers.run(
+                _record_guest_seed_step,
+                settings,
+                backend,
+                "seed_container_remove",
+                "running",
             )
             await services.run_command_checked_async(
                 ["podman", "rm", "-f", temp_container],
                 timeout_sec=settings.command_timeout_apply_sec,
             )
-            _record_guest_seed_step(
-                settings, backend, "seed_container_remove", "succeeded"
+            await _filesystem_workers.run(
+                _record_guest_seed_step,
+                settings,
+                backend,
+                "seed_container_remove",
+                "succeeded",
             )
-        _record_guest_seed_step(settings, backend, "seed_archive_extract", "running")
+        await _filesystem_workers.run(
+            _record_guest_seed_step,
+            settings,
+            backend,
+            "seed_archive_extract",
+            "running",
+        )
         preserved_steps.extend(
             await _filesystem_workers.run(
                 _unpack_guest_seed_archive,
@@ -1533,8 +1570,15 @@ async def _seed_persistent_guest_rootfs(
                 preserved_root,
             )
         )
-        _record_guest_seed_step(settings, backend, "seed_archive_extract", "succeeded")
-        _record_app_reconcile_step(
+        await _filesystem_workers.run(
+            _record_guest_seed_step,
+            settings,
+            backend,
+            "seed_archive_extract",
+            "succeeded",
+        )
+        await _filesystem_workers.run(
+            _record_app_reconcile_step,
             settings,
             backend,
             phase="create",
@@ -1543,7 +1587,8 @@ async def _seed_persistent_guest_rootfs(
             kind="seed",
         )
         if preserved_steps:
-            _record_app_reconcile_step(
+            await _filesystem_workers.run(
+                _record_app_reconcile_step,
                 settings,
                 backend,
                 phase="create",
@@ -1576,7 +1621,8 @@ async def _seed_persistent_guest_rootfs(
         had_existing_rootfs = rootfs_dir.exists()
         quarantine_rootfs: Path | None = None
         rollback_rootfs = temp_dir / "rollback-rootfs"
-        _record_app_reconcile_step(
+        await _filesystem_workers.run(
+            _record_app_reconcile_step,
             settings,
             backend,
             phase="create",
@@ -1597,7 +1643,9 @@ async def _seed_persistent_guest_rootfs(
             else:
                 shutil.move(str(rootfs_dir), str(rollback_rootfs))
         try:
-            _record_guest_seed_step(settings, backend, "rootfs_activate", "running")
+            await _filesystem_workers.run(
+                _record_guest_seed_step, settings, backend, "rootfs_activate", "running"
+            )
             shutil.move(str(extracted_rootfs), str(rootfs_dir))
         except Exception:
             if quarantine_rootfs is not None and quarantine_rootfs.exists():
@@ -1611,7 +1659,9 @@ async def _seed_persistent_guest_rootfs(
             elif had_existing_rootfs and rollback_rootfs.exists():
                 shutil.move(str(rollback_rootfs), str(rootfs_dir))
             raise
-        _record_guest_seed_step(settings, backend, "rootfs_activate", "succeeded")
+        await _filesystem_workers.run(
+            _record_guest_seed_step, settings, backend, "rootfs_activate", "succeeded"
+        )
         if quarantine_rootfs is None:
             await _filesystem_workers.run(
                 shutil.rmtree, rollback_rootfs, ignore_errors=True
@@ -1837,114 +1887,6 @@ def _known_or_fail(
         ) from exc
 
 
-def _container_requires_quadlet_migration(
-    current_spec: dict[str, Any],
-    inspect_payload: dict[str, Any] | None,
-    settings: Settings,
-    container: str,
-) -> bool:
-    return (
-        current_spec.get("runtime_owner") == "quadlet"
-        and inspect_payload is not None
-        and _legacy_reboot_bridge_path(settings, container).exists()
-        and not _container_is_quadlet_managed(inspect_payload)
-    )
-
-
-def legacy_direct_podman_migration_backend_reasons(
-    desired: DesiredState,
-    settings: Settings,
-    *,
-    services: AppRuntimeServices,
-    candidate_backend_names: set[str] | None = None,
-) -> dict[str, str]:
-    candidates = (
-        set(candidate_backend_names)
-        if candidate_backend_names is not None
-        else set(desired.runtime_graph.enabled_app_backend_names)
-    )
-    reasons: dict[str, str] = {}
-    for backend in sorted(desired.known_app_backends, key=lambda item: item.name):
-        if (
-            backend.name not in candidates
-            or backend.name not in desired.runtime_graph.enabled_app_backend_names
-        ):
-            continue
-        inter_app_interfaces = tuple(
-            item
-            for item in desired.runtime_graph.inter_app_interfaces
-            if item.source_backend == backend.name
-            or item.target_backend == backend.name
-        )
-        current_spec = runtime_spec(
-            backend,
-            settings,
-            base_profile=desired.resource_profile,
-            inter_app_interfaces=inter_app_interfaces,
-        )
-        if current_spec.get("runtime_owner") != "quadlet":
-            continue
-        bridge_path = _legacy_reboot_bridge_path(settings, container_name(backend.name))
-        if not bridge_path.exists():
-            continue
-        inspect_payload = present_value(
-            services.inspect_container(
-                container_name(backend.name),
-                timeout_sec=settings.command_timeout_status_sec,
-            )
-        )
-        if _container_requires_quadlet_migration(
-            current_spec, inspect_payload, settings, container_name(backend.name)
-        ):
-            reasons[backend.name] = "legacy_direct_podman_runtime_owner"
-    return reasons
-
-
-async def _remove_legacy_direct_podman_reboot_bridge(
-    container: str,
-    settings: Settings,
-    *,
-    services: AppRuntimeServices,
-) -> dict[str, Any]:
-    service_name = _legacy_reboot_bridge_service_name(container)
-    service_path = _legacy_reboot_bridge_path(settings, container)
-    removed = False
-    if service_path.exists():
-        await services.run_command_checked_async(
-            ["systemctl", "disable", service_name],
-            timeout_sec=settings.command_timeout_apply_sec,
-        )
-        service_path.unlink()
-        await _systemctl_daemon_reload(settings, services=services)
-        removed = True
-    return {"changed": removed, "reason": "quadlet_managed" if removed else "no_bridge"}
-
-
-async def _ensure_legacy_direct_podman_reboot_bridge(
-    container: str,
-    inspect_payload: dict[str, Any] | None,
-    settings: Settings,
-    *,
-    services: AppRuntimeServices,
-) -> dict[str, Any]:
-    if _container_is_quadlet_managed(inspect_payload):
-        return await _remove_legacy_direct_podman_reboot_bridge(
-            container, settings, services=services
-        )
-    service_name = _legacy_reboot_bridge_service_name(container)
-    changed = _write_text_atomic(
-        _legacy_reboot_bridge_path(settings, container),
-        _render_legacy_reboot_bridge(container),
-    )
-    if changed:
-        await _systemctl_daemon_reload(settings, services=services)
-    await services.run_command_checked_async(
-        ["systemctl", "enable", service_name],
-        timeout_sec=settings.command_timeout_apply_sec,
-    )
-    return {"changed": changed, "service": service_name}
-
-
 class AppRuntimeReconciler:
     PHASES = ("prepare", "create", "bootstrap", "publish", "verify", "steady_state")
 
@@ -1973,16 +1915,20 @@ class AppRuntimeReconciler:
             settings,
             base_profile=base_profile,
             inter_app_interfaces=inter_app_interfaces,
+            nginx_container=nginx_container,
         )
-        self.saved_spec = _normalize_saved_spec(
-            read_saved_spec(settings, backend.name),
-            self.current_spec,
+        self.contract_hash = runtime_contract_hash(
+            backend,
+            settings,
+            inter_app_interfaces=inter_app_interfaces,
+            nginx_container=nginx_container,
         )
         self.inspect_payload = None
         self.network_payload = None
         self.create_action = "reuse"
         self.container_started = False
         self.guest_rootfs_seeded = False
+        self._write_profile_state = True
         self.remove_runtime_on_apply_failure = False
         self._isolation_rollback_files: dict[Path, bytes] = {}
         self._isolation_rollback_dir: Path | None = None
@@ -2002,7 +1948,7 @@ class AppRuntimeReconciler:
         *,
         reason: str,
         container_exists: bool,
-        rebuild_required_keys: list[str] | None = None,
+        observed_contract_hash: str | None = None,
     ) -> dict[str, Any] | None:
         if bootstrap_lock_is_held(self.settings, self.backend.name):
             return None
@@ -2015,20 +1961,23 @@ class AppRuntimeReconciler:
                 self.backend.name, self.settings, services=self.services
             )
             remove_command = ["podman", "rm", "-f", self.container]
-            _remove_podman_container(
-                self.container, self.settings, services=self.services
+            await _runtime_workers.run(
+                _remove_podman_container,
+                self.container,
+                self.settings,
+                services=self.services,
             )
             actions.append(" ".join(remove_command))
             self.result.recreated = True
 
-        removed_artifacts = _clear_runtime_artifacts_for_recreate(
+        removed_artifacts = await _filesystem_workers.run(
+            _clear_runtime_artifacts_for_recreate,
             self.settings,
             self.backend.name,
             clear_lock=True,
         )
         actions.extend(f"removed {name}" for name in removed_artifacts)
 
-        self.saved_spec = None
         self.inspect_payload = None
         self.create_action = "create"
 
@@ -2036,8 +1985,9 @@ class AppRuntimeReconciler:
             "reason": reason,
             "actions": actions,
         }
-        if rebuild_required_keys:
-            details["rebuild_required_keys"] = rebuild_required_keys
+        if observed_contract_hash is not None:
+            details["observed_contract_hash"] = observed_contract_hash
+            details["expected_contract_hash"] = self.contract_hash
         logger.info(
             "app.prepare.auto_repair",
             backend=self.backend.name,
@@ -2105,7 +2055,9 @@ class AppRuntimeReconciler:
             artifact["diagnostics_error"] = str(exc)
         else:
             artifact["runtime_diagnostics"] = diagnostics
-        write_failure_artifact(self.settings, self.backend.name, artifact)
+        await _filesystem_workers.run(
+            write_failure_artifact, self.settings, self.backend.name, artifact
+        )
 
     async def _run_phase(self, phase: str, fn):
         bootstrap_snapshot = (
@@ -2113,7 +2065,7 @@ class AppRuntimeReconciler:
             if phase == "bootstrap"
             else None
         )
-        self._record_phase(phase, "running")
+        await _filesystem_workers.run(self._record_phase, phase, "running")
         try:
             details = await fn()
         except Exception as exc:
@@ -2144,16 +2096,21 @@ class AppRuntimeReconciler:
                     "status": "failed",
                     "details": failure_details,
                 }
-                _restore_bootstrap_state_file(
+                await _filesystem_workers.run(
+                    _restore_bootstrap_state_file,
                     self.settings,
                     self.backend.name,
                     bootstrap_snapshot,
                 )
                 raise
-            self._record_phase(phase, "failed", **failure_details)
+            await _filesystem_workers.run(
+                self._record_phase, phase, "failed", **failure_details
+            )
             await self._write_failure_artifact(phase, failure_details)
             raise
-        self._record_phase(phase, "succeeded", **(details or {}))
+        await _filesystem_workers.run(
+            self._record_phase, phase, "succeeded", **(details or {})
+        )
         return details
 
     async def reconcile_for_publish(self) -> AppRuntimeReconcileResult:
@@ -2210,7 +2167,12 @@ class AppRuntimeReconciler:
         await _stop_app_quadlet_backend(
             self.backend.name, self.settings, services=self.services
         )
-        _remove_podman_container(self.container, self.settings, services=self.services)
+        await _runtime_workers.run(
+            _remove_podman_container,
+            self.container,
+            self.settings,
+            services=self.services,
+        )
         for path, content in self._isolation_rollback_files.items():
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(content)
@@ -2243,7 +2205,8 @@ class AppRuntimeReconciler:
             timeout_sec=self.settings.command_timeout_apply_sec,
         )
         self.inspect_payload = _known_or_fail(
-            self.services.inspect_container(
+            await _runtime_workers.run(
+                self.services.inspect_container,
                 self.container,
                 timeout_sec=self.settings.command_timeout_status_sec,
             ),
@@ -2252,7 +2215,8 @@ class AppRuntimeReconciler:
             phase="app_create",
         )
         self.network_payload = _known_or_fail(
-            self.services.inspect_network(
+            await _runtime_workers.run(
+                self.services.inspect_network,
                 self.network,
                 timeout_sec=self.settings.command_timeout_status_sec,
             ),
@@ -2275,111 +2239,45 @@ class AppRuntimeReconciler:
                 for line in existing_unit.read_text(encoding="utf-8").splitlines()
             )
             gateway_binding_changes = current_gateway_binding != expected_gateway_binding
+        observed_hash = container_contract_hash(self.inspect_payload)
         if (
             container_exists
-            and (
-                gateway_binding_changes
-                or (
-                    self.saved_spec is not None
-                    and self.saved_spec.get("guest_isolation_revision")
-                    != self.current_spec.get("guest_isolation_revision")
-                )
-            )
+            and existing_unit.is_file()
+            and (gateway_binding_changes or observed_hash != self.contract_hash)
         ):
-            self._save_previous_isolation_runtime()
+            await _filesystem_workers.run(
+                self._save_previous_isolation_runtime,
+            )
         network_exists = self.network_payload is not None
         self.create_action = "reuse"
         auto_repair_details: dict[str, Any] | None = None
 
         if not container_exists:
-            if self.saved_spec is not None:
-                auto_repair_details = await self._auto_repair_prepare_drift(
-                    reason="container_missing_saved_spec",
-                    container_exists=False,
-                )
-                if auto_repair_details is None:
-                    runtime_diagnostics = collect_app_backend_diagnostics(
-                        self.backend, self.settings
-                    )
-                    raise ApplyFailed(
-                        f"app backend {self.backend.name} container missing with saved spec present",
-                        phase="app_create",
-                        details={
-                            "backend": self.backend.name,
-                            "container": self.container,
-                            "runtime_diagnostics": runtime_diagnostics,
-                        },
-                    )
             self.create_action = "create"
             self.remove_runtime_on_apply_failure = not guest_state_preexisting
-        elif self.saved_spec is None:
+        elif observed_hash != self.contract_hash:
             auto_repair_details = await self._auto_repair_prepare_drift(
-                reason="missing_saved_spec",
+                reason="contract_hash_mismatch",
                 container_exists=True,
+                observed_contract_hash=observed_hash or "",
             )
             if auto_repair_details is None:
-                runtime_diagnostics = collect_app_backend_diagnostics(
-                    self.backend, self.settings
-                )
                 raise ApplyFailed(
-                    f"app backend {self.backend.name} is missing saved runtime spec",
+                    f"app backend {self.backend.name} live contract does not match desired state",
                     phase="app_create",
                     details={
                         "backend": self.backend.name,
                         "container": self.container,
-                        "runtime_diagnostics": runtime_diagnostics,
+                        "observed_contract_hash": observed_hash,
+                        "expected_contract_hash": self.contract_hash,
                     },
                 )
             container_exists = False
+        elif not container_is_running(self.inspect_payload):
+            self.create_action = "start"
+            self.guest_rootfs_seeded = False
         else:
-            rebuild_required_keys = sorted(
-                _rebuild_required_spec_keys(self.saved_spec, self.current_spec)
-            )
-            if rebuild_required_keys:
-                auto_repair_details = await self._auto_repair_prepare_drift(
-                    reason="rebuild_required_settings",
-                    container_exists=True,
-                    rebuild_required_keys=rebuild_required_keys,
-                )
-                if auto_repair_details is None:
-                    raise ApplyFailed(
-                        f"app backend {self.backend.name} changed rebuild-required settings",
-                        phase="app_create",
-                        details={
-                            "backend": self.backend.name,
-                            "container": self.container,
-                            "rebuild_required_keys": rebuild_required_keys,
-                            "saved_spec": self.saved_spec,
-                            "current_spec": self.current_spec,
-                        },
-                    )
-                container_exists = False
-            elif _container_requires_quadlet_migration(
-                self.current_spec,
-                self.inspect_payload,
-                self.settings,
-                self.container,
-            ):
-                auto_repair_details = await self._auto_repair_prepare_drift(
-                    reason="legacy_direct_podman_runtime_owner",
-                    container_exists=True,
-                )
-                if auto_repair_details is None:
-                    runtime_diagnostics = collect_app_backend_diagnostics(
-                        self.backend, self.settings
-                    )
-                    raise ApplyFailed(
-                        f"app backend {self.backend.name} requires Quadlet runtime migration",
-                        phase="app_create",
-                        details={
-                            "backend": self.backend.name,
-                            "container": self.container,
-                            "runtime_diagnostics": runtime_diagnostics,
-                        },
-                    )
-                container_exists = False
-            else:
-                self.guest_rootfs_seeded = False
+            self.guest_rootfs_seeded = False
 
         if container_exists and network_uses_bridge_dns(self.network_payload):
             raise ApplyFailed(
@@ -2396,7 +2294,8 @@ class AppRuntimeReconciler:
         return {
             "container_exists": container_exists,
             "network_exists": network_exists,
-            "saved_spec_present": self.saved_spec is not None,
+            "contract_hash": self.contract_hash,
+            "observed_contract_hash": observed_hash,
             "action": self.create_action,
             "auto_repair": auto_repair_details,
         }
@@ -2404,10 +2303,6 @@ class AppRuntimeReconciler:
     async def _create_phase(self) -> dict[str, Any]:
         auto_repair_details: dict[str, Any] | None = None
         quadlet_container_restarted = False
-        legacy_reboot_bridge: dict[str, Any] = {
-            "changed": False,
-            "reason": "not_legacy_direct_podman",
-        }
         resource_limits: dict[str, Any]
         rootfs_state = await _seed_persistent_guest_rootfs(
             self.backend,
@@ -2415,23 +2310,10 @@ class AppRuntimeReconciler:
             services=self.services,
         )
         self.guest_rootfs_seeded = bool(rootfs_state.get("seeded"))
-        write_profile_state = not bool(rootfs_state.get("reseed_skipped"))
+        self._write_profile_state = not bool(rootfs_state.get("reseed_skipped"))
         if self.create_action == "create":
-            _record_app_reconcile_step(
-                self.settings,
-                self.backend,
-                phase="create",
-                substep="app_control_assets_write",
-                status="running",
-            )
-            write_app_control_assets(
-                self.backend,
-                self.settings,
-                write_profile_state=write_profile_state,
-                base_profile=self.base_profile,
-                inter_app_interfaces=self.inter_app_interfaces,
-            )
-            _record_app_reconcile_step(
+            await _filesystem_workers.run(
+                _record_app_reconcile_step,
                 self.settings,
                 self.backend,
                 phase="create",
@@ -2446,7 +2328,8 @@ class AppRuntimeReconciler:
                 nginx_container=self.nginx_container,
                 services=self.services,
             )
-            _record_app_reconcile_step(
+            await _filesystem_workers.run(
+                _record_app_reconcile_step,
                 self.settings,
                 self.backend,
                 phase="create",
@@ -2455,11 +2338,6 @@ class AppRuntimeReconciler:
             )
             await _start_app_quadlet_backend(
                 self.backend, self.settings, services=self.services
-            )
-            legacy_reboot_bridge = await _remove_legacy_direct_podman_reboot_bridge(
-                self.container,
-                self.settings,
-                services=self.services,
             )
             self.result.created = True
             resource_limits = {
@@ -2470,22 +2348,51 @@ class AppRuntimeReconciler:
                 "cpu_quota": self.current_spec.get("cpu_quota"),
                 "cpu_shares": self.current_spec.get("cpu_shares"),
             }
-        else:
-            _record_app_reconcile_step(
+        elif self.create_action == "start":
+            await _filesystem_workers.run(
+                _record_app_reconcile_step,
                 self.settings,
                 self.backend,
                 phase="create",
-                substep="app_control_assets_write",
+                substep="service_files_write",
                 status="running",
             )
-            write_app_control_assets(
+            quadlet_details = await _reconcile_app_quadlet_assets(
                 self.backend,
                 self.settings,
-                write_profile_state=write_profile_state,
                 base_profile=self.base_profile,
                 inter_app_interfaces=self.inter_app_interfaces,
+                nginx_container=self.nginx_container,
+                services=self.services,
             )
-            _record_app_reconcile_step(
+            await _filesystem_workers.run(
+                _record_app_reconcile_step,
+                self.settings,
+                self.backend,
+                phase="create",
+                substep="app_service_start",
+                status="running",
+            )
+            if container_is_paused(self.inspect_payload):
+                await self.services.run_command_checked_async(
+                    ["podman", "unpause", self.container],
+                    timeout_sec=self.settings.command_timeout_apply_sec,
+                )
+            else:
+                await _start_app_quadlet_backend(
+                    self.backend, self.settings, services=self.services
+                )
+            self.container_started = True
+            resource_limits = await apply_app_resource_limits(
+                self.backend,
+                self.settings,
+                base_profile=self.base_profile,
+                services=self.services,
+                operation_id=self.operation_id,
+            )
+        else:
+            await _filesystem_workers.run(
+                _record_app_reconcile_step,
                 self.settings,
                 self.backend,
                 phase="create",
@@ -2501,7 +2408,8 @@ class AppRuntimeReconciler:
                 services=self.services,
             )
             if quadlet_details["container_restart_required"]:
-                _record_app_reconcile_step(
+                await _filesystem_workers.run(
+                    _record_app_reconcile_step,
                     self.settings,
                     self.backend,
                     phase="create",
@@ -2546,12 +2454,6 @@ class AppRuntimeReconciler:
                 self.container_started = True
                 self.result.recreated = True
                 quadlet_container_restarted = True
-            legacy_reboot_bridge = await _ensure_legacy_direct_podman_reboot_bridge(
-                self.container,
-                self.inspect_payload,
-                self.settings,
-                services=self.services,
-            )
             if quadlet_container_restarted:
                 resource_limits = {
                     "resource_mode": self.current_spec.get("resource_mode"),
@@ -2563,7 +2465,8 @@ class AppRuntimeReconciler:
                 }
             else:
                 try:
-                    _record_app_reconcile_step(
+                    await _filesystem_workers.run(
+                        _record_app_reconcile_step,
                         self.settings,
                         self.backend,
                         phase="create",
@@ -2586,21 +2489,8 @@ class AppRuntimeReconciler:
                     )
                     if auto_repair_details is None:
                         raise
-                    _record_app_reconcile_step(
-                        self.settings,
-                        self.backend,
-                        phase="create",
-                        substep="app_control_assets_write",
-                        status="running",
-                    )
-                    write_app_control_assets(
-                        self.backend,
-                        self.settings,
-                        write_profile_state=write_profile_state,
-                        base_profile=self.base_profile,
-                        inter_app_interfaces=self.inter_app_interfaces,
-                    )
-                    _record_app_reconcile_step(
+                    await _filesystem_workers.run(
+                        _record_app_reconcile_step,
                         self.settings,
                         self.backend,
                         phase="create",
@@ -2615,7 +2505,8 @@ class AppRuntimeReconciler:
                         nginx_container=self.nginx_container,
                         services=self.services,
                     )
-                    _record_app_reconcile_step(
+                    await _filesystem_workers.run(
+                        _record_app_reconcile_step,
                         self.settings,
                         self.backend,
                         phase="create",
@@ -2626,13 +2517,6 @@ class AppRuntimeReconciler:
                         self.backend, self.settings, services=self.services
                     )
                     self.result.created = True
-                    legacy_reboot_bridge = (
-                        await _remove_legacy_direct_podman_reboot_bridge(
-                            self.container,
-                            self.settings,
-                            services=self.services,
-                        )
-                    )
                     resource_limits = {
                         "resource_mode": self.current_spec.get("resource_mode"),
                         "resource_size": self.current_spec.get("resource_size"),
@@ -2642,10 +2526,11 @@ class AppRuntimeReconciler:
                         "cpu_shares": self.current_spec.get("cpu_shares"),
                     }
 
-        if not _app_container_running(
-            self.backend, self.settings, services=self.services
+        if not await _runtime_workers.run(
+            _app_container_running, self.backend, self.settings, services=self.services
         ):
-            _record_app_reconcile_step(
+            await _filesystem_workers.run(
+                _record_app_reconcile_step,
                 self.settings,
                 self.backend,
                 phase="create",
@@ -2681,7 +2566,6 @@ class AppRuntimeReconciler:
             "quadlet": quadlet_details,
             "quadlet_container_restarted": quadlet_container_restarted,
             "auto_repair": auto_repair_details,
-            "legacy_reboot_bridge": legacy_reboot_bridge,
         }
 
     async def _bootstrap_phase(self) -> dict[str, Any]:
@@ -2718,7 +2602,8 @@ class AppRuntimeReconciler:
         elif (read_bootstrap_state(self.settings, self.backend.name) or {}).get(
             "status"
         ) != "succeeded":
-            write_bootstrap_state(
+            await _filesystem_workers.run(
+                write_bootstrap_state,
                 self.settings,
                 self.backend.name,
                 {
@@ -2750,7 +2635,8 @@ class AppRuntimeReconciler:
 
     async def _publish_phase(self) -> dict[str, Any]:
         self.inspect_payload = _known_or_fail(
-            self.services.inspect_container(
+            await _runtime_workers.run(
+                self.services.inspect_container,
                 self.container,
                 timeout_sec=self.settings.command_timeout_status_sec,
             ),
@@ -2760,8 +2646,8 @@ class AppRuntimeReconciler:
         )
         target_ip = container_ipv4_address(self.backend, self.inspect_payload)
         if target_ip is None:
-            runtime_diagnostics = collect_app_backend_diagnostics(
-                self.backend, self.settings
+            runtime_diagnostics = await _runtime_workers.run(
+                collect_app_backend_diagnostics, self.backend, self.settings
             )
             raise ApplyFailed(
                 f"app backend {self.backend.name} missing private network address",
@@ -2814,8 +2700,20 @@ class AppRuntimeReconciler:
         }
 
     async def _steady_state_phase(self) -> dict[str, Any]:
+        # Diagnostic snapshot only: written after live runtime verification succeeds.
+        await _filesystem_workers.run(
+            write_app_control_assets,
+            self.backend,
+            self.settings,
+            write_spec=True,
+            write_profile_state=self._write_profile_state,
+            base_profile=self.base_profile,
+            inter_app_interfaces=self.inter_app_interfaces,
+            nginx_container=self.nginx_container,
+        )
         state = read_bootstrap_state(self.settings, self.backend.name) or {}
-        write_bootstrap_state(
+        await _filesystem_workers.run(
+            write_bootstrap_state,
             self.settings,
             self.backend.name,
             {
@@ -2831,6 +2729,7 @@ class AppRuntimeReconciler:
         clear_failure_artifact(self.settings, self.backend.name)
         return {
             "container": self.container,
+            "contract_hash": self.contract_hash,
             "target_ip": self.result.target_ip,
             "dns_servers": list(self.current_spec.get("dns_servers", [])),
         }
@@ -2864,10 +2763,7 @@ def _app_container_running(
         backend_name=backend.name,
         phase="app_create",
     )
-    state = payload.get("State") if isinstance(payload, dict) else {}
-    if not isinstance(state, dict):
-        return False
-    return bool(state.get("Running"))
+    return container_is_running(payload)
 
 
 def _verify_guest_isolation(
@@ -3016,61 +2912,6 @@ def _restore_bootstrap_state_file(
         _remove_runtime_artifact(path)
 
 
-def _runtime_spec_diff_keys(
-    saved_spec: dict[str, Any], current_spec: dict[str, Any]
-) -> set[str]:
-    return {
-        key
-        for key in set(saved_spec) | set(current_spec)
-        if saved_spec.get(key) != current_spec.get(key)
-    }
-
-
-def _normalize_saved_spec(
-    saved_spec: dict[str, Any] | None,
-    current_spec: dict[str, Any],
-) -> dict[str, Any] | None:
-    if saved_spec is None:
-        return None
-    normalized = dict(saved_spec)
-    normalized.setdefault("hardening", {})
-    # Interfaces once carried a "direction" that never reached the runtime.
-    # Dropping it from older specs keeps its removal from forcing a rebuild.
-    if isinstance(normalized.get("inter_app_interfaces"), list):
-        normalized["inter_app_interfaces"] = [
-            {key: value for key, value in item.items() if key != "direction"}
-            if isinstance(item, dict)
-            else item
-            for item in normalized["inter_app_interfaces"]
-        ]
-    if "guest_isolation_revision" in current_spec:
-        normalized.setdefault("guest_isolation_revision", 0)
-    for key, value in current_spec.items():
-        normalized.setdefault(key, value)
-    return normalized
-
-
-def _rebuild_required_spec_keys(
-    saved_spec: dict[str, Any], current_spec: dict[str, Any]
-) -> set[str]:
-    immutable_keys = {
-        "guest_isolation_revision",
-        "hardening",
-        "runtime_owner",
-        "network",
-        "sandbox_profile",
-        "seed_image",
-        "guest_rootfs",
-        "init_command",
-        "port",
-        "handoff_port",
-        "dns_servers",
-        "volumes",
-        "inter_app_interfaces",
-    }
-    return _runtime_spec_diff_keys(saved_spec, current_spec) & immutable_keys
-
-
 def _remove_runtime_artifact(path: Path) -> bool:
     try:
         path.unlink()
@@ -3151,7 +2992,8 @@ async def _bootstrap_app_backend(
                 phase="app_bootstrap",
                 details=state_details,
             )
-        write_bootstrap_state(
+        await _filesystem_workers.run(
+            write_bootstrap_state,
             settings,
             backend.name,
             {
@@ -3170,7 +3012,8 @@ async def _bootstrap_app_backend(
             container=container,
         )
     inspect_payload = present_value(
-        services.inspect_container(
+        await _runtime_workers.run(
+            services.inspect_container,
             container,
             timeout_sec=settings.command_timeout_status_sec,
         )
@@ -3189,7 +3032,8 @@ async def _bootstrap_app_backend(
     try:
         try:
             with BackendBootstrapLock(settings, backend.name):
-                write_bootstrap_state(
+                await _filesystem_workers.run(
+                    write_bootstrap_state,
                     settings,
                     backend.name,
                     {
@@ -3207,7 +3051,8 @@ async def _bootstrap_app_backend(
                         "dns_servers": dns_servers,
                     },
                 )
-                _record_app_reconcile_step(
+                await _filesystem_workers.run(
+                    _record_app_reconcile_step,
                     settings,
                     backend,
                     phase="bootstrap",
@@ -3247,7 +3092,8 @@ async def _bootstrap_app_backend(
                                 "guest_state": guest_state or {},
                             },
                         )
-                    _record_app_reconcile_step(
+                    await _filesystem_workers.run(
+                        _record_app_reconcile_step,
                         settings,
                         backend,
                         phase="bootstrap",
@@ -3317,7 +3163,8 @@ async def _bootstrap_app_backend(
             else ""
         )
         if exec_outcome in {"guard_busy", "guard_unavailable"}:
-            _restore_bootstrap_state_file(
+            await _filesystem_workers.run(
+                _restore_bootstrap_state_file,
                 settings,
                 backend.name,
                 bootstrap_snapshot,
@@ -3355,7 +3202,8 @@ async def _bootstrap_app_backend(
                     **details,
                 },
             ) from exc
-        write_bootstrap_state(
+        await _filesystem_workers.run(
+            write_bootstrap_state,
             settings,
             backend.name,
             {
@@ -3420,7 +3268,8 @@ async def _bootstrap_app_backend(
                 **details,
             },
         ) from exc
-    write_bootstrap_state(
+    await _filesystem_workers.run(
+        write_bootstrap_state,
         settings,
         backend.name,
         {
@@ -3507,7 +3356,8 @@ async def _cleanup_disabled_app_backend(
     container = container_name(backend.name)
     network = network_name(backend.name)
     inspect_payload = _known_or_fail(
-        services.inspect_container(
+        await _runtime_workers.run(
+            services.inspect_container,
             container,
             timeout_sec=settings.command_timeout_status_sec,
         ),
@@ -3516,7 +3366,8 @@ async def _cleanup_disabled_app_backend(
         phase="app_runtime",
     )
     network_payload = _known_or_fail(
-        services.inspect_network(
+        await _runtime_workers.run(
+            services.inspect_network,
             network,
             timeout_sec=settings.command_timeout_status_sec,
         ),
@@ -3534,12 +3385,18 @@ async def _cleanup_disabled_app_backend(
         await _stop_app_quadlet_backend(backend.name, settings, services=services)
         actions.append(f"stopped {quadlet_container_service_name(backend.name)}")
     if container_exists:
-        _remove_podman_container(container, settings, services=services)
+        await _runtime_workers.run(
+            _remove_podman_container, container, settings, services=services
+        )
         actions.append(f"removed {container}")
     if network_exists:
-        _stop_app_quadlet_network(backend.name, settings, services=services)
+        await _runtime_workers.run(
+            _stop_app_quadlet_network, backend.name, settings, services=services
+        )
         actions.append(f"stopped {quadlet_network_service_name(backend.name)}")
-        _remove_podman_network(network, settings, services=services)
+        await _runtime_workers.run(
+            _remove_podman_network, network, settings, services=services
+        )
         actions.append(f"removed {network}")
 
     removed_quadlet_files = remove_app_quadlet_assets(settings, backend.name)

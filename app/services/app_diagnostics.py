@@ -544,8 +544,6 @@ def collect_app_backend_diagnostics(
         issues.append("container_not_running")
     if network_uses_bridge_dns(network_payload):
         issues.append("bridge_dns_enabled")
-    if inspect_payload is not None and saved_spec is None:
-        issues.append("missing_saved_spec")
     if network_missing:
         issues.append("network_missing")
     if bootstrap_status == "failed":

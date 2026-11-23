@@ -1,0 +1,600 @@
+#!/usr/bin/env python3
+"""Versioned CNC follower node entrypoint.
+
+Reads one JSON request from stdin, executes a bounded host action using atomic
+file writes and follower-local resource budgets, and writes a JSON result to stdout.
+"""
+from __future__ import annotations
+
+import base64
+import json
+import os
+from pathlib import Path
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from typing import Any
+from urllib import error as urllib_error
+from urllib import request as urllib_request
+
+NODE_EXEC_VERSION = 1
+QUADLET_DIR = Path("/etc/containers/systemd")
+SANDBOX_ROOT = Path("/var/lib/cnc/sandboxes")
+TRANSFER_ROOT = Path("/var/lib/cnc/cluster-transfers")
+GUEST_HELPER_PATH = Path("/usr/local/bin/cnc-prepare-guest")
+APPS_SLICE_DROPIN = Path("/etc/systemd/system/cnc-apps.slice.d/50-cnc-memory.conf")
+
+SIZE_WEIGHTS = {"small": 1, "medium": 2, "large": 4}
+MIN_PODMAN_VERSION = (5, 2, 0)
+
+
+def _write_atomic(path: Path, content: str | bytes, mode: int = 0o644) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = content.encode("utf-8") if isinstance(content, str) else content
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp_path, mode)
+        os.replace(tmp_path, path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def _run(
+    command: list[str], *, check: bool = True, timeout: int = 180
+) -> subprocess.CompletedProcess[str]:
+    proc = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+    if check and proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
+        raise RuntimeError(f"{' '.join(command)}: {detail}")
+    return proc
+
+
+def _run_cleanup(command: list[str], missing_markers: tuple[str, ...]) -> None:
+    proc = _run(command, check=False)
+    if proc.returncode == 0:
+        return
+    combined = f"{proc.stdout}\n{proc.stderr}".lower()
+    if any(marker in combined for marker in missing_markers):
+        return
+    detail = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
+    raise RuntimeError(f"{' '.join(command)}: {detail}")
+
+
+def _require_pinned_podman() -> None:
+    if shutil.which("podman") is None:
+        raise RuntimeError(
+            "Podman is not installed on this follower. Re-run the CNC node join installer to install CNC's pinned runtime."
+        )
+    proc = _run(["podman", "--version"], check=True, timeout=15)
+    parts = proc.stdout.strip().split()
+    version_text = parts[-1] if parts else ""
+    parsed: list[int] = []
+    for piece in version_text.split(".")[:3]:
+        digits = "".join(ch for ch in piece if ch.isdigit())
+        parsed.append(int(digits) if digits else 0)
+    while len(parsed) < 3:
+        parsed.append(0)
+    if tuple(parsed[:3]) < MIN_PODMAN_VERSION:
+        raise RuntimeError(
+            f"Follower Podman {version_text} is below CNC's minimum 5.2.0. Re-run the CNC node join installer."
+        )
+
+
+def _install_guest_helper(helper_b64: str) -> None:
+    if not helper_b64:
+        return
+    if GUEST_HELPER_PATH.is_symlink():
+        raise RuntimeError("Guest helper cannot be a symlink")
+    _write_atomic(GUEST_HELPER_PATH, base64.b64decode(helper_b64), mode=0o755)
+
+
+def _follower_memory_bytes() -> int:
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemTotal:"):
+                kb = int(line.split()[1])
+                return kb * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 4 * 1024**3
+
+
+def _follower_cpu_count() -> int:
+    return max(1, os.cpu_count() or 1)
+
+
+def _format_mib(value_bytes: int) -> str:
+    mib = max(64, int(round(value_bytes / (1024 * 1024))))
+    return f"{mib}M"
+
+
+def _compute_follower_resource_limits(payload: dict[str, Any]) -> dict[str, Any]:
+    """Compute memory/CPU limits using this follower's actual RAM and CPU count."""
+    host_mem = _follower_memory_bytes()
+    host_cpus = _follower_cpu_count()
+    # Reserve 25% (min 512MiB) for host/control services, matching leader philosophy.
+    reserve = max(512 * 1024 * 1024, int(host_mem * 0.25))
+    app_pool = max(256 * 1024 * 1024, host_mem - reserve)
+
+    resource_mode = str(payload.get("resource_mode") or "auto").strip().lower()
+    resource_size = str(payload.get("resource_size") or "small").strip().lower()
+    weight = SIZE_WEIGHTS.get(resource_size, 1)
+
+    active_count = max(1, int(payload.get("follower_app_count") or 1))
+    total_weight = max(weight, active_count * 2)
+    share = min(1.0, weight / total_weight)
+
+    mem_high = payload.get("memory_high_override") or _format_mib(
+        int(app_pool * share * 0.8)
+    )
+    mem_max = payload.get("memory_max_override") or _format_mib(
+        int(app_pool * min(1.0, share * 1.15))
+    )
+    if resource_mode == "manual" and payload.get("cpu_quota_override"):
+        cpu_quota = str(payload["cpu_quota_override"]).strip()
+    else:
+        pct = max(25.0, min(100.0, share * 100.0))
+        cpu_quota = f"{pct:.0f}%"
+
+    normalized_quota = cpu_quota.rstrip("%")
+    try:
+        quota_val = float(normalized_quota)
+    except ValueError:
+        quota_val = 50.0
+    cpus = max(0.25, round((quota_val / 100.0) * host_cpus, 2))
+    cpus_str = f"{cpus:.2f}".rstrip("0").rstrip(".")
+    cpu_shares = max(256, int(1024 * weight))
+    return {
+        "memory_high": str(mem_high),
+        "memory_max": str(mem_max),
+        "cpus": cpus_str,
+        "cpu_shares": cpu_shares,
+        "apps_slice_memory_max": _format_mib(app_pool),
+    }
+
+
+def _patch_quadlet_with_follower_limits(
+    container_unit: str, limits: dict[str, Any]
+) -> str:
+    patched: list[str] = []
+    for line in container_unit.splitlines():
+        if line.startswith("MemoryHigh="):
+            patched.append(f"MemoryHigh={limits['memory_high']}")
+        elif line.startswith("MemoryMax="):
+            patched.append(f"MemoryMax={limits['memory_max']}")
+        elif line.startswith("PodmanArgs="):
+            args = shlex.split(line.removeprefix("PodmanArgs="))
+            new_args = []
+            for arg in args:
+                if arg.startswith("--cpus="):
+                    new_args.append(f"--cpus={limits['cpus']}")
+                elif arg.startswith("--cpu-shares="):
+                    new_args.append(f"--cpu-shares={limits['cpu_shares']}")
+                else:
+                    new_args.append(arg)
+            patched.append(f"PodmanArgs={shlex.join(new_args)}")
+        else:
+            patched.append(line)
+    return "\n".join(patched) + "\n"
+
+
+def _ensure_apps_slice(apps_slice_memory_max: str) -> None:
+    content = (
+        "# Managed by CNC. Do not edit by hand.\n"
+        "[Slice]\n"
+        f"MemoryMax={apps_slice_memory_max}\n"
+    )
+    _write_atomic(APPS_SLICE_DROPIN, content, mode=0o644)
+
+
+def _wait_for_container_running(container: str, timeout_sec: int = 30) -> None:
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        proc = _run(
+            ["podman", "inspect", container, "--format", "{{.State.Running}}"],
+            check=False,
+            timeout=10,
+        )
+        if proc.returncode == 0 and proc.stdout.strip().lower() == "true":
+            return
+        time.sleep(0.5)
+    raise RuntimeError(f"container {container} did not enter running state")
+
+
+def _stop_runtime(container: str, network: str) -> None:
+    _run_cleanup(
+        ["systemctl", "stop", f"{container}.service"],
+        ("not loaded", "not-found", "not found", "could not be found"),
+    )
+    _run_cleanup(
+        ["podman", "rm", "-f", container],
+        ("no such container", "does not exist", "not found"),
+    )
+    _run_cleanup(
+        ["systemctl", "stop", f"{network}-network.service"],
+        ("not loaded", "not-found", "not found", "could not be found"),
+    )
+
+
+def _backup_units(unit_backup_dir: Path, network_unit: str, container_unit: str) -> None:
+    shutil.rmtree(unit_backup_dir, ignore_errors=True)
+    unit_backup_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+    for unit_name in (network_unit, container_unit):
+        src = QUADLET_DIR / unit_name
+        if src.exists():
+            shutil.copy2(src, unit_backup_dir / unit_name)
+
+
+def _restore_units_and_sandbox(
+    *,
+    container: str,
+    network: str,
+    network_unit: str,
+    container_unit: str,
+    target_sandbox: Path,
+    rollback_dir: Path,
+    unit_backup_dir: Path,
+    previous_active: bool,
+) -> None:
+    _run(["systemctl", "stop", f"{container}.service"], check=False)
+    _run(["podman", "rm", "-f", container], check=False)
+    _run(["systemctl", "stop", f"{network}-network.service"], check=False)
+    if target_sandbox.exists():
+        shutil.rmtree(target_sandbox, ignore_errors=True)
+    if rollback_dir.exists():
+        shutil.move(str(rollback_dir), str(target_sandbox))
+    if unit_backup_dir.is_dir():
+        for unit_name in (network_unit, container_unit):
+            backup_file = unit_backup_dir / unit_name
+            dest = QUADLET_DIR / unit_name
+            if backup_file.exists():
+                _write_atomic(dest, backup_file.read_bytes(), mode=0o644)
+            else:
+                dest.unlink(missing_ok=True)
+        _run(["systemctl", "daemon-reload"], check=False)
+        if previous_active:
+            _run(["systemctl", "start", f"{network}-network.service"], check=False)
+            _run(["systemctl", "start", f"{container}.service"], check=False)
+
+
+def _activate_staged_sandbox(
+    payload: dict[str, Any], staged_sandbox: Path
+) -> dict[str, Any]:
+    backend = str(payload["backend"])
+    container = str(payload["container"])
+    network = str(payload["network"])
+    network_unit = str(payload["network_unit"])
+    container_unit = str(payload["container_unit"])
+    target_sandbox = Path(payload["target_path"])
+    rollback_dir = Path(payload["rollback_path"])
+    unit_backup_dir = Path(payload["unit_backup_path"])
+    previous_active = bool(payload.get("service_was_active"))
+
+    limits = _compute_follower_resource_limits(payload)
+    network_content = str(payload["network_unit_content"])
+    container_content = _patch_quadlet_with_follower_limits(
+        str(payload["container_unit_content"]), limits
+    )
+
+    shutil.rmtree(rollback_dir, ignore_errors=True)
+    _backup_units(unit_backup_dir, network_unit, container_unit)
+
+    activated = False
+    try:
+        _stop_runtime(container, network)
+        if target_sandbox.exists():
+            target_sandbox.rename(rollback_dir)
+        staged_sandbox.rename(target_sandbox)
+        activated = True
+
+        _ensure_apps_slice(limits["apps_slice_memory_max"])
+        _write_atomic(QUADLET_DIR / network_unit, network_content, mode=0o644)
+        _write_atomic(QUADLET_DIR / container_unit, container_content, mode=0o644)
+        _run(["systemctl", "daemon-reload"])
+        _run(["systemctl", "start", f"{network}-network.service"])
+        _run(["systemctl", "start", f"{container}.service"])
+        _wait_for_container_running(container)
+    except BaseException:
+        if activated:
+            _restore_units_and_sandbox(
+                container=container,
+                network=network,
+                network_unit=network_unit,
+                container_unit=container_unit,
+                target_sandbox=target_sandbox,
+                rollback_dir=rollback_dir,
+                unit_backup_dir=unit_backup_dir,
+                previous_active=previous_active,
+            )
+        else:
+            if rollback_dir.exists() and not target_sandbox.exists():
+                rollback_dir.rename(target_sandbox)
+            if previous_active:
+                _run(["systemctl", "start", f"{network}-network.service"])
+                _run(["systemctl", "start", f"{container}.service"])
+        raise
+    return {"ok": True, "backend": backend, "resource_limits": limits}
+
+
+def _action_archive_sandbox(payload: dict[str, Any]) -> dict[str, Any]:
+    _install_guest_helper(str(payload.get("guest_helper_b64") or ""))
+    TRANSFER_ROOT.mkdir(parents=True, mode=0o755, exist_ok=True)
+    backend = str(payload["backend"])
+    sandbox = SANDBOX_ROOT / backend
+    if not sandbox.is_dir():
+        raise RuntimeError(f"source sandbox is missing: {sandbox}")
+    destination = str(payload["remote_path"])
+    _run(
+        [
+            str(GUEST_HELPER_PATH),
+            "--archive",
+            str(sandbox),
+            "--destination",
+            destination,
+            "--name",
+            backend,
+        ]
+    )
+    return {"ok": True, "remote_path": destination}
+
+
+def _action_restore_sandbox(payload: dict[str, Any]) -> dict[str, Any]:
+    _require_pinned_podman()
+    _install_guest_helper(str(payload.get("guest_helper_b64") or ""))
+    _run([str(GUEST_HELPER_PATH)])
+    SANDBOX_ROOT.mkdir(parents=True, mode=0o755, exist_ok=True)
+    TRANSFER_ROOT.mkdir(parents=True, mode=0o755, exist_ok=True)
+    QUADLET_DIR.mkdir(parents=True, mode=0o755, exist_ok=True)
+    backend = str(payload["backend"])
+    remote_path = str(payload["remote_path"])
+    with tempfile.TemporaryDirectory(
+        prefix=f".cnc-transfer-stage-{backend}.", dir=str(SANDBOX_ROOT)
+    ) as stage_name:
+        stage_dir = Path(stage_name)
+        _run(
+            [
+                str(GUEST_HELPER_PATH),
+                "--extract",
+                remote_path,
+                "--destination",
+                str(stage_dir),
+                "--name",
+                backend,
+            ]
+        )
+        staged = stage_dir / backend
+        if not staged.is_dir():
+            raise RuntimeError(f"transfer bundle missing sandbox directory: {backend}")
+        return _activate_staged_sandbox(payload, staged)
+
+
+def _action_setup_fresh(payload: dict[str, Any]) -> dict[str, Any]:
+    _require_pinned_podman()
+    _install_guest_helper(str(payload.get("guest_helper_b64") or ""))
+    _run([str(GUEST_HELPER_PATH)])
+    SANDBOX_ROOT.mkdir(parents=True, mode=0o755, exist_ok=True)
+    QUADLET_DIR.mkdir(parents=True, mode=0o755, exist_ok=True)
+    backend = str(payload["backend"])
+    container = str(payload["container"])
+    seed_image = str(payload["seed_image"])
+    provision_script = str(payload.get("provision_script") or "")
+    self_test_command = list(payload.get("self_test_command") or [])
+    profile_state = payload.get("profile_state") or {}
+    seed_container = f"{container}-seed-{os.getpid()}"
+
+    with tempfile.TemporaryDirectory(
+        prefix=f".cnc-fresh-stage-{backend}.", dir=str(SANDBOX_ROOT)
+    ) as stage_name:
+        stage_dir = Path(stage_name)
+        stage_sandbox = stage_dir / backend
+        stage_rootfs = stage_sandbox / "rootfs"
+        stage_rootfs.mkdir(parents=True, exist_ok=True)
+        stage_sandbox.chmod(0o700)
+        seed_tar = stage_dir / "seed.tar"
+        try:
+            _run(["podman", "pull", seed_image])
+            _run(["podman", "create", "--name", seed_container, seed_image, "/bin/true"])
+            _run(["podman", "export", "-o", str(seed_tar), seed_container])
+            _run(
+                [
+                    str(GUEST_HELPER_PATH),
+                    "--extract-rootfs",
+                    str(seed_tar),
+                    "--destination",
+                    str(stage_rootfs),
+                ]
+            )
+            (stage_rootfs / "etc").mkdir(parents=True, exist_ok=True)
+            machine_id = stage_rootfs / "etc" / "machine-id"
+            if not machine_id.exists():
+                machine_id.write_text("", encoding="utf-8")
+            if provision_script.strip():
+                _run(
+                    [
+                        "podman",
+                        "run",
+                        "--rm",
+                        "--rootfs",
+                        str(stage_rootfs),
+                        "/bin/bash",
+                        "-lc",
+                        provision_script,
+                    ],
+                    timeout=300,
+                )
+            if self_test_command:
+                _run(
+                    [
+                        "podman",
+                        "run",
+                        "--rm",
+                        "--rootfs",
+                        str(stage_rootfs),
+                        *self_test_command,
+                    ],
+                    timeout=180,
+                )
+            _write_atomic(
+                stage_sandbox / "profile.json",
+                json.dumps(profile_state, indent=2, sort_keys=True),
+                mode=0o644,
+            )
+        finally:
+            _run(["podman", "rm", "-f", seed_container], check=False)
+        return _activate_staged_sandbox(payload, stage_sandbox)
+
+
+def _action_verify_health(payload: dict[str, Any]) -> dict[str, Any]:
+    host = str(payload["host"])
+    port = int(payload["port"])
+    mode = str(payload.get("healthcheck_mode") or "http").strip().lower()
+    if mode == "auto":
+        mode = "http"
+    path = str(payload.get("healthcheck_path") or "/").strip() or "/"
+    host_header = str(payload.get("healthcheck_host_header") or "").strip()
+    container = str(payload.get("container") or "")
+    timeout_sec = max(15, min(int(payload.get("timeout_sec") or 60), 90))
+    deadline = time.monotonic() + timeout_sec
+    last_error = "backend healthcheck failed"
+
+    while time.monotonic() < deadline:
+        if mode == "none":
+            proc = _run(
+                ["podman", "inspect", container, "--format", "{{.State.Running}}"],
+                check=False,
+                timeout=10,
+            )
+            if proc.returncode == 0 and proc.stdout.strip().lower() == "true":
+                return {"ok": True, "summary": f"container {container} running"}
+            last_error = proc.stderr.strip() or "container not running"
+        elif mode == "tcp":
+            try:
+                with socket.create_connection((host, port), timeout=5):
+                    return {"ok": True, "summary": f"tcp reachable at {host}:{port}"}
+            except OSError as exc:
+                last_error = str(exc)
+        else:
+            url = f"http://{host}:{port}{path}"
+            headers = {"Host": host_header} if host_header else {}
+            req = urllib_request.Request(url, headers=headers)
+            try:
+                with urllib_request.urlopen(req, timeout=5) as resp:
+                    status = int(resp.status)
+                    if 200 <= status < 400:
+                        return {
+                            "ok": True,
+                            "summary": f"http {status} at {host}:{port}{path}",
+                        }
+                    last_error = f"http {status}"
+            except urllib_error.HTTPError as exc:
+                last_error = f"http {exc.code}"
+            except Exception as exc:
+                last_error = str(exc)
+        time.sleep(1)
+    raise RuntimeError(last_error)
+
+
+def _action_restore_rollback(payload: dict[str, Any]) -> dict[str, Any]:
+    _restore_units_and_sandbox(
+        container=str(payload["container"]),
+        network=str(payload["network"]),
+        network_unit=str(payload["network_unit"]),
+        container_unit=str(payload["container_unit"]),
+        target_sandbox=Path(payload["target_path"]),
+        rollback_dir=Path(payload["rollback_path"]),
+        unit_backup_dir=Path(payload["unit_backup_path"]),
+        previous_active=bool(payload.get("service_was_active")),
+    )
+    shutil.rmtree(Path(payload["unit_backup_path"]), ignore_errors=True)
+    return {"ok": True}
+
+
+def _action_discard_rollback(payload: dict[str, Any]) -> dict[str, Any]:
+    for key in ("rollback_path", "unit_backup_path"):
+        raw = str(payload.get(key) or "").strip()
+        if raw:
+            shutil.rmtree(Path(raw), ignore_errors=True)
+    return {"ok": True}
+
+
+def _action_cleanup_backend(payload: dict[str, Any]) -> dict[str, Any]:
+    container = str(payload["container"])
+    network = str(payload["network"])
+    _stop_runtime(container, network)
+    for unit_name in (str(payload["network_unit"]), str(payload["container_unit"])):
+        (QUADLET_DIR / unit_name).unlink(missing_ok=True)
+    _run(["systemctl", "daemon-reload"], check=False)
+    sandbox = SANDBOX_ROOT / str(payload["backend"])
+    shutil.rmtree(sandbox, ignore_errors=True)
+    return {"ok": True}
+
+
+def _action_pause(payload: dict[str, Any]) -> dict[str, Any]:
+    verb = "pause" if payload.get("paused") else "unpause"
+    _run(["podman", verb, str(payload["container"])])
+    return {"ok": True}
+
+
+def _action_service_active(payload: dict[str, Any]) -> dict[str, Any]:
+    proc = _run(
+        ["systemctl", "is-active", str(payload["service"])],
+        check=False,
+        timeout=15,
+    )
+    return {
+        "ok": True,
+        "returncode": proc.returncode,
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+    }
+
+
+ACTIONS = {
+    "archive_sandbox": _action_archive_sandbox,
+    "restore_sandbox": _action_restore_sandbox,
+    "setup_fresh": _action_setup_fresh,
+    "verify_health": _action_verify_health,
+    "restore_rollback": _action_restore_rollback,
+    "discard_rollback": _action_discard_rollback,
+    "cleanup_backend": _action_cleanup_backend,
+    "pause_container": _action_pause,
+    "service_active": _action_service_active,
+}
+
+
+def main() -> int:
+    try:
+        raw = sys.stdin.read()
+        payload = json.loads(raw) if raw.strip() else {}
+        action = str(payload.get("action") or "").strip()
+        handler = ACTIONS.get(action)
+        if handler is None:
+            raise ValueError(f"unsupported cnc-node-exec action: {action!r}")
+        result = handler(payload)
+        sys.stdout.write(json.dumps({"version": NODE_EXEC_VERSION, **result}))
+        return 0
+    except Exception as exc:
+        sys.stdout.write(
+            json.dumps({"version": NODE_EXEC_VERSION, "ok": False, "error": str(exc)})
+        )
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

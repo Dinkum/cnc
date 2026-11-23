@@ -11,20 +11,12 @@ from app.config import Settings
 from app.services.apply_core import DesiredState
 from app.services.cloudflare_certificates import reconcile_follower_certificates
 from app.services.commands import (
-    CommandResult,
-    command_result_is_retryable,
     run_command,
 )
-from app.services.ssh_options import SSH_BATCH_OPTIONS
+from app.services.remote_node import RemoteNodeExecutor, RemoteNodeUnavailable
 
 
-class ClusterFollowerUnavailable(RuntimeError):
-    def __init__(self, node_uid: str, node_ip: str, result: CommandResult) -> None:
-        message = result.stderr or result.stdout or "follower unavailable"
-        super().__init__(message.strip())
-        self.node_uid = node_uid
-        self.node_ip = node_ip
-        self.result = result
+ClusterFollowerUnavailable = RemoteNodeUnavailable
 
 
 def reconcile_cluster_followers(
@@ -276,42 +268,22 @@ fi
 """
 
 
+def _executor(node_uid: str, node_ip: str, settings: Settings) -> RemoteNodeExecutor:
+    return RemoteNodeExecutor(
+        node_uid, node_ip, settings, run_command_fn=run_command
+    )
+
+
 def _ssh_checked(node_uid: str, node_ip: str, settings: Settings, script: str) -> str:
-    return _run_checked(
-        [
-            "ssh",
-            *SSH_BATCH_OPTIONS,
-            f"root@{node_ip}",
-            f"bash -lc {shlex.quote(script)}",
-        ],
-        settings,
-        node_uid=node_uid,
-        node_ip=node_ip,
+    return _executor(node_uid, node_ip, settings).ssh(
+        script, retryable_as_unavailable=True
     )
 
 
 def _scp_checked(
     node_uid: str, node_ip: str, source: str, destination: str, settings: Settings
 ) -> None:
-    _run_checked(
-        ["scp", *SSH_BATCH_OPTIONS, source, destination],
-        settings,
-        node_uid=node_uid,
-        node_ip=node_ip,
+    remote_path = destination.split(":", 1)[1] if ":" in destination else destination
+    _executor(node_uid, node_ip, settings).scp_upload(
+        source, remote_path, retryable_as_unavailable=True
     )
-
-
-def _run_checked(
-    command: list[str],
-    settings: Settings,
-    *,
-    node_uid: str,
-    node_ip: str,
-) -> str:
-    result = run_command(command, timeout_sec=settings.command_timeout_apply_sec)
-    if result.ok:
-        return result.stdout
-    if command_result_is_retryable(result):
-        raise ClusterFollowerUnavailable(node_uid, node_ip, result)
-    message = result.stderr or result.stdout or "command failed"
-    raise RuntimeError(message.strip())

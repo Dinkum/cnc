@@ -17,7 +17,6 @@ from app.logger import get_logger
 from app.services import cloudflare_ingress
 from app.services.host_state import (
     LockedStateSectionTransaction,
-    host_state_lock_path,
 )
 from app.services.commands import CommandError, command_result_is_retryable, run_command
 from app.services.managed_env import apply_managed_env_updates
@@ -63,10 +62,6 @@ def _record_phase(
 
 def _utc_now_iso() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
-
-
-def cloudflare_sync_state_lock_path(path: Path) -> Path:
-    return host_state_lock_path(path)
 
 
 def _log_cloudflare_sync_state_written(path: Path, payload: dict[str, Any]) -> None:
@@ -467,8 +462,12 @@ def reconcile_cloudflare_http_firewall(
 
 def write_cloudflare_sync_state(settings: Settings, payload: dict[str, Any]) -> None:
     with _cloudflare_sync_state_transaction(settings) as transaction:
-        transaction.replace(payload)
-        _log_cloudflare_sync_state_written(settings.host_state_path, payload)
+        state = dict(payload)
+        for key in ("last_successful_cidrs", "last_successful_fetch_at"):
+            if key not in state and key in transaction.value:
+                state[key] = transaction.value[key]
+        transaction.replace(state)
+        _log_cloudflare_sync_state_written(settings.host_state_path, state)
 
 
 def read_cloudflare_sync_state(settings: Settings) -> dict[str, Any]:

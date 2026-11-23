@@ -86,10 +86,6 @@ def app_sandbox_profiles() -> tuple[SandboxProfile, ...]:
     return tuple(_APP_SANDBOX_PROFILES.values())
 
 
-def sandbox_profile_ids() -> tuple[str, ...]:
-    return tuple(_APP_SANDBOX_PROFILES)
-
-
 def get_app_sandbox_profile(profile_id: str | None) -> SandboxProfile:
     normalized = str(profile_id or "").strip().lower()
     if not normalized:

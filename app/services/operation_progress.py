@@ -39,6 +39,9 @@ def write_operation_progress(
     phase: str | None,
     details: dict[str, Any] | None,
     error: str | None = None,
+    pending_terminal_write: bool = False,
+    config_revision: str | None = None,
+    desired_state_hash: str | None = None,
 ) -> None:
     path = operation_progress_path(settings, operation_id)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -75,6 +78,12 @@ def write_operation_progress(
         "error": error,
         "updated_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
     }
+    if pending_terminal_write:
+        payload.update(
+            pending_terminal_write=True,
+            config_revision=config_revision,
+            desired_state_hash=desired_state_hash,
+        )
     with tempfile.NamedTemporaryFile(
         "w", encoding="utf-8", dir=path.parent, delete=False
     ) as handle:

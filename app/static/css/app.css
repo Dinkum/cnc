@@ -420,114 +420,6 @@ a.tab {
   min-width: 0;
 }
 
-.route-map {
-  display: grid;
-  gap: 8px;
-}
-
-.route-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
-  align-items: stretch;
-  border: 1px solid var(--line);
-  border-radius: 16px;
-  background: rgba(11, 15, 24, 0.82);
-  overflow: hidden;
-}
-
-.route-node {
-  padding: 14px 18px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  justify-content: center;
-}
-
-.route-node-head {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-}
-
-.route-node-right {
-  border-left: 1px solid var(--line);
-}
-
-.route-outputs {
-  display: flex;
-  flex-direction: column;
-  border-left: 1px solid var(--line);
-}
-
-.route-output {
-  padding: 14px 18px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  justify-content: center;
-}
-
-.route-output + .route-output {
-  border-top: 1px solid var(--line);
-}
-
-.route-node-name {
-  font-size: 0.9rem;
-  color: var(--text);
-  word-break: break-all;
-  line-height: 1.3;
-}
-
-.route-target {
-  color: var(--muted);
-  font-size: 0.76rem;
-  word-break: break-all;
-  line-height: 1.4;
-}
-
-.route-conn {
-  padding: 14px 18px;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  border-left: 1px solid var(--line);
-  border-right: 1px solid var(--line);
-  background: rgba(8, 13, 22, 0.6);
-  min-width: 80px;
-}
-
-.route-arrow {
-  color: rgba(147, 227, 255, 0.48);
-  font-size: 1.2rem;
-  opacity: 1;
-}
-
-.route-conn-label {
-  color: var(--muted);
-  font-family: var(--font-mono);
-  font-size: 0.72rem;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-}
-
-.route-conn.active .route-arrow,
-.route-conn.active .route-conn-label {
-  color: var(--green);
-}
-
-.route-conn.inactive .route-arrow,
-.route-conn.inactive .route-conn-label {
-  color: var(--muted);
-}
-
-.route-conn.error .route-arrow,
-.route-conn.error .route-conn-label {
-  color: var(--red);
-}
-
 .route-graph-shell {
   display: grid;
   gap: 12px;
@@ -1594,25 +1486,6 @@ a.tab {
   border-color: rgba(99, 208, 141, 0.24);
 }
 
-.floating-save-card.success {
-  border-color: rgba(135, 242, 184, 0.42);
-  background:
-    linear-gradient(180deg, rgba(61, 188, 116, 0.12), rgba(61, 188, 116, 0.04)),
-    rgba(14, 24, 28, 0.9);
-  box-shadow:
-    0 28px 80px rgba(0, 0, 0, 0.45),
-    0 0 0 1px rgba(135, 242, 184, 0.08),
-    0 0 36px rgba(87, 214, 140, 0.13);
-}
-
-.floating-save-card.success .save-stage-line {
-  color: #9bf0c7;
-}
-
-.floating-save-card.success .save-progress span {
-  background: linear-gradient(90deg, #77d7ff, #8ef2b8);
-}
-
 .save-job-card.error {
   border-color: rgba(231, 112, 112, 0.28);
 }
@@ -1710,24 +1583,17 @@ a.tab {
   gap: 8px;
 }
 
-.queue-grid,
 .version-list {
   display: grid;
   gap: 12px;
   margin-bottom: 18px;
 }
 
-.queue-grid {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-}
-
 .version-list {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
-.queue-stat,
-.version-row,
-.run-card {
+.version-row {
   border-radius: 18px;
   border: 1px solid var(--line);
   background:
@@ -1735,12 +1601,10 @@ a.tab {
     rgba(16, 22, 35, 0.88);
 }
 
-.queue-stat,
 .version-row {
   padding: 16px;
 }
 
-.queue-stat strong,
 .version-row strong {
   display: block;
   margin-top: 8px;
@@ -1749,53 +1613,9 @@ a.tab {
   color: #f7fbff;
 }
 
-.queue-stat p {
-  margin-top: 8px;
-  color: var(--muted);
-  font-size: 0.86rem;
-  line-height: 1.5;
-}
-
-.run-card {
-  padding: 18px;
-  display: grid;
-  gap: 12px;
-}
-
 .run-group {
   display: grid;
   gap: 10px;
-}
-
-.floating-save-shell {
-  position: fixed;
-  left: 28px;
-  right: 28px;
-  bottom: 24px;
-  z-index: 30;
-  display: flex;
-  flex-direction: column-reverse;
-  gap: 12px;
-  pointer-events: none;
-}
-
-.floating-save-shell[hidden] {
-  display: none;
-}
-
-.floating-save-shell > [data-save-card]:nth-of-type(n+4) {
-  display: none;
-}
-
-.floating-save-card {
-  pointer-events: auto;
-  position: relative;
-  min-height: 86px;
-  grid-template-columns: minmax(0, 1fr);
-  align-items: stretch;
-  row-gap: 9px;
-  padding: 14px 54px 12px 16px;
-  box-shadow: 0 28px 80px rgba(0, 0, 0, 0.45);
 }
 
 .save-card-close-floating {
@@ -1869,15 +1689,6 @@ a.tab {
   display: none;
 }
 
-.floating-save-card .save-job-meta {
-  display: flex;
-  min-width: 0;
-  justify-content: flex-end;
-  flex-wrap: wrap;
-  align-self: center;
-  gap: 8px;
-}
-
 .save-progress {
   grid-column: 1 / -1;
   height: 4px;
@@ -1897,21 +1708,6 @@ a.tab {
   transition: width 420ms ease;
 }
 
-.floating-save-card.running .save-progress span::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  width: 48%;
-  border-radius: inherit;
-  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.46), transparent);
-  transform: translateX(-130%);
-  animation: save-progress-pulse 1500ms ease-in-out infinite;
-}
-
-.floating-save-card.error .save-progress span {
-  background: linear-gradient(90deg, #ff969b, #f2c16b);
-}
-
 @keyframes save-progress-pulse {
   0% {
     transform: translateX(-130%);
@@ -1922,32 +1718,11 @@ a.tab {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .floating-save-card.running .save-progress span::after {
-    animation: none;
-    opacity: 0;
-  }
 }
 
 @media (max-width: 820px) {
-  .floating-save-shell {
-    left: 10px;
-    right: 10px;
-    bottom: max(12px, env(safe-area-inset-bottom));
-  }
-
-  .floating-save-card {
-    grid-template-columns: 1fr;
-    align-items: stretch;
-    padding-right: 44px;
-  }
-
   .save-card-top {
     grid-template-columns: 1fr;
-  }
-
-  .floating-save-card .save-job-meta {
-    justify-content: flex-start;
-    flex-wrap: wrap;
   }
 
 }
@@ -2071,19 +1846,6 @@ a.tab {
   font-size: 0.88rem;
 }
 
-.run-card.success {
-  border-color: rgba(142, 242, 184, 0.22);
-}
-
-.run-card.error {
-  border-color: rgba(255, 138, 138, 0.22);
-}
-
-.run-card.running,
-.run-card.queued {
-  border-color: rgba(242, 193, 107, 0.22);
-}
-
 .run-head,
 .run-meta,
 .table-primary {
@@ -2163,14 +1925,12 @@ a.tab {
   background: rgba(6, 12, 22, 0.46);
 }
 
-.status-pair-grid,
-.service-cluster {
+.status-pair-grid {
   display: grid;
   gap: 12px;
 }
 
-.status-pair-grid,
-.service-cluster {
+.status-pair-grid {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
@@ -5000,39 +4760,18 @@ pre {
     grid-column: span 1;
   }
 
-  .route-row {
-    grid-template-columns: 1fr;
-  }
-
-  .route-conn {
-    flex-direction: row;
-    border-left: none;
-    border-right: none;
-    border-top: 1px solid var(--line);
-    border-bottom: 1px solid var(--line);
-    padding: 10px 18px;
-    min-width: 0;
-    justify-content: flex-start;
-  }
-
-  .route-node-right,
-  .route-outputs {
-    border-left: none;
-  }
-
   .resource-bars,
   .detail-columns,
   .metrics-summary-grid,
-  .queue-grid,
   .runtime-facts,
   .runtime-checks,
   .hardening-phase-grid,
   .version-list,
   .settings-sections,
-  .status-pair-grid,
-  .service-cluster {
+  .status-pair-grid {
     grid-template-columns: 1fr;
   }
+
 }
 
 @media (max-width: 820px) {

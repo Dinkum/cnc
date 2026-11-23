@@ -9,6 +9,8 @@ OUTCOME_FACT_KEYS = (
     "commit_outcome",
     "failure_mode",
     "manual_review_required",
+    "host_restored",
+    "restore_error",
     "still_changed_tools",
     "commit_still_changed_tools",
     "unwind_errors",
@@ -93,6 +95,12 @@ def mutation_recovery_detail(details: Mapping[str, Any] | None) -> str:
             "No changes were attempted because a control-plane update was in "
             "progress. Retry after the update finishes."
         )
+    if facts.get("host_restored") is False or facts.get("restore_error"):
+        return (
+            "Host could not be restored to the previous configuration; retry."
+        )
+    if facts.get("host_restored") is True:
+        return "The previous configuration remains saved and active."
     if facts.get("manual_review_required") or str(
         facts.get("failure_mode") or ""
     ).strip().lower() == "partial":

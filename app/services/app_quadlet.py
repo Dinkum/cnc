@@ -20,8 +20,10 @@ from app.config import Settings
 from app.logger import get_logger
 from app.models.entities import Backend
 from app.services.app_containers import (
+    CONTRACT_LABEL,
     app_sandbox_rootfs_path,
     configured_app_dns_servers,
+    runtime_contract_hash,
 )
 from app.services.inter_app_interfaces import RuntimeInterAppInterface
 from app.services.nginx_contract import GATEWAY, NETWORK_NAME, nginx_gateway_enabled
@@ -217,6 +219,14 @@ def render_quadlet_container(
         f"--cpu-shares={resource_profile.cpu_shares or 1024}",
         f"--cpus={_cpu_quota_to_cpus(resource_profile.cpu_quota, resource_profile.host_cpu_count)}",
     ]
+    contract_hash = runtime_contract_hash(
+        backend,
+        settings,
+        inter_app_interfaces=inter_app_interfaces,
+        rootfs_path=rootfs,
+        publish_host=publish_address,
+        nginx_container=nginx_container,
+    )
     lines = [
         QUADLET_HEADER,
         "",
@@ -247,6 +257,7 @@ def render_quadlet_container(
         ),
         "Label=io.cnc.managed=true",
         f"Label=io.cnc.backend={backend.name}",
+        f"Label={CONTRACT_LABEL}={contract_hash}",
         f"Exec={' '.join(sandbox_profile.init_command)}",
     ]
     for link in sorted(source_interfaces, key=lambda item: item.name):

@@ -12,10 +12,10 @@ from pathlib import Path
 from typing import Any, Literal
 import uuid
 
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
-from app.database import create_configured_async_engine
+from app.database import isolated_database_session
 from app.logger import get_logger
 from app.models.entities import HostJournalCommit
 from app.services.thread_workers import HostMutationLifecycle, run_to_completion
@@ -103,14 +103,12 @@ async def durable_row_exists(
 ) -> CommitOutcome:
     """Read on a connection of its own, because a raised commit does not prove the write was discarded."""
     try:
-        engine = create_configured_async_engine(settings.database_url)
-        try:
-            maker = async_sessionmaker(bind=engine, expire_on_commit=False)
-            async with maker() as probe:
-                found = await probe.get(model, key)
-                return "persisted" if found is not None and (matches is None or matches(found)) else "rolled_back"
-        finally:
-            await engine.dispose()
+        async with isolated_database_session(settings.database_url) as probe:
+            found = await probe.get(model, key)
+            return (
+                "persisted" if found is not None and (matches is None or matches(found))
+                else "rolled_back"
+            )
     except Exception as exc:
         logger.warning("host_journal.commit_outcome_unresolved", error=str(exc))
         return "unknown"

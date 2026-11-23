@@ -42,6 +42,7 @@ from app.services.llm_help import (
     render_host_llm_help_text,
 )
 from app.services.managed_env import apply_managed_env_updates
+from app.services.startup_state import snapshot_startup_state
 from app.ui.access import _access_page_context
 from app.ui.dashboard.context import dashboard_context, host_llm_help_context
 from app.ui.errors import operator_coded_error as _operator_coded_error
@@ -168,6 +169,18 @@ async def dashboard(
         context["flash_success"] = flash_success
     context["request"] = request
     context["active_tab"] = active_tab
+    context["panel_only"] = request.query_params.get("panel") == "1"
+    if active_tab == "settings" and (app := request.scope.get("app")) is not None:
+        startup = snapshot_startup_state(app)
+        context["startup_warnings"] = [
+            label
+            for phase, label in (
+                ("self_audit", "Startup audit did not pass."),
+                ("runtime_assets", "CNC could not verify the host runtime files and timers."),
+            )
+            if startup.get(phase, {}).get("status")
+            in {"warning", "failed", "error", "timeout"}
+        ]
     response = render_dashboard_template(request, context)
     if hasattr(response, "delete_cookie"):
         response.delete_cookie(FLASH_SUCCESS_COOKIE, path="/")
@@ -262,7 +275,18 @@ async def output_detail(
             status_code=404,
         )
     context["request"] = request
-    return render_output_template(request, settings, context)
+    flash_cookies = (
+        (FLASH_ERROR_COOKIE, "flash_error"),
+        (FLASH_SUCCESS_COOKIE, "flash_success"),
+    )
+    for cookie, key in flash_cookies:
+        if (value := request.cookies.get(cookie)) is not None:
+            context[key] = value
+    response = render_output_template(request, settings, context)
+    for cookie, _key in flash_cookies:
+        if cookie in request.cookies:
+            response.delete_cookie(cookie, path="/")
+    return response
 
 
 @router.get(

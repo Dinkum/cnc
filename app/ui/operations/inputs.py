@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 from sqlalchemy.exc import IntegrityError
 
 from app.config import Settings
@@ -39,47 +37,6 @@ from app.ui.progress import (
 
 
 logger = get_logger("ui")
-
-
-@dataclass(frozen=True)
-class InputOperationMessages:
-    create_saved: str = "Input saved."
-    update_saved: str = "Input saved."
-    delete_saved: str = "Input deleted."
-
-
-def operator_validation_error(exc: ValidationError) -> str:
-    return str(exc)
-
-
-async def _update_input_operation_progress(
-    operation: OperationHandle,
-    *,
-    pipeline: str,
-    message: str,
-    phase: str,
-    substate: str,
-    input_id: int | None = None,
-    input_value: str = "",
-    backend_ids: list[int] | None = None,
-    progress_plan: dict[str, object] | None = None,
-) -> None:
-    detail_builder = (
-        _planned_operation_progress_details
-        if progress_plan is not None
-        else _input_progress_details
-    )
-    details = detail_builder(
-        progress_plan if progress_plan is not None else pipeline,
-        0,
-        message,
-        phase=phase,
-        substate=substate,
-        **({"input_id": input_id} if input_id is not None else {}),
-        **({"input_value": input_value} if input_value else {}),
-        **({"backend_ids": backend_ids} if backend_ids is not None else {}),
-    )
-    await operation.update(status="running", phase=phase, details=details)
 
 
 CREATE_INPUT = Action(

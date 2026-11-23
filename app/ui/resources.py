@@ -104,19 +104,6 @@ def format_cpu_limit(
     return str(raw_quota or "-")
 
 
-def _format_rate(value_bps: object) -> str:
-    if not isinstance(value_bps, (int, float)):
-        return "-"
-    bits_per_sec = max(0.0, float(value_bps) * 8.0)
-    if bits_per_sec < 1000:
-        return f"{bits_per_sec:.0f} bps"
-    for unit in ["Kbps", "Mbps", "Gbps"]:
-        bits_per_sec /= 1000.0
-        if bits_per_sec < 1000 or unit == "Gbps":
-            return f"{bits_per_sec:.1f} {unit}"
-    return f"{bits_per_sec:.1f} Gbps"
-
-
 def memory_soft_limit_percent_for_profile(
     backend: Backend, base_profile: ResourceProfile
 ) -> float | None:

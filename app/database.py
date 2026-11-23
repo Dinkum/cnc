@@ -1,5 +1,6 @@
 import asyncio
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from weakref import WeakSet
 
@@ -28,7 +29,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _ALEMBIC_INI = _PROJECT_ROOT / "alembic.ini"
 _ALEMBIC_SCRIPT_LOCATION = _PROJECT_ROOT / "migrations"
 _ALEMBIC_BASELINE_REVISION = "0003_app_backends"
-_ALEMBIC_CURRENT_SCHEMA_REVISION = "0037_control_event_target_indexes"
+_ALEMBIC_CURRENT_SCHEMA_REVISION = "0045_host_sample_bucket_index"
 _ALEMBIC_COMPATIBILITY_BRIDGE_REVISIONS = {
     "0009_backend_migrate_command",
 }
@@ -99,6 +100,16 @@ def SessionLocal():
 async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
     async with SessionLocal() as session:
         yield session
+
+
+@asynccontextmanager
+async def isolated_database_session(database_url: str) -> AsyncIterator[AsyncSession]:
+    isolated_engine = create_configured_async_engine(database_url)
+    try:
+        async with async_sessionmaker(isolated_engine, expire_on_commit=False)() as session:
+            yield session
+    finally:
+        await isolated_engine.dispose()
 
 
 async def verify_db_connection() -> None:
@@ -328,12 +339,14 @@ async def _detect_schema_revision(user_tables: set[str]) -> str:
     control_event_indexes = await _index_names("control_events")
     required_performance_indexes = {
         "ix_backend_resource_samples_bucket_start": backend_resource_indexes,
-        "ix_host_resource_samples_bucket_start": host_resource_indexes,
         "ix_control_events_kind_created_at": control_event_indexes,
     }
     if any(
         index_name not in index_names
         for index_name, index_names in required_performance_indexes.items()
+    ) or (
+        "ix_host_resource_samples_bucket_start" not in host_resource_indexes
+        and "connection" not in input_columns
     ):
         return "0021_output_disk_metric_samples"
     if (
@@ -435,6 +448,22 @@ async def _detect_schema_revision(user_tables: set[str]) -> str:
     }
     if not required_control_event_target_indexes <= control_event_indexes:
         return "0036_backend_memory_events"
+    if not {"hardening_config_json", "hardening_previous_json"} <= backend_columns:
+        return "0037_control_event_target_indexes"
+    if "command_jobs" not in user_tables:
+        return "0038_backend_hardening_config"
+    if "backend_ssh_keys" not in user_tables:
+        return "0039_command_jobs"
+    if "https_enabled" not in input_columns:
+        return "0040_backend_ssh_keys"
+    if not {"https_provider", "cloudflare_dns_enabled", "cloudflare_dns_ipv4"} <= input_columns:
+        return "0041_input_https"
+    if "host_journal_commits" not in user_tables:
+        return "0042_input_cloudflare"
+    if "connection" not in input_columns:
+        return "0043_host_journal_commits"
+    if "ix_host_resource_samples_bucket_start" in host_resource_indexes:
+        return "0044_input_connection"
     return _ALEMBIC_CURRENT_SCHEMA_REVISION
 
 

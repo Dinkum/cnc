@@ -16,24 +16,27 @@ import re
 import secrets
 import shutil
 import sys
+import tempfile
 import threading
 import time
 import traceback
 from typing import Any
+
+from app.services.file_locks import FileLock
 
 
 SAFE_CTX_VALUE_RE = re.compile(r"^[A-Za-z0-9._:/@-]+$")
 EVENT_NAME_RE = re.compile(r"^[a-z0-9.]+$")
 EVENT_TOKEN_RE = re.compile(r"^[a-z0-9._]+$")
 SENSITIVE_CONTEXT_KEY_RE = re.compile(
-    r"(?:^|[_-])(?:authorization|cookie|password|passwd|secret|token|access[_-](?:key|code)|api[_-]key|csrf|shield[_-]code|private[_-]key)(?:$|[_-])",
+    r"(?:^|[_-])(?:authorization|cookie|password|passwd|secret|token|access[_-](?:key|code)|api[_-]key|csrf|shield[_-]code|private[_-]key|user[_-]key|github[_-]readonly[_-]pat)(?:$|[_-])",
     re.IGNORECASE,
 )
 AUTHORIZATION_TEXT_RE = re.compile(
     r"(?i)(\bauthorization[\"']?\s*[:=]\s*)(?:Bearer|Basic)\s+[^\s,;\"'\)\]\}]+"
 )
 SENSITIVE_TEXT_RE = re.compile(
-    r"(?i)(\b(?:[a-z0-9]+[_-])*(?:token|secret|password|passwd|authorization|cookie|csrf|api[_-]?key|access[_-]?(?:key|code)|shield[_-]?code|private[_-]?key)"
+    r"(?i)(\b(?:[a-z0-9]+[_-])*(?:token|secret(?:[_-]key)?|password|passwd|authorization|cookie|csrf|api[_-]?key|access[_-]?(?:key|code)(?:[_-]hash)?|shield[_-]?code|private[_-]?key|user[_-]key|github[_-]readonly[_-]pat)"
     r"[\"']?\s*[:=]\s*)"
     r"(\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|\[redacted\]|[^,\s&\"'\)\]\};]+)"
 )
@@ -212,6 +215,7 @@ class PrivateRotatingFileHandler(RotatingFileHandler):
         kwargs["delay"] = True
         self.write_failures = 0
         self.last_write_error = ""
+        self.last_write_failure_at: float | None = None
         self.last_successful_write: float | None = None
         super().__init__(*args, **kwargs)
         path = Path(self.baseFilename)
@@ -273,6 +277,7 @@ class PrivateRotatingFileHandler(RotatingFileHandler):
 
     def handleError(self, record: logging.LogRecord) -> None:  # noqa: N802
         self.write_failures += 1
+        self.last_write_failure_at = time.time()
         error_type = sys.exc_info()[0]
         self.last_write_error = error_type.__name__ if error_type else "WriteError"
 
@@ -286,45 +291,78 @@ class PrivateRotatingFileHandler(RotatingFileHandler):
 
 
 class GZipRotatingFileHandler(PrivateRotatingFileHandler):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._compression_pending = True
 
-    def _reopen_current_file(self) -> None:
-        self._finish_pending_compression()
-        super()._reopen_current_file()
+    def emit(self, record: logging.LogRecord) -> None:
+        super().emit(record)
+        if self._compression_pending:
+            try:
+                self._compress_rotated_files()
+            except OSError:
+                self.handleError(record)
 
-    def _finish_pending_compression(self) -> None:
+    def doRollover(self) -> None:  # noqa: N802
+        super().doRollover()
+        self._compress_rotated_files()
+
+    def _compress_rotated_files(self) -> None:
+        compression_lock = self.lock_path.with_suffix(".compression.lock")
+        with suppress(BlockingIOError), FileLock(
+            Path(self.baseFilename), lock_path=compression_lock, blocking=False
+        ):
+            for index in range(self.backupCount, 0, -1):
+                self._compress_rotated_file(Path(f"{self.baseFilename}.{index}"))
+            self._compression_pending = False
+
+    def _compress_rotated_file(self, plain: Path) -> None:
         import gzip
 
-        plain = f"{self.baseFilename}.1"
-        if not os.path.exists(plain):
+        try:
+            descriptor = os.open(plain, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        except FileNotFoundError:
             return
-        destination = f"{plain}.gz"
-        temporary = f"{destination}.tmp"
-        with open(plain, "rb") as source:
-            descriptor = os.open(
-                temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600
-            )
-            with os.fdopen(descriptor, "wb") as raw:
-                with gzip.GzipFile(fileobj=raw, mode="wb") as compressed:
-                    shutil.copyfileobj(source, compressed)
-        os.replace(temporary, destination)
-        os.remove(plain)
+        with os.fdopen(descriptor, "rb") as source:
+            identity = os.fstat(source.fileno())
+            temporary_path: Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    dir=plain.parent, prefix=".cnc-log-", delete=False
+                ) as temporary:
+                    temporary_path = Path(temporary.name)
+                    with gzip.GzipFile(filename="", fileobj=temporary, mode="wb") as compressed:
+                        shutil.copyfileobj(source, compressed)
+                with self._writer_lock():
+                    for index in range(1, self.backupCount + 1):
+                        current = Path(f"{self.baseFilename}.{index}")
+                        try:
+                            candidate = current.stat()
+                        except FileNotFoundError:
+                            continue
+                        if os.path.samestat(identity, candidate):
+                            os.replace(temporary_path, f"{current}.gz")
+                            current.unlink()
+                            break
+            finally:
+                if temporary_path is not None:
+                    temporary_path.unlink(missing_ok=True)
 
     def _rollover_locked(self) -> None:
         if self.stream:
             self.stream.close()
             self.stream = None
-        self._finish_pending_compression()
         if self.backupCount > 0:
-            oldest = f"{self.baseFilename}.{self.backupCount}.gz"
-            if os.path.exists(oldest):
-                os.remove(oldest)
-            for index in range(self.backupCount - 1, 0, -1):
-                source = f"{self.baseFilename}.{index}.gz"
-                dest = f"{self.baseFilename}.{index + 1}.gz"
-                if os.path.exists(source):
-                    os.replace(source, dest)
+            for suffix in ("", ".gz"):
+                with suppress(FileNotFoundError):
+                    os.unlink(f"{self.baseFilename}.{self.backupCount}{suffix}")
+                for index in range(self.backupCount - 1, 0, -1):
+                    source = f"{self.baseFilename}.{index}{suffix}"
+                    dest = f"{self.baseFilename}.{index + 1}{suffix}"
+                    with suppress(FileNotFoundError):
+                        os.replace(source, dest)
             self.rotate(self.baseFilename, f"{self.baseFilename}.1")
-            self._finish_pending_compression()
+            self._compression_pending = True
         if not self.delay:
             self.stream = self._open()
 
@@ -439,10 +477,12 @@ class _RecordQueueListener:
         self._state_lock = threading.Lock()
         self._handler_failures = 0
         self._last_handler_error = ""
+        self._last_handler_failure_at: float | None = None
         self._dropped_records = 0
         self._dropped_by_level: dict[str, int] = {}
         self._last_drop_at: float | None = None
         self._flush_timeouts = 0
+        self._last_flush_timeout_at: float | None = None
         self._flush_failures = 0
 
     @property
@@ -477,12 +517,14 @@ class _RecordQueueListener:
         return {
             "handler_failures": self._handler_failures,
             "last_handler_error": self._last_handler_error,
+            "last_handler_failure_at": self._last_handler_failure_at,
             "queue_depth": self._queue.qsize(),
             "queue_capacity": self._queue.maxsize,
             "dropped_records": self._dropped_records,
             "dropped_by_level": dict(self._dropped_by_level),
             "last_drop_at": self._last_drop_at,
             "flush_timeouts": self._flush_timeouts,
+            "last_flush_timeout_at": self._last_flush_timeout_at,
             "flush_failures": self._flush_failures,
         }
 
@@ -495,10 +537,12 @@ class _RecordQueueListener:
                 self._queue.put_nowait(_FlushRequest(done=done))
             except queue.Full:
                 self._flush_timeouts += 1
+                self._last_flush_timeout_at = time.time()
                 return False
         if not done.wait(timeout=max(0, timeout)):
             with self._state_lock:
                 self._flush_timeouts += 1
+                self._last_flush_timeout_at = time.time()
             return False
         return self._handler_failures == 0 and all(
             getattr(getattr(handler, "_sink", handler), "write_failures", 0) == 0
@@ -516,6 +560,7 @@ class _RecordQueueListener:
     def _failure(self, handler: logging.Handler, *, flushing: bool = False) -> None:
         with self._state_lock:
             self._handler_failures += 1
+            self._last_handler_failure_at = time.time()
             self._last_handler_error = f"{type(handler).__name__} failed"
             if flushing:
                 self._flush_failures += 1
@@ -890,13 +935,18 @@ def logging_pipeline_status() -> dict[str, Any]:
         and root.manager.disable < logging.INFO
         and not disabled
     )
+    recent_failure_cutoff = time.time() - 60
     degraded = (
         not operational
         or any(
-            failures.get(key, 0)
-            for key in ("handler_failures", "dropped_records", "flush_timeouts")
+            (failures.get(key) or 0) >= recent_failure_cutoff
+            for key in ("last_handler_failure_at", "last_drop_at", "last_flush_timeout_at")
         )
-        or any(handler.get("write_failures", 0) for handler in handlers)
+        or any(
+            (handler.get("last_write_failure_at") or 0)
+            > (handler.get("last_successful_write") or 0)
+            for handler in handlers
+        )
     )
     return {
         "configured": pipeline is not None,
@@ -1224,6 +1274,7 @@ def _handler_status(handler: logging.Handler) -> dict[str, Any]:
     sink = getattr(handler, "_sink", handler)
     status["write_failures"] = getattr(sink, "write_failures", 0)
     status["last_write_error"] = getattr(sink, "last_write_error", "")
+    status["last_write_failure_at"] = getattr(sink, "last_write_failure_at", None)
     status["last_successful_write"] = getattr(sink, "last_successful_write", None)
     if isinstance(handler, BlockBufferedHandler):
         status["buffered_blocks"] = len(handler._blocks)
@@ -1337,6 +1388,8 @@ class AppLogger:
         timing_only: bool = False,
         **kwargs: Any,
     ) -> None:
+        if not self._logger.isEnabledFor(level):
+            return
         context = {"component": self._logger.name, **kwargs}
         resolved_event_name, resolved_message = _normalize_event_payload(
             message, event_name=event_name

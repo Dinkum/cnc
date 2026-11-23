@@ -1,39 +1,9 @@
 from __future__ import annotations
 
-import argparse
 from pathlib import Path
 
-from app.cli.common import CommandResult, bind_command, load_backend_async
+from app.cli.common import CommandResult, load_backend_async
 from app.config import Settings
-
-
-def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
-    restore_verify = subparsers.add_parser("restore-verify")
-    restore_verify_subparsers = restore_verify.add_subparsers(
-        dest="restore_verify_command", required=True
-    )
-
-    restore_verify_app = restore_verify_subparsers.add_parser("app")
-    restore_verify_app.add_argument("backend")
-    restore_verify_app.add_argument("--backup-id", type=int, default=None)
-    restore_verify_app.add_argument("--json", action="store_true", dest="json_output")
-    bind_command(
-        restore_verify_app,
-        handler=_run_restore_verify_command,
-        formatter=format_restore_verify_text,
-        needs_env=True,
-    )
-
-    restore_create = subparsers.add_parser("restore-create")
-    restore_create.add_argument("bundle_path")
-    restore_create.add_argument("--backend-name", dest="backend_name", default=None)
-    restore_create.add_argument("--json", action="store_true", dest="json_output")
-    bind_command(
-        restore_create,
-        handler=_run_restore_create_command,
-        formatter=format_restore_create_text,
-        needs_settings=True,
-    )
 
 
 def format_restore_verify_text(payload: dict[str, object]) -> str:
@@ -156,18 +126,3 @@ async def restore_create_async(
         },
         None,
     )
-
-
-async def _run_restore_verify_command(
-    args: argparse.Namespace,
-    settings: Settings | None,
-) -> CommandResult:
-    return await restore_verify_app_async(args.backend, args.backup_id)
-
-
-async def _run_restore_create_command(
-    args: argparse.Namespace,
-    settings: Settings | None,
-) -> CommandResult:
-    assert settings is not None
-    return await restore_create_async(args.bundle_path, args.backend_name, settings)

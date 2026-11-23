@@ -8,6 +8,7 @@ from app.config import Settings
 from app.logger import get_logger
 from app.models.entities import Backend
 from app.services.app_diagnostics import collect_app_backend_diagnostics
+from app.services.app_healthchecks import preferred_backend_host_header
 from app.services.thread_workers import BoundedThreadWorker
 
 logger = get_logger("ui")
@@ -109,9 +110,21 @@ async def collect_output_runtime_diagnostics_for_ui(
         cached_after_task = _RUNTIME_DIAGNOSTICS_CACHE.get(cache_key)
         return dict(cached_after_task[1]) if cached_after_task is not None else None
     if task is None:
+        probe_backend = Backend(
+            id=backend.id,
+            name=backend.name,
+            kind=backend.kind,
+            enabled=backend.enabled,
+            port=backend.port,
+            handoff_port=backend.handoff_port,
+            sandbox_profile=backend.sandbox_profile,
+            healthcheck_mode=backend.healthcheck_mode,
+            healthcheck_path=backend.healthcheck_path,
+            healthcheck_host_header=preferred_backend_host_header(backend),
+        )
         task = asyncio.create_task(
             _runtime_diagnostics_workers.run(
-                collect_app_backend_diagnostics, backend, settings
+                collect_app_backend_diagnostics, probe_backend, settings
             )
         )
         _RUNTIME_DIAGNOSTICS_TASKS[cache_key] = task

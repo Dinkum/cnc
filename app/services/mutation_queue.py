@@ -10,7 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 from pydantic import BaseModel
-from sqlalchemy import select, text
+from sqlalchemy import select
 
 from app.config import Settings
 from app.logger import get_logger
@@ -23,6 +23,7 @@ from app.services.operations import (
     _json_loads_details,
     _operation_session,
     job_awaiting_dispatch,
+    operation_session_scope,
     queued_job,
     reserve_host_mutation_lock,
 )
@@ -64,6 +65,7 @@ _wake = asyncio.Event()
 # Secrets never reach the operation row, which is retained and shown in history.
 # A job whose secrets were lost to a restart fails rather than running without them.
 _SECRETS: dict[str, dict[str, Any]] = {}
+_UNCONFIRMED_SECRETS: dict[str, dict[str, int]] = {}
 
 
 def mutation_runner(
@@ -118,7 +120,6 @@ async def enqueue_mutation(
         details_json=json.dumps({**(details or {}), QUEUED_JOB_KEY: job}),
     )
     async with _operation_session(settings.database_url) as session:
-        await session.execute(text("PRAGMA busy_timeout=5000"))
         session.add(operation)
         await session.flush()
         operation_id = operation.id
@@ -129,13 +130,26 @@ async def enqueue_mutation(
             saved = queued_job(_json_loads_details(row.details_json))
             return bool(saved and saved.get("submission_id") == submission_id)
 
-        commit = await commit_verified(
-            session, settings, Operation, operation_id, matches=same_submission
-        )
+        try:
+            commit = await commit_verified(
+                session, settings, Operation, operation_id, matches=same_submission
+            )
+        except asyncio.CancelledError:
+            if secrets:
+                _UNCONFIRMED_SECRETS.setdefault(settings.database_url, {})[
+                    submission_id
+                ] = operation_id
+            _wake.set()
+            raise
         if commit.outcome == "rolled_back":
             _SECRETS.pop(submission_id, None)
             raise RuntimeError(f"Could not queue {runner}: {commit.error}")
         if commit.outcome == "unknown":
+            if secrets:
+                _UNCONFIRMED_SECRETS.setdefault(settings.database_url, {})[
+                    submission_id
+                ] = operation_id
+            _wake.set()
             raise RuntimeError(f"Could not confirm operation {operation_id}. Check its status before submitting again.")
     _wake.set()
     logger.info("mutation_queue.enqueued", operation_id=operation_id, runner=runner)
@@ -144,7 +158,19 @@ async def enqueue_mutation(
 
 async def _next_waiting_job(settings: Settings) -> int | None:
     async with _operation_session(settings.database_url) as session:
-        await session.execute(text("PRAGMA busy_timeout=5000"))
+        unconfirmed = _UNCONFIRMED_SECRETS.get(settings.database_url)
+        if unconfirmed:
+            for submission_id, operation_id in tuple(unconfirmed.items()):
+                operation = await session.get(Operation, operation_id)
+                details = _json_loads_details(operation.details_json) if operation else {}
+                job = queued_job(details)
+                if not (
+                    operation and operation.status == "queued"
+                    and job and job.get("submission_id") == submission_id
+                    and job_awaiting_dispatch(details)
+                ):
+                    _SECRETS.pop(submission_id, None)
+                unconfirmed.pop(submission_id, None)
         rows = (
             (
                 await session.execute(
@@ -165,7 +191,6 @@ async def _next_waiting_job(settings: Settings) -> int | None:
 
 async def _claim_job(settings: Settings, operation_id: int) -> dict[str, Any] | None:
     async with _operation_session(settings.database_url) as session:
-        await session.execute(text("PRAGMA busy_timeout=5000"))
         operation = await session.get(Operation, operation_id)
         if operation is None or operation.status != "queued":
             return None
@@ -184,7 +209,6 @@ async def _fail_undispatchable(
     settings: Settings, operation_id: int, error: str
 ) -> None:
     async with _operation_session(settings.database_url) as session:
-        await session.execute(text("PRAGMA busy_timeout=5000"))
         operation = await session.get(Operation, operation_id)
         if operation is None or operation.status not in {"queued", "running"}:
             return
@@ -208,6 +232,7 @@ async def _dispatch_job(settings: Settings, operation_id: int) -> bool:
     job = await _claim_job(settings, operation_id)
     if job is None:
         return False
+    secrets = _SECRETS.pop(job.get("submission_id", ""), {})
     registered = _RUNNERS.get(str(job["runner"]))
     if registered is None:
         await _fail_undispatchable(
@@ -216,7 +241,6 @@ async def _dispatch_job(settings: Settings, operation_id: int) -> bool:
         return True
     kwargs = dict(job.get("kwargs") or {})
     secret_keys = list(job.get("secret_keys") or [])
-    secrets = _SECRETS.pop(job.get("submission_id", ""), {})
     if any(key not in secrets for key in secret_keys):
         await _fail_undispatchable(
             settings,
@@ -253,17 +277,19 @@ async def _dispatch_job(settings: Settings, operation_id: int) -> bool:
 
 async def run_mutation_worker(settings: Settings, stop: asyncio.Event) -> None:
     load_runners()
-    while not stop.is_set():
-        try:
-            while not stop.is_set() and await run_one(settings):
-                pass
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.exception("mutation_queue.worker_iteration_failed", error=str(exc))
-        _wake.clear()
-        with suppress(TimeoutError):
-            await asyncio.wait_for(_wake.wait(), timeout=POLL_INTERVAL_SEC)
+    async with operation_session_scope(settings.database_url):
+        while not stop.is_set():
+            _wake.clear()
+            try:
+                while not stop.is_set() and await run_one(settings):
+                    pass
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception("mutation_queue.worker_iteration_failed", error=str(exc))
+            if not stop.is_set():
+                with suppress(TimeoutError):
+                    await asyncio.wait_for(_wake.wait(), timeout=POLL_INTERVAL_SEC)
 
 
 async def stop_mutation_worker(

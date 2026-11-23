@@ -29,7 +29,6 @@ from app.services.ssh_access import (
     deferred_backend_ssh_reconcile,
     remove_backend_ssh_access,
 )
-from app.services.validators import ValidationError
 from app.services.config_change import ConfigChange, converge_change, output_edit
 from app.ui.operations.action import Action
 from app.ui.operations.save import (
@@ -53,10 +52,6 @@ from app.ui.view_models import _save_apply_feedback
 
 
 logger = get_logger("ui")
-
-
-def operator_validation_error(exc: ValidationError) -> str:
-    return str(exc)
 
 
 CREATE_OUTPUT = Action(

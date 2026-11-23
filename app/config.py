@@ -25,11 +25,11 @@ class Settings(BaseSettings):
     admin_port: int = Field(default=9090, ge=9090, le=9090)
     admin_unsafe_allow_remote: bool = False
     admin_allowed_hosts: str = ""
-    access_key_hash: str = ""
+    access_key_hash: str = Field(default="", repr=False)
     access_session_ttl_sec: int = Field(
         default=60 * 60 * 24 * 30, ge=300, le=60 * 60 * 24 * 365
     )
-    csrf_token: str | None = None
+    csrf_token: str | None = Field(default=None, repr=False)
     database_url: str = "sqlite+aiosqlite:///data/app.db"
     log_path: Path = Path("data/app.log")
     log_max_bytes: int = Field(default=10 * 1024 * 1024, ge=1024)
@@ -128,8 +128,8 @@ class Settings(BaseSettings):
     shield_db_path: Path = Path("/var/lib/cnc/shield/shield.db")
     shield_env_file_path: Path = Path("/var/lib/cnc/shield/shield.env")
     shield_config_path: Path = Path("/var/lib/cnc/shield/shield-config.json")
-    shield_secret_key: str = ""
-    shield_access_code_hash: str = ""
+    shield_secret_key: str = Field(default="", repr=False)
+    shield_access_code_hash: str = Field(default="", repr=False)
     shield_session_ttl_sec: int = Field(
         default=60 * 60 * 24 * 7, ge=300, le=60 * 60 * 24 * 30
     )
@@ -140,6 +140,7 @@ class Settings(BaseSettings):
     app_bootstrap_stale_after_sec: int = Field(default=900, ge=60, le=86400)
     startup_db_timeout_sec: int = Field(default=30, ge=1, le=600)
     startup_observe_timeout_sec: int = Field(default=30, ge=1, le=600)
+    startup_converge_enabled: bool = True
 
     command_timeout_apply_sec: int = 300
     command_timeout_status_sec: int = 5
@@ -155,12 +156,11 @@ class Settings(BaseSettings):
     )
     github_repo: str = ""
     github_ref: str = "main"
-    github_readonly_pat: str = ""
-    pushover_app_token: str = ""
-    pushover_user_key: str = ""
+    github_readonly_pat: str = Field(default="", repr=False)
+    pushover_app_token: str = Field(default="", repr=False)
+    pushover_user_key: str = Field(default="", repr=False)
 
     static_files_dir: Path = Path("app/static")
-    templates_dir: Path = Path("app/templates")
 
     @property
     def resolved_host_journal_dir(self) -> Path:

@@ -6,6 +6,7 @@ from typing import Any
 from app.config import Settings
 from app.logger import get_logger
 from app.services.apply_core import ApplyFailed
+from app.services.atomic_files import replace_bytes_if_changed
 from app.services.resource_profile import (
     ResourceProfile,
     calculate_app_memory_budget_bytes,
@@ -54,15 +55,7 @@ def render_apps_slice_drop_in(memory_max_bytes: int) -> str:
 
 
 def _write_atomic(path: Path, content: str) -> bool:
-    encoded = content.encode("utf-8")
-    if path.exists() and path.read_bytes() == encoded:
-        return False
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_bytes(encoded)
-    temporary.chmod(0o644)
-    temporary.replace(path)
-    return True
+    return replace_bytes_if_changed(path, content.encode("utf-8"), mode=0o644)
 
 
 async def reconcile_apps_slice(

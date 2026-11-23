@@ -14,6 +14,8 @@ import subprocess
 import tempfile
 from typing import Iterator
 
+from app.services.atomic_files import replace_bytes
+
 DEFAULT_CONTROL_DIR = Path("/var/lib/cnc/app-control")
 RENEW_BEFORE_SECONDS = 30 * 86400
 
@@ -52,15 +54,7 @@ def certificate_valid(path: Path) -> bool:
 
 
 def _write_atomic(path: Path, content: bytes) -> None:
-    with tempfile.NamedTemporaryFile(
-        dir=path.parent, prefix=".certificate-", delete=False
-    ) as temporary:
-        os.fchmod(temporary.fileno(), 0o600)
-        temporary.write(content)
-        temporary.flush()
-        os.fsync(temporary.fileno())
-        staged = Path(temporary.name)
-    staged.replace(path)
+    replace_bytes(path, content, mode=0o600, sync=True)
 
 
 def _ensure_certificate_locked(path: Path) -> bool:

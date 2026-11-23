@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from app.services.guest_isolation import GUEST_RUNTIME_REVISION
 
+import hashlib
 import ipaddress
 import json
 import os
 from typing import Any
 from pathlib import Path
 
-from app.services.hardening_policy import read_hardening_policy
+from app.services.hardening_policy import hardening_volumes, read_hardening_policy
 from app.config import Settings
 from app.models.entities import Backend
 from app.services.container_runtime import (
@@ -17,6 +18,7 @@ from app.services.container_runtime import (
     inspect_network as runtime_inspect_network,
 )
 from app.services.inter_app_interfaces import RuntimeInterAppInterface
+from app.services.nginx_contract import nginx_gateway_enabled
 from app.services.resource_profile import (
     ResourceProfile,
     backend_resource_profile,
@@ -34,6 +36,7 @@ from app.services.sandbox_profiles import (
 from app.services.validators import parse_volumes_json
 
 
+CONTRACT_LABEL = "io.cnc.contract"
 APP_DEBUG_TOOLBELT_VERSION = "v3"
 APP_DEBUG_TOOL_COMMANDS = (
     "bash",
@@ -130,18 +133,158 @@ def configured_app_dns_servers(settings: Settings) -> list[str]:
     return list(DEFAULT_APP_DNS_SERVERS)
 
 
+def runtime_contract_payload(
+    backend: Backend,
+    settings: Settings,
+    *,
+    inter_app_interfaces: tuple[RuntimeInterAppInterface, ...] = (),
+    rootfs_path: Path | str | None = None,
+    publish_host: str = "127.0.0.1",
+    nginx_container: bool = False,
+) -> dict[str, Any]:
+    sandbox_profile = get_app_sandbox_profile(backend.sandbox_profile)
+    policy = read_hardening_policy(backend)
+    rootfs = rootfs_path or app_sandbox_rootfs_path(settings, backend.name)
+    publish_address = str(publish_host or "127.0.0.1").strip() or "127.0.0.1"
+    return {
+        "guest_isolation_revision": GUEST_RUNTIME_REVISION,
+        "hardening": policy.model_dump(exclude_defaults=True),
+        "network": network_name(backend.name),
+        "sandbox_profile": sandbox_profile.profile_id,
+        "seed_image": sandbox_profile.seed_image,
+        "guest_rootfs": str(rootfs),
+        "port": int(backend.port or 0),
+        "handoff_port": int(backend.handoff_port),
+        "publish_host": publish_address,
+        "nginx_gateway_binding": bool(
+            publish_address == "127.0.0.1"
+            and nginx_gateway_enabled(settings, container_mode=nginx_container)
+        ),
+        "dns_servers": configured_app_dns_servers(settings),
+        "volumes": hardening_volumes(policy, parse_volumes_json(backend.volumes_json)),
+        "init_command": list(sandbox_profile.init_command),
+        "healthcheck_mode": str(backend.healthcheck_mode or "http").strip().lower()
+        or "http",
+        "healthcheck_path": str(backend.healthcheck_path or "/").strip() or "/",
+        "healthcheck_host_header": str(backend.healthcheck_host_header or "").strip(),
+        "inter_app_interfaces": [
+            {
+                "name": item.name,
+                "source_backend": item.source_backend,
+                "target_backend": item.target_backend,
+                "target_handoff_port": item.target_handoff_port,
+                "network": item.network,
+                "env_key": item.env_key,
+                "url": item.url,
+                "role": "source" if item.source_backend == backend.name else "target",
+            }
+            for item in sorted(
+                inter_app_interfaces,
+                key=lambda entry: (
+                    entry.source_backend,
+                    entry.target_backend,
+                    entry.name,
+                ),
+            )
+        ],
+    }
+
+
+def runtime_contract_hash(
+    backend: Backend,
+    settings: Settings,
+    *,
+    inter_app_interfaces: tuple[RuntimeInterAppInterface, ...] = (),
+    rootfs_path: Path | str | None = None,
+    publish_host: str = "127.0.0.1",
+    nginx_container: bool = False,
+) -> str:
+    payload = runtime_contract_payload(
+        backend,
+        settings,
+        inter_app_interfaces=inter_app_interfaces,
+        rootfs_path=rootfs_path,
+        publish_host=publish_host,
+        nginx_container=nginx_container,
+    )
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
+
+
+def container_labels(inspect_payload: dict[str, Any] | None) -> dict[str, str]:
+    if not isinstance(inspect_payload, dict):
+        return {}
+    config = inspect_payload.get("Config")
+    labels = config.get("Labels") if isinstance(config, dict) else None
+    if not isinstance(labels, dict):
+        labels = inspect_payload.get("Labels")
+    if not isinstance(labels, dict):
+        return {}
+    return {str(k): str(v) for k, v in labels.items() if v is not None}
+
+
+def container_contract_hash(inspect_payload: dict[str, Any] | None) -> str | None:
+    value = container_labels(inspect_payload).get(CONTRACT_LABEL, "").strip()
+    return value or None
+
+
+def container_is_paused(inspect_payload: dict[str, Any] | None) -> bool:
+    if not isinstance(inspect_payload, dict):
+        return False
+    state = inspect_payload.get("State")
+    if not isinstance(state, dict):
+        return False
+    return bool(state.get("Paused")) or str(state.get("Status") or "").lower() == "paused"
+
+
+def container_is_running(inspect_payload: dict[str, Any] | None) -> bool:
+    if not isinstance(inspect_payload, dict):
+        return False
+    state = inspect_payload.get("State")
+    if not isinstance(state, dict):
+        return False
+    return bool(state.get("Running")) and not container_is_paused(inspect_payload)
+
+
+def container_live_cpu_limits(
+    inspect_payload: dict[str, Any] | None,
+) -> tuple[int | None, int | None]:
+    if not isinstance(inspect_payload, dict):
+        return None, None
+    host_config = inspect_payload.get("HostConfig")
+    if not isinstance(host_config, dict):
+        return None, None
+    raw_nano = host_config.get("NanoCpus")
+    raw_shares = host_config.get("CpuShares")
+    nano = int(raw_nano) if isinstance(raw_nano, (int, float)) and raw_nano > 0 else None
+    shares = (
+        int(raw_shares)
+        if isinstance(raw_shares, (int, float)) and raw_shares > 0
+        else None
+    )
+    return nano, shares
+
+
 def runtime_spec(
     backend: Backend,
     settings: Settings,
     *,
     base_profile: ResourceProfile | None = None,
     inter_app_interfaces: tuple[RuntimeInterAppInterface, ...] = (),
+    nginx_container: bool = False,
 ) -> dict[str, Any]:
     base_profile = base_profile or build_resource_profile(settings, [backend])
     resource_profile = backend_resource_profile(backend, base_profile)
     sandbox_profile = get_app_sandbox_profile(backend.sandbox_profile)
+    contract_hash = runtime_contract_hash(
+        backend,
+        settings,
+        inter_app_interfaces=inter_app_interfaces,
+        nginx_container=nginx_container,
+    )
     return {
         "runtime_owner": "quadlet",
+        "contract_hash": contract_hash,
         "guest_isolation_revision": GUEST_RUNTIME_REVISION,
         "hardening": read_hardening_policy(backend).model_dump(exclude_defaults=True),
         "quadlet_container_unit": f"{container_name(backend.name)}.container",
@@ -213,6 +356,7 @@ def write_app_control_assets(
     write_profile_state: bool = True,
     base_profile: ResourceProfile | None = None,
     inter_app_interfaces: tuple[RuntimeInterAppInterface, ...] = (),
+    nginx_container: bool = False,
 ) -> None:
     backend_control_dir = control_dir(settings, backend.name)
     backend_control_dir.mkdir(parents=True, exist_ok=True)
@@ -225,6 +369,7 @@ def write_app_control_assets(
                     settings,
                     base_profile=base_profile,
                     inter_app_interfaces=inter_app_interfaces,
+                    nginx_container=nginx_container,
                 ),
                 indent=2,
                 sort_keys=True,

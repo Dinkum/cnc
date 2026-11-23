@@ -8,17 +8,12 @@ from typing import Mapping
 from app.config import Settings, reload_settings
 from app.services.host_state import (
     LockedStateTransaction,
-    host_state_lock_path,
     write_text_atomic,
 )
 
 
 _ENV_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _SAFE_ENV_VALUE_RE = re.compile(r"^[A-Za-z0-9._:/@%+=,-]+$")
-
-
-def managed_env_lock_path(path: Path) -> Path:
-    return host_state_lock_path(path)
 
 
 def _normalize_env_updates(updates: Mapping[str, str | None]) -> dict[str, str | None]:

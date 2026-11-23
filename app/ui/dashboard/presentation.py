@@ -20,7 +20,6 @@ from app.services.operation_runtime import (
     operation_progress_pipelines,
     output_save_progress_steps,
 )
-from app.services.renderers import container_name
 from app.services.resource_profile import ResourceProfile
 from app.services.sandbox_profiles import app_sandbox_profiles
 from app.ui.forms import (
@@ -52,7 +51,6 @@ from app.ui.view_models import (
     _change_state,
     _format_timestamp,
     _save_job_summary,
-    _tone_for_value,
 )
 
 
@@ -87,148 +85,6 @@ def build_service_cards(
         if service.get("ok") and data.get("ActiveState") == "active":
             services_ok += 1
     return service_map, services_ok
-
-
-def build_nginx_card(nginx_status: dict[str, object]) -> tuple[str, dict[str, object]]:
-    nginx_data = nginx_status.get("data") or {}
-    nginx_active_state = str(
-        nginx_data.get("ActiveState")
-        or ("error" if not nginx_status.get("ok") else "unknown")
-    )
-    return nginx_active_state, {
-        "tone": _tone_for_value(
-            nginx_active_state,
-            success_values={"active"},
-            queued_values={"activating", "reloading"},
-            error_values={"failed", "inactive", "deactivating"},
-            ok=bool(nginx_status.get("ok")),
-        ),
-        "active_state": nginx_active_state,
-        "sub_state": str(nginx_data.get("SubState") or "-"),
-        "since": nginx_data.get("ActiveEnterTimestamp") or None,
-        "error": nginx_status.get("error") or None,
-    }
-
-
-def build_runtime_cards(
-    service_rows: list[dict[str, object]],
-    enabled_app_backends: list[Backend],
-) -> tuple[list[dict[str, object]], list[float], list[int]]:
-    runtime_backends_by_service = {
-        container_name(backend.name): backend for backend in enabled_app_backends
-    }
-    runtime_cards: list[dict[str, object]] = []
-    runtime_cpu_host_values: list[float] = []
-    runtime_memory_current_values: list[int] = []
-    for service in service_rows:
-        service_name_raw = str(service.get("service") or "")
-        backend = runtime_backends_by_service.get(service_name_raw)
-        if backend is None:
-            continue
-        data = service.get("data") or {}
-        metrics = service.get("metrics") or {}
-        cpu_host_percent = metrics.get("cpu_percent_of_host")
-        memory_current_bytes = metrics.get("memory_current_bytes")
-        if isinstance(cpu_host_percent, (int, float)):
-            runtime_cpu_host_values.append(float(cpu_host_percent))
-        if isinstance(memory_current_bytes, int):
-            runtime_memory_current_values.append(memory_current_bytes)
-        active_state = str(
-            data.get("ActiveState") or ("error" if not service.get("ok") else "unknown")
-        )
-        sub_state = str(data.get("SubState") or "-")
-        tone = _tone_for_value(
-            active_state,
-            success_values={"active"},
-            queued_values={"activating", "reloading"},
-            error_values={"failed", "inactive", "deactivating"},
-            ok=bool(service.get("ok")),
-        )
-        target = (
-            f"127.0.0.1:{backend.port}" if backend.port else "port assigned on save"
-        )
-        bootstrap_state = str(data.get("BootstrapState") or "unknown")
-        private_reachable = str(data.get("PrivateReachable") or "unknown")
-        proxy_reachable = str(data.get("ProxyReachable") or "unknown")
-        private_address = str(data.get("PrivateAddress") or "-")
-        bootstrap_tone = _tone_for_value(
-            bootstrap_state,
-            success_values={"yes", "active", "succeeded"},
-            queued_values={"pending", "activating", "reloading", "queued", "running"},
-            error_values={"no", "error", "failed", "inactive", "missing"},
-        )
-        private_tone = _tone_for_value(
-            private_reachable,
-            success_values={"yes", "active", "succeeded"},
-            queued_values={"pending", "activating", "reloading", "queued", "running"},
-            error_values={"no", "error", "failed", "inactive", "missing"},
-        )
-        loopback_tone = _tone_for_value(
-            proxy_reachable,
-            success_values={"yes", "active", "succeeded"},
-            queued_values={"pending", "activating", "reloading", "queued", "running"},
-            error_values={"no", "error", "failed", "inactive", "missing"},
-        )
-
-        def _check_value(raw_value: str, *, good_label: str, bad_label: str) -> str:
-            return (
-                good_label
-                if raw_value.lower() in {"yes", "active", "succeeded"}
-                else bad_label
-            )
-
-        checks = [
-            {
-                "label": "bootstrap",
-                "value": _check_value(
-                    bootstrap_state, good_label="ready", bad_label=bootstrap_state
-                ),
-                "tone": bootstrap_tone,
-            },
-            {
-                "label": "container",
-                "value": _check_value(
-                    private_reachable, good_label="reachable", bad_label="not reachable"
-                ),
-                "tone": private_tone,
-            },
-            {
-                "label": "loopback",
-                "value": _check_value(
-                    proxy_reachable, good_label="reachable", bad_label="not reachable"
-                ),
-                "tone": loopback_tone,
-            },
-        ]
-        facts = [
-            {"label": "target", "value": target},
-            {
-                "label": "container",
-                "value": f"{private_address}:{backend.handoff_port}",
-            },
-        ]
-        if sub_state and sub_state != "running":
-            facts.append({"label": "state", "value": sub_state})
-        if tone != "success":
-            dns_servers = str(data.get("DnsServers") or "").strip()
-            if dns_servers:
-                facts.append({"label": "dns", "value": dns_servers})
-        runtime_cards.append(
-            {
-                "name": backend.name,
-                "kind": backend.kind,
-                "unit": service_name_raw,
-                "target": target,
-                "active_state": active_state,
-                "sub_state": sub_state,
-                "tone": tone,
-                "checks": checks,
-                "facts": facts,
-                "action_hints": service.get("action_hints") or [],
-                "error": service.get("error") or None,
-            }
-        )
-    return runtime_cards, runtime_cpu_host_values, runtime_memory_current_values
 
 
 _EMPTY_NOTIFICATION_SETTINGS = {
@@ -602,9 +458,6 @@ def build_dashboard_context(
     enabled_backends = [backend for backend in backends if backend.enabled]
     enabled_inputs = [item for item in inputs if item.enabled]
     app_backends = [backend for backend in backends if backend.kind == "app"]
-    enabled_app_backends = [
-        backend for backend in enabled_backends if backend.kind == "app"
-    ]
     static_backends = [backend for backend in backends if backend.kind == "static"]
     host_cpu_count = status.get("resource_profile", {}).get("host_cpu_count")
     settings_context = dashboard_settings_context(
@@ -616,13 +469,6 @@ def build_dashboard_context(
 
     service_rows = status.get("services", [])
     service_map, services_ok = build_service_cards(service_rows)
-    nginx_status = status.get("nginx") or {}
-    _nginx_active_state, nginx_card = build_nginx_card(nginx_status)
-    runtime_cards, _runtime_cpu_host_values, _runtime_memory_current_values = (
-        build_runtime_cards(service_rows, enabled_app_backends)
-        if scope.needs_settings
-        else ([], [], [])
-    )
 
     backend_input_ids, backend_input_labels = (
         build_backend_input_maps(inputs) if scope.needs_outputs else ({}, {})
@@ -697,8 +543,6 @@ def build_dashboard_context(
         "notification_settings": settings_context["notification_settings"],
         "access_key_settings": settings_context["access_key_settings"],
         "netdata_settings": settings_context["netdata_settings"],
-        "nginx_card": nginx_card,
-        "runtime_cards": runtime_cards,
         "status": status,
         "latest_save_job": latest_save_job,
         "active_tab": scope.active_tab,

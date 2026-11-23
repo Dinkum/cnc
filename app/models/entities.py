@@ -623,7 +623,6 @@ class HostResourceSample(Base):
     __tablename__ = "host_resource_samples"
     __table_args__ = (
         UniqueConstraint("bucket_start", name="uq_host_resource_sample_bucket"),
-        Index("ix_host_resource_samples_bucket_start", "bucket_start"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)

@@ -85,12 +85,13 @@ def _existing_cgroup_path(value: object) -> tuple[str, Path] | None:
     return value, path
 
 
-def _resolve_container_cgroup(state: dict[str, Any]) -> tuple[str, Path] | None:
+def _resolve_container_cgroup(
+    state: dict[str, Any], process_path: str | None
+) -> tuple[str, Path] | None:
     inspected = _existing_cgroup_path(state.get("CgroupPath"))
     if inspected is not None:
         return inspected
 
-    process_path = _process_cgroup_path(state.get("Pid"))
     resolved = _existing_cgroup_path(process_path)
     if resolved is None:
         return None
@@ -190,22 +191,29 @@ def collect_container_cgroup_diagnostics(
     service_name = (
         quadlet_container_service_name(backend_name) if backend_name else None
     )
-    service_path = (
-        _service_control_group(
+    service_path = None
+    resolved = None
+    selection_source = "process_ancestry"
+    if service_name and process_path and _path_beneath_apps_slice(process_path):
+        resolved = _ancestor_cgroup(process_path, service_name=service_name)
+        if resolved is not None and _path_beneath_apps_slice(resolved[0]):
+            service_path = resolved[0]
+        else:
+            resolved = None
+    if resolved is None and backend_name:
+        service_path = _service_control_group(
             backend_name,
             command_runner=command_runner,
             timeout_sec=timeout_sec,
         )
-        if backend_name
-        else None
-    )
-    resolved = _existing_cgroup_path(service_path)
-    selection_source = "systemd_service"
-    if resolved is None and service_name is not None:
-        resolved = _ancestor_cgroup(process_path, service_name=service_name)
-        selection_source = "process_ancestry"
+        resolved = _existing_cgroup_path(service_path)
+        selection_source = "systemd_service"
     if resolved is None:
-        resolved = _resolve_container_cgroup(state) if isinstance(state, dict) else None
+        resolved = (
+            _resolve_container_cgroup(state, process_path)
+            if isinstance(state, dict)
+            else None
+        )
         selection_source = "podman_inspect_or_process"
     if resolved is None:
         if backend_name is None and process_path is None and service_path is None:

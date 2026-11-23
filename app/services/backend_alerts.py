@@ -20,7 +20,6 @@ from app.services.app_fix import fix_app_backend
 from app.services.control_events import emit_control_event
 from app.services.host_state import (
     LockedStateSectionTransaction,
-    host_state_lock_path,
 )
 from app.services.notifications import (
     admin_dashboard_url,
@@ -140,10 +139,6 @@ def _clear_backend_alerts_running_marker(
             "backend_alerts.check.running_marker_clear_failed",
             path=str(settings.host_state_path),
         )
-
-
-def backend_alerts_lock_path(path: Path) -> Path:
-    return host_state_lock_path(path)
 
 
 def _log_backend_alerts_state_written(path: Path, payload: dict[str, Any]) -> None:
@@ -807,16 +802,6 @@ async def run_backend_alerts_check(settings: Settings) -> dict[str, Any]:
         diagnostics_payloads = await asyncio.gather(
             *[collect_bounded_diagnostics(backend) for backend in backends]
         )
-        all_backends_down = bool(backends) and all(
-            not diagnostics.get("observation_deferred")
-            and not bool(diagnostics.get("ok"))
-            for diagnostics in diagnostics_payloads
-        )
-        if not all_backends_down:
-            await cancel_pushover_emergency_async(
-                settings, emergency_key="all_backends_down"
-            )
-
         notifications: list[dict[str, Any]] = []
         pending_notifications: list[dict[str, Any]] = []
         backend_payloads: list[dict[str, Any]] = []
@@ -1291,6 +1276,9 @@ async def run_backend_alerts_check(settings: Settings) -> dict[str, Any]:
         initial_down_notifications = [
             item for item in pending_notifications if item.get("kind") == "down"
         ]
+        all_backends_down = bool(backend_payloads) and all(
+            item["ok"] is False for item in backend_payloads
+        )
         if len(backends) > 1 and all_backends_down and initial_down_notifications:
             affected_backends = sorted(
                 str(item.get("backend") or "")
@@ -1322,8 +1310,13 @@ async def run_backend_alerts_check(settings: Settings) -> dict[str, Any]:
 
         with _backend_alerts_state_transaction(settings) as state_transaction:
             final_state = dict(next_state)
+            final_state["running"] = {"started_at": now_iso}
             state_transaction.replace(final_state)
         _log_backend_alerts_state_written(settings.host_state_path, next_state)
+        if not all_backends_down:
+            await cancel_pushover_emergency_async(
+                settings, emergency_key="all_backends_down"
+            )
 
         sent_notification_updates: list[dict[str, Any]] = []
         for notification in pending_notifications:
@@ -1410,9 +1403,8 @@ async def run_backend_alerts_check(settings: Settings) -> dict[str, Any]:
             "backends": backend_payloads,
             "ok": True,
         }
-    except Exception:
+    finally:
         _clear_backend_alerts_running_marker(settings, started_at=now_iso)
-        raise
 
 
 async def send_backend_alert_test_notifications(

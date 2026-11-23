@@ -211,9 +211,11 @@
   });
   const initialize = async () => {
     try {
-      await loadConfiguration();
-      const payload = await request(`/api/active-operations?surface=output_detail&backend_id=${backendId}`);
-      const active = payload.operations?.find((operation) => operation.kind === "ui.backend.hardening");
+      const [, operations] = await Promise.all([
+        loadConfiguration(),
+        window.CNCOperations.activeOperations({ surface: "output_detail", backend_id: backendId }),
+      ]);
+      const active = operations.find((operation) => operation.kind === "ui.backend.hardening");
       if (active) await watch(active.id);
     } catch (error) {
       status.textContent = error.message;

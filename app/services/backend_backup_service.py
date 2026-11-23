@@ -469,77 +469,8 @@ def _progressing_backup_tar_filter(
     return progress_filter
 
 
-def _temporary_snapshot_image_ref(backend_name: str) -> str:
-    stamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
-    return (
-        f"localhost/cnc-backup-snapshot-{safe_slug(backend_name)}:{stamp}-{os.getpid()}"
-    )
-
-
 def restored_snapshot_image_ref(backend_name: str) -> str:
     return f"localhost/cnc-restored-{safe_slug(backend_name)}:latest"
-
-
-def _snapshot_capture_is_unsupported(error_text: str) -> bool:
-    normalized = str(error_text or "").strip().lower()
-    return "cannot commit a container that uses an exploded rootfs" in normalized
-
-
-def _capture_container_snapshot(
-    *,
-    backend: Backend,
-    settings: Settings,
-    temp_dir: Path,
-) -> dict[str, Any] | None:
-    if backend.kind != "app" or not _backend_container_exists(backend.name, settings):
-        return None
-
-    container = container_name(backend.name)
-    snapshot_image = _temporary_snapshot_image_ref(backend.name)
-    snapshot_path = temp_dir / CONTAINER_SNAPSHOT_NAME
-    try:
-        commit_result = run_command(
-            ["podman", "commit", container, snapshot_image],
-            timeout_sec=settings.command_timeout_apply_sec,
-        )
-        if not commit_result.ok:
-            error_text = "\n".join(
-                part
-                for part in (commit_result.stderr, commit_result.stdout)
-                if str(part or "").strip()
-            )
-            if _snapshot_capture_is_unsupported(error_text):
-                logger.info(
-                    "backup.snapshot.skipped",
-                    backend=backend.name,
-                    container=container,
-                    reason="exploded_rootfs_unsupported",
-                )
-                return None
-            raise RuntimeError(
-                commit_result.stderr or commit_result.stdout or "podman commit failed"
-            )
-
-        save_result = run_command(
-            ["podman", "save", "-o", str(snapshot_path), snapshot_image],
-            timeout_sec=settings.command_timeout_apply_sec,
-        )
-        if not save_result.ok:
-            raise RuntimeError(
-                save_result.stderr or save_result.stdout or "podman save failed"
-            )
-
-        return {
-            "included": True,
-            "archive_name": CONTAINER_SNAPSHOT_NAME,
-            "image_format": "podman-archive",
-            "size_bytes": snapshot_path.stat().st_size,
-        }
-    finally:
-        run_command(
-            ["podman", "image", "rm", "-f", snapshot_image],
-            timeout_sec=settings.command_timeout_apply_sec,
-        )
 
 
 def _write_bundle_member_to_file(
@@ -622,140 +553,106 @@ def _write_backup_bundle(
     backend: Backend,
     bundle_path: Path,
     settings: Settings,
-    include_container_snapshot: bool = True,
     progress_callback: BackupProgressCallback | None = None,
 ) -> dict[str, Any]:
     bundle_path.parent.mkdir(parents=True, exist_ok=True)
     temp_bundle_path = bundle_path.with_name(f".{bundle_path.name}.{os.getpid()}.tmp")
     if temp_bundle_path.exists():
         temp_bundle_path.unlink()
-    with tempfile.TemporaryDirectory(prefix="cnc-backup-bundle-") as temp_dir_name:
-        temp_dir = Path(temp_dir_name)
-        _report_backup_progress(progress_callback, 12, "Gathering app data.")
-        if include_container_snapshot:
-            _report_backup_progress(
-                progress_callback, 18, "Capturing container snapshot."
-            )
-        snapshot_payload = (
-            _capture_container_snapshot(
-                backend=backend, settings=settings, temp_dir=temp_dir
-            )
-            if include_container_snapshot
-            else None
-        )
-        if include_container_snapshot:
-            if snapshot_payload is None:
-                _report_backup_progress(
-                    progress_callback, 22, "Container snapshot skipped."
-                )
-            else:
-                _report_backup_progress(
-                    progress_callback, 22, "Container snapshot captured."
-                )
-        _report_backup_progress(progress_callback, 28, "Collecting mounted paths.")
-        metadata = _bundle_metadata(backend, settings)
-        guest_view = (
-            GuestArchiveView.capture(container_name(backend.name), run_command)
-            if backend.kind == "app"
-            else None
-        )
-        metadata["container_snapshot"] = snapshot_payload or {
-            "included": False,
-            "archive_name": CONTAINER_SNAPSHOT_NAME,
-        }
-        metadata_bytes = json.dumps(metadata, indent=2, sort_keys=True).encode("utf-8")
-        archived_entries = [
-            entry
-            for entry in metadata.get("mount_entries", [])
-            if isinstance(entry, dict) and entry.get("exists")
-        ]
-        source_size_bytes = len(metadata_bytes)
-        path_sizes: dict[str, int] = {}
-        for entry in archived_entries:
-            host_path = entry.get("host_path")
-            if isinstance(host_path, str):
-                path_size = _path_size_bytes(Path(host_path))
-                path_sizes[host_path] = path_size
-                source_size_bytes += path_size
-        snapshot_path = temp_dir / CONTAINER_SNAPSHOT_NAME
-        if snapshot_payload is not None and snapshot_path.exists():
-            source_size_bytes += _path_size_bytes(snapshot_path)
-        _report_backup_progress(
-            progress_callback,
-            32,
-            f"Measured {_format_progress_bytes(source_size_bytes)} of source data.",
-        )
+    _report_backup_progress(progress_callback, 12, "Gathering app data.")
+    _report_backup_progress(progress_callback, 28, "Collecting mounted paths.")
+    metadata = _bundle_metadata(backend, settings)
+    guest_view = (
+        GuestArchiveView.capture(container_name(backend.name), run_command)
+        if backend.kind == "app"
+        else None
+    )
+    metadata["container_snapshot"] = {
+        "included": False,
+        "archive_name": CONTAINER_SNAPSHOT_NAME,
+    }
+    metadata_bytes = json.dumps(metadata, indent=2, sort_keys=True).encode("utf-8")
+    archived_entries = [
+        entry
+        for entry in metadata.get("mount_entries", [])
+        if isinstance(entry, dict) and entry.get("exists")
+    ]
+    source_size_bytes = len(metadata_bytes)
+    path_sizes: dict[str, int] = {}
+    for entry in archived_entries:
+        host_path = entry.get("host_path")
+        if isinstance(host_path, str):
+            path_size = _path_size_bytes(Path(host_path))
+            path_sizes[host_path] = path_size
+            source_size_bytes += path_size
+    _report_backup_progress(
+        progress_callback,
+        32,
+        f"Measured {_format_progress_bytes(source_size_bytes)} of source data.",
+    )
 
-        try:
-            open_mode, open_kwargs = _bundle_write_open_kwargs(settings)
-            with tarfile.open(temp_bundle_path, open_mode, **open_kwargs) as archive:
-                metadata_info = tarfile.TarInfo(BUNDLE_METADATA_NAME)
-                metadata_info.size = len(metadata_bytes)
-                metadata_info.mtime = int(datetime.now(UTC).timestamp())
-                metadata_info.mode = 0o600
-                archive.addfile(metadata_info, io.BytesIO(metadata_bytes))
-                path_count = max(len(archived_entries), 1)
-                for index, entry in enumerate(archived_entries, start=1):
-                    allow_links = entry.get("link_policy") == "guest"
-                    path_progress_start = 34 + round((index - 1) * 30 / path_count)
-                    path_progress_end = 34 + round(index * 30 / path_count)
-                    host_path = str(entry["host_path"])
-                    path_size = path_sizes.get(host_path, 0)
-                    _report_backup_progress(
-                        progress_callback,
-                        path_progress_start,
-                        f"Exporting path {host_path} ({_format_progress_bytes(path_size)}).",
-                    )
-                    archive.add(
-                        host_path,
-                        arcname=str(entry["archive_prefix"]),
-                        filter=_progressing_backup_tar_filter(
-                            allow_links=allow_links,
-                            path_label=host_path,
-                            path_total_bytes=path_size,
-                            progress_start=path_progress_start,
-                            progress_end=path_progress_end,
-                            progress_callback=progress_callback,
-                            metadata_filter=guest_tar_filter(
-                                source=Path(host_path),
-                                archive_prefix=str(entry["archive_prefix"]),
-                                view=guest_view,
-                                rootfs_prefix="rootfs"
-                                if entry.get("target_path") is None
-                                else "",
-                                include_xattrs=entry.get("target_path") is None,
-                            )
-                            if allow_links and guest_view is not None
-                            else None,
-                        ),
-                    )
-                    _report_backup_progress(
-                        progress_callback,
-                        path_progress_end,
-                        f"Exported path {host_path} ({_format_progress_bytes(path_size)}).",
-                    )
-                if snapshot_payload is not None:
-                    _report_backup_progress(
-                        progress_callback, 66, "Exporting container snapshot."
-                    )
-                    archive.add(
-                        str(temp_dir / CONTAINER_SNAPSHOT_NAME),
-                        arcname=CONTAINER_SNAPSHOT_NAME,
-                    )
+    try:
+        open_mode, open_kwargs = _bundle_write_open_kwargs(settings)
+        with tarfile.open(temp_bundle_path, open_mode, **open_kwargs) as archive:
+            metadata_info = tarfile.TarInfo(BUNDLE_METADATA_NAME)
+            metadata_info.size = len(metadata_bytes)
+            metadata_info.mtime = int(datetime.now(UTC).timestamp())
+            metadata_info.mode = 0o600
+            archive.addfile(metadata_info, io.BytesIO(metadata_bytes))
+            path_count = max(len(archived_entries), 1)
+            for index, entry in enumerate(archived_entries, start=1):
+                allow_links = entry.get("link_policy") == "guest"
+                path_progress_start = 34 + round((index - 1) * 30 / path_count)
+                path_progress_end = 34 + round(index * 30 / path_count)
+                host_path = str(entry["host_path"])
+                path_size = path_sizes.get(host_path, 0)
                 _report_backup_progress(
                     progress_callback,
-                    76,
-                    f"Compressing backup bundle from {_format_progress_bytes(source_size_bytes)}.",
+                    path_progress_start,
+                    f"Exporting path {host_path} ({_format_progress_bytes(path_size)}).",
                 )
-            if guest_view is not None:
-                guest_view.verify(run_command)
-            temp_bundle_path.replace(bundle_path)
-        except Exception:
-            try:
-                temp_bundle_path.unlink()
-            except FileNotFoundError:
-                pass
-            raise
+                archive.add(
+                    host_path,
+                    arcname=str(entry["archive_prefix"]),
+                    filter=_progressing_backup_tar_filter(
+                        allow_links=allow_links,
+                        path_label=host_path,
+                        path_total_bytes=path_size,
+                        progress_start=path_progress_start,
+                        progress_end=path_progress_end,
+                        progress_callback=progress_callback,
+                        metadata_filter=guest_tar_filter(
+                            source=Path(host_path),
+                            archive_prefix=str(entry["archive_prefix"]),
+                            view=guest_view,
+                            rootfs_prefix="rootfs"
+                            if entry.get("target_path") is None
+                            else "",
+                            include_xattrs=entry.get("target_path") is None,
+                        )
+                        if allow_links and guest_view is not None
+                        else None,
+                    ),
+                )
+                _report_backup_progress(
+                    progress_callback,
+                    path_progress_end,
+                    f"Exported path {host_path} ({_format_progress_bytes(path_size)}).",
+                )
+            _report_backup_progress(
+                progress_callback,
+                76,
+                f"Compressing backup bundle from {_format_progress_bytes(source_size_bytes)}.",
+            )
+        if guest_view is not None:
+            guest_view.verify(run_command)
+        temp_bundle_path.replace(bundle_path)
+    except Exception:
+        try:
+            temp_bundle_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
 
     bundle_size = bundle_path.stat().st_size
     compression_savings_percent = _compression_savings_percent(
@@ -795,6 +692,9 @@ def _backup_tar_filter(*, allow_links: bool):
 
 def _load_bundle_metadata(bundle_path: Path) -> dict[str, Any]:
     with tarfile.open(bundle_path, "r:*") as archive:
+        first = archive.next()
+        if first is not None and first.isfile() and first.name == BUNDLE_METADATA_NAME:
+            return _metadata_from_open_archive(archive, first)
         _scan_bundle_members(archive, max_expanded_bytes=None)
         return _metadata_from_open_archive(archive)
 
@@ -825,11 +725,14 @@ def _scan_bundle_members(
     return expanded_bytes
 
 
-def _metadata_from_open_archive(archive: tarfile.TarFile) -> dict[str, Any]:
-    try:
-        member = archive.getmember(BUNDLE_METADATA_NAME)
-    except KeyError as exc:
-        raise RuntimeError("backup bundle metadata missing") from exc
+def _metadata_from_open_archive(
+    archive: tarfile.TarFile, member: tarfile.TarInfo | None = None
+) -> dict[str, Any]:
+    if member is None:
+        try:
+            member = archive.getmember(BUNDLE_METADATA_NAME)
+        except KeyError as exc:
+            raise RuntimeError("backup bundle metadata missing") from exc
     if member.size > BUNDLE_METADATA_MAX_BYTES:
         raise RuntimeError("backup bundle metadata is too large")
     handle = archive.extractfile(member)
@@ -913,6 +816,7 @@ def _bundle_restore_signals(
     metadata: dict[str, Any],
     *,
     current_backend: Backend | None = None,
+    guest_rootfs_included: bool = False,
 ) -> dict[str, Any]:
     backend_payload = (
         metadata.get("backend") if isinstance(metadata.get("backend"), dict) else {}
@@ -946,10 +850,14 @@ def _bundle_restore_signals(
             "bundle contains a container snapshot but no mounted data payload"
         )
 
-    if bundle_backend_kind == "app" and not container_snapshot_included:
-        risk_flags.append("app_without_container_snapshot")
+    if (
+        bundle_backend_kind == "app"
+        and not guest_rootfs_included
+        and not container_snapshot_included
+    ):
+        risk_flags.append("app_without_guest_rootfs")
         risk_details.append(
-            "app bundle does not include a container snapshot and will rely on metadata-driven rebuild"
+            "app bundle does not include a guest root filesystem and will rely on a rebuild"
         )
 
     if current_backend is not None:
@@ -1030,6 +938,7 @@ def _verify_bundle_contents(
             raise RuntimeError("backup bundle format version is invalid")
 
         member_names: set[str] = set()
+        directory_names: set[str] = set()
         for member in archive.getmembers():
             member_name = member.name.strip()
             if not member_name:
@@ -1037,10 +946,13 @@ def _verify_bundle_contents(
             if member_name.startswith("/") or ".." in Path(member_name).parts:
                 raise RuntimeError(f"invalid bundle member path: {member_name}")
             member_names.add(member_name)
+            if member.isdir():
+                directory_names.add(member_name)
         _validate_bundle_restore_members(archive, metadata)
 
     mount_entries = metadata.get("mount_entries")
     archived_mounts = 0
+    guest_rootfs_included = False
     if isinstance(mount_entries, list):
         for entry in mount_entries:
             if not isinstance(entry, dict) or not entry.get("exists"):
@@ -1056,6 +968,12 @@ def _verify_bundle_contents(
                     f"backup bundle missing mounted path payload: {archive_prefix}"
                 )
             archived_mounts += 1
+            if (
+                entry.get("link_policy") == "guest"
+                and entry.get("target_path") is None
+                and f"{archive_prefix}/rootfs" in directory_names
+            ):
+                guest_rootfs_included = True
 
     snapshot_included = _bundle_has_container_snapshot(metadata)
     if snapshot_included and CONTAINER_SNAPSHOT_NAME not in member_names:
@@ -1072,8 +990,11 @@ def _verify_bundle_contents(
         "mount_entries_archived": archived_mounts,
         "mount_entries_total": _bundle_archived_mount_count(metadata),
         "container_snapshot_included": snapshot_included,
+        "guest_rootfs_included": guest_rootfs_included,
         **_bundle_coverage_payload(metadata),
-        **_bundle_restore_signals(metadata),
+        **_bundle_restore_signals(
+            metadata, guest_rootfs_included=guest_rootfs_included
+        ),
         "metadata": metadata,
     }
 
@@ -1697,9 +1618,16 @@ async def _validate_restored_backend_state(session: AsyncSession) -> None:
 
 
 def _extract_bundle_entries(
-    bundle_path: Path, destination_dir: Path, metadata: dict[str, Any]
+    bundle_path: Path,
+    destination_dir: Path,
+    metadata: dict[str, Any],
+    *,
+    archive_prefixes: set[str] | None = None,
 ) -> None:
     allowed_prefixes, guest_symlink_roots = _bundle_restore_member_policy(metadata)
+    if archive_prefixes is not None:
+        allowed_prefixes.intersection_update(archive_prefixes)
+        guest_symlink_roots.intersection_update(archive_prefixes)
     if not allowed_prefixes:
         return
 
@@ -1726,7 +1654,7 @@ def _extract_bundle_entries(
                 and entry.get("archive_prefix") in guest_symlink_roots
                 and entry.get("target_path") is None
             },
-            guest_owner_roots=_bundle_guest_owner_roots(metadata),
+            guest_owner_roots=_bundle_guest_owner_roots(metadata) & allowed_prefixes,
         )
 
 
@@ -1763,7 +1691,7 @@ def _rollback_restore_entries(entries: list[dict[str, Any]]) -> None:
         if _restore_entry_exists(rollback):
             if _restore_entry_exists(target):
                 _remove_existing_path(target)
-            shutil.move(str(rollback), str(target))
+            rollback.rename(target)
         elif not entry["had_existing"] and _restore_entry_exists(target):
             _remove_existing_path(target)
         if _restore_entry_exists(stage):
@@ -1803,10 +1731,7 @@ class _RestoreBundleTransaction:
         self.metadata = metadata
         self.bundle_path = bundle_path
         self.token = token or uuid.uuid4().hex[:12]
-        self._temp_dir_context: tempfile.TemporaryDirectory[str] | None = None
-        self._temp_dir: Path | None = None
         self.entries = self._plan_entries()
-        self.restored_paths: list[str] = []
 
     def _plan_entries(self) -> list[dict[str, Any]]:
         if self.bundle_path is None or not self.bundle_path.exists():
@@ -1847,59 +1772,61 @@ class _RestoreBundleTransaction:
         if not self.entries:
             return []
         assert self.bundle_path is not None
-        self._temp_dir_context = tempfile.TemporaryDirectory(
-            prefix="cnc-backup-restore-"
-        )
-        self._temp_dir = Path(self._temp_dir_context.name)
-        _extract_bundle_entries(self.bundle_path, self._temp_dir, self.metadata)
         guest_owner_roots = _bundle_guest_owner_roots(self.metadata)
         try:
-            staged: list[dict[str, Any]] = []
+            entries_by_parent: dict[Path, list[dict[str, Any]]] = {}
             for entry in self.entries:
-                extracted_path = self._temp_dir / entry["archive_prefix"]
-                if not extracted_path.exists():
-                    continue
                 target = Path(entry["target"])
-                stage = Path(entry["stage"])
-                rollback = Path(entry["rollback"])
                 if entry["archive_prefix"] in guest_owner_roots:
                     validate_guest_volume_paths([f"{target}:/:rw"], allow_missing=True)
                 target.parent.mkdir(parents=True, exist_ok=True)
-                for leftover in (stage, rollback):
-                    if _restore_entry_exists(leftover):
-                        _remove_existing_path(leftover)
-                shutil.move(str(extracted_path), str(stage))
-                if entry["private_stage"]:
-                    stage.chmod(0o700)
-                staged.append(entry)
-            for entry in staged:
+                entries_by_parent.setdefault(target.parent, []).append(entry)
+
+            staged_paths: set[Path] = set()
+            for parent, entries in entries_by_parent.items():
+                with tempfile.TemporaryDirectory(
+                    prefix=".cnc-restore-extract-", dir=parent
+                ) as temp_dir:
+                    extraction_root = Path(temp_dir)
+                    _extract_bundle_entries(
+                        self.bundle_path,
+                        extraction_root,
+                        self.metadata,
+                        archive_prefixes={entry["archive_prefix"] for entry in entries},
+                    )
+                    for entry in entries:
+                        extracted_path = extraction_root / entry["archive_prefix"]
+                        if not extracted_path.exists():
+                            continue
+                        stage = Path(entry["stage"])
+                        for leftover in (stage, Path(entry["rollback"])):
+                            if _restore_entry_exists(leftover):
+                                _remove_existing_path(leftover)
+                        extracted_path.rename(stage)
+                        if entry["private_stage"]:
+                            stage.chmod(0o700)
+                        staged_paths.add(stage)
+
+            restored_paths: list[str] = []
+            for entry in self.entries:
+                stage = Path(entry["stage"])
+                if stage not in staged_paths:
+                    continue
                 target = Path(entry["target"])
                 if entry["had_existing"]:
-                    shutil.move(str(target), entry["rollback"])
-                shutil.move(entry["stage"], str(target))
-                self.restored_paths.append(str(target))
-            return list(self.restored_paths)
+                    target.rename(entry["rollback"])
+                stage.rename(target)
+                restored_paths.append(str(target))
+            return restored_paths
         except Exception:
             self.rollback()
             raise
 
     def commit(self) -> None:
         _discard_restore_rollbacks(self.entries)
-        try:
-            self._cleanup()
-        except Exception as exc:
-            logger.warning("restore.temp_cleanup_failed", error=str(exc))
 
     def rollback(self) -> None:
         _rollback_restore_entries(self.entries)
-        self._cleanup()
-
-    def _cleanup(self) -> None:
-        self.restored_paths = []
-        if self._temp_dir_context is not None:
-            self._temp_dir_context.cleanup()
-            self._temp_dir_context = None
-            self._temp_dir = None
 
 
 def _backend_container_exists(backend_name: str, settings: Settings) -> bool:
@@ -2013,7 +1940,7 @@ async def _converge_restored_backend_host_state(
     response = await run_apply(
         session,
         settings,
-        commit_on_success=False,
+        persist_run=False,
         operation_kind="restore_backend",
         operation_handle=operation,
         scope=full_reconcile("restore_backend").scope(),
@@ -2101,7 +2028,7 @@ async def create_backend_backup(
 
     host_operation = None
     if operation is not None:
-        host_operation = operation.with_deferred_db_updates()
+        host_operation = operation
     elif operation_id is not None:
         host_operation = OperationHandle(
             id=operation_id, kind="backup_backend", settings=settings
@@ -2166,7 +2093,6 @@ async def create_backend_backup(
                     recorded_failure = await lifecycle.finish(record_failure(error))
                 cancelled = cancelled or lifecycle.cancel_requested
                 if cancelled and mutation_operation is not None:
-                    mutation_operation.defer_db_updates = False
                     await lifecycle.finish(
                         mutation_operation.complete(
                             "cancelled" if recorded_failure else "success",
@@ -2630,9 +2556,7 @@ async def restore_backend_backup(
         _backend_container_exists, backend_name, settings
     )
     restored_paths: list[str] = []
-    host_operation = (
-        operation.with_deferred_db_updates() if operation is not None else None
-    )
+    host_operation = operation if operation is not None else None
     operation_context = host_mutation_operation(
         settings,
         kind="restore_backend",
@@ -3023,7 +2947,7 @@ async def import_backend_backup_bundle(
 
     host_operation = None
     if operation is not None:
-        host_operation = operation.with_deferred_db_updates()
+        host_operation = operation
     elif operation_id is not None:
         host_operation = OperationHandle(
             id=operation_id, kind="import_backend_backup", settings=settings
@@ -3046,11 +2970,9 @@ async def import_backend_backup_bundle(
             await session.refresh(record)
         try:
             await asyncio.to_thread(shutil.copy2, source_path, temp_destination_path)
-            bundle_sha256 = await asyncio.to_thread(_sha256_file, temp_destination_path)
             verification = await asyncio.to_thread(
                 _verify_bundle_contents,
                 temp_destination_path,
-                expected_sha256=bundle_sha256,
                 max_expanded_bytes=settings.backend_backup_expanded_max_bytes,
             )
             metadata = verification["metadata"]
@@ -3063,7 +2985,7 @@ async def import_backend_backup_bundle(
             record.status = "success"
             record.scope = str(verification["scope"])
             record.bundle_path = str(destination_path)
-            record.bundle_sha256 = bundle_sha256
+            record.bundle_sha256 = str(verification["bundle_sha256"])
             record.size_bytes = destination_path.stat().st_size
             record.notes = f"{_bundle_notes(metadata, imported=True)}; verified"
             record.error = None
@@ -3171,25 +3093,79 @@ async def restore_backend_bundle_as_new_backend(
         phase="restore_as_new",
         details={"backend": target_backend_name, "bundle": source_path.name},
     ) as operation:
-        backend = _backend_from_metadata(metadata, backend_name=target_backend_name)
-        session.add(backend)
-        await session.flush()
-        await _validate_restored_backend_state(session)
-        await session.commit()
-        await session.refresh(backend)
-
-        imported_backup: BackendBackup | None = None
+        # Stage and verify the bundle file on disk before inserting the new Backend
+        # row, so a failure or crash during import leaves no orphaned DB row.
+        logger.info(
+            "backup.import.requested",
+            backend=target_backend_name,
+            bundle_path=str(source_path),
+            original_name=original_name,
+        )
+        destination_name = (
+            f"{_timestamp_slug()}-import-{_sanitize_bundle_name(original_name)}"
+        )
+        if not (destination_name.endswith(".tar.gz") or destination_name.endswith(".tar")):
+            destination_name = f"{destination_name}{_bundle_extension(settings)}"
+        staged_bundle_path = (
+            settings.backend_backup_dir / target_backend_name / destination_name
+        )
+        staged_bundle_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_staged_path = staged_bundle_path.with_name(
+            f".{staged_bundle_path.name}.{os.getpid()}.tmp"
+        )
+        temp_staged_path.unlink(missing_ok=True)
         try:
-            imported_backup = await import_backend_backup_bundle(
-                session,
-                backend,
-                source_path,
-                original_name=original_name,
-                settings=settings,
-                operation=operation,
+            await asyncio.to_thread(shutil.copy2, source_path, temp_staged_path)
+            bundle_sha256 = await asyncio.to_thread(_sha256_file, temp_staged_path)
+            staged_verification = await asyncio.to_thread(
+                _verify_bundle_contents,
+                temp_staged_path,
+                expected_sha256=bundle_sha256,
+                max_expanded_bytes=settings.backend_backup_expanded_max_bytes,
             )
-            if imported_backup.status != "success":
-                raise RuntimeError(imported_backup.error or "bundle import failed")
+            os.replace(temp_staged_path, staged_bundle_path)
+        except BaseException:
+            temp_staged_path.unlink(missing_ok=True)
+            staged_bundle_path.unlink(missing_ok=True)
+            raise
+
+        backend = _backend_from_metadata(metadata, backend_name=target_backend_name)
+        imported_backup: BackendBackup | None = None
+        backend_id: int | None = None
+        imported_backup_id: int | None = None
+        try:
+            session.add(backend)
+            await session.flush()
+            await _validate_restored_backend_state(session)
+            imported_backup = BackendBackup(
+                backend_id=backend.id,
+                operation_id=operation.id,
+                status="success",
+                scope=str(staged_verification["scope"]),
+                bundle_path=str(staged_bundle_path),
+                bundle_sha256=bundle_sha256,
+                size_bytes=staged_bundle_path.stat().st_size,
+                notes=f"{_bundle_notes(staged_verification['metadata'], imported=True)}; verified",
+                error=None,
+            )
+            session.add(imported_backup)
+            await session.commit()
+            backend_id = backend.id
+            imported_backup_id = imported_backup.id
+            backend = (
+                await session.execute(
+                    select(Backend)
+                    .options(selectinload(Backend.inputs))
+                    .where(Backend.id == backend_id)
+                )
+            ).scalar_one()
+            await session.refresh(imported_backup)
+            logger.info(
+                "backup.import.succeeded",
+                backend=backend.name,
+                backup_id=imported_backup.id,
+                bundle_path=str(staged_bundle_path),
+            )
             restore_result = await restore_backend_backup(
                 session,
                 backend,
@@ -3197,7 +3173,7 @@ async def restore_backend_bundle_as_new_backend(
                 settings,
                 notify_on_success=False,
                 notify_on_failure=False,
-                operation=operation,
+                operation=operation.as_step(),
             )
             await send_pushover_notification_async(
                 settings,
@@ -3255,9 +3231,9 @@ async def restore_backend_bundle_as_new_backend(
                 "restore.bundle.failed", backend=target_backend_name, error=str(exc)
             )
             await session.rollback()
-            if imported_backup is not None:
+            if backend_id is not None and imported_backup_id is not None:
                 managed_backup = await get_backend_backup(
-                    session, backend.id, imported_backup.id
+                    session, backend_id, imported_backup_id
                 )
                 if managed_backup is not None:
                     if managed_backup.bundle_path:
@@ -3358,7 +3334,6 @@ async def clone_backend_as_new_backend(
                 backend=loaded_backend,
                 bundle_path=bundle_path,
                 settings=settings,
-                include_container_snapshot=False,
             )
             _report_backup_progress(progress_callback, 0, "Verifying clone bundle.")
             verification = await asyncio.to_thread(
@@ -3684,7 +3659,9 @@ def _inspect_backup_description(backup, current_backend) -> dict[str, Any]:
             "covered_paths_summary": verification["covered_paths_summary"],
             "verification_status": "verified",
             **_bundle_restore_signals(
-                verification["metadata"], current_backend=current_backend
+                verification["metadata"],
+                current_backend=current_backend,
+                guest_rootfs_included=verification["guest_rootfs_included"],
             ),
         }
         return payload

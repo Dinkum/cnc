@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import ipaddress
+import json
 from pathlib import Path
 import tempfile
 from typing import Any
@@ -9,6 +10,7 @@ from typing import Any
 from app.config import Settings
 from app.logger import get_logger
 from app.services.commands import CommandError, CommandResult
+from app.services.container_runtime import inspect_container_batch
 from app.services.observation import Absent, Present
 from app.services.guest_exec import (
     EXEC_CIRCUIT_OPEN_RETURN_CODE,
@@ -25,7 +27,35 @@ from app.services.runtime_services import (
 
 APP_ISOLATION_CHAIN = "CNC_APP_ISOLATION"
 CANARY_SOURCE_CONCURRENCY = 4
+CANARY_SOURCE_TIMEOUT_MAX_SEC = 30
 logger = get_logger("app.network_isolation")
+
+
+_CANARY_SOURCE_PROBE = """
+import json
+import subprocess
+import sys
+
+def probe(command, timeout):
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+        return [result.returncode, result.stdout.strip()[:1024], result.stderr.strip()[:1024]]
+    except subprocess.TimeoutExpired:
+        return [124, "", "probe timed out"]
+    except OSError as exc:
+        return [127, "", str(exc)]
+
+timeout = float(sys.argv[2])
+for index, (name, address, port) in enumerate(json.loads(sys.argv[1])):
+    dns = probe(["getent", "hosts", name], min(timeout, 2))
+    connect = None
+    if address and port:
+        connect = probe([
+            "curl", "-sS", "-o", "/dev/null", "--connect-timeout", "2",
+            "--max-time", "3", "-w", "%{http_code}", f"http://{address}:{port}/",
+        ], min(timeout, 4))
+    print(json.dumps([index, dns, connect]), flush=True)
+"""
 
 
 def _network_subnets(payload: dict[str, Any] | None) -> list[str]:
@@ -203,6 +233,23 @@ def _probe_unavailable(result: CommandResult) -> bool:
     return any(marker in combined for marker in markers)
 
 
+def _batch_probe_result(raw: object, batch: CommandResult) -> CommandResult:
+    if (
+        isinstance(raw, list)
+        and len(raw) == 3
+        and type(raw[0]) is int
+        and isinstance(raw[1], str)
+        and isinstance(raw[2], str)
+    ):
+        return CommandResult(batch.command, raw[0], raw[1], raw[2])
+    return CommandResult(
+        batch.command,
+        126,
+        "",
+        batch.stderr or "canary probe result unavailable",
+    )
+
+
 def _probe_from_source(
     source: dict[str, object],
     nodes: list[dict[str, object]],
@@ -217,22 +264,39 @@ def _probe_from_source(
             {"backend": source["backend"], "reason": "source_container_unavailable"}
         )
         return checks, leaks, unknown
-    for target in nodes:
-        if source["backend"] == target["backend"]:
+    targets = [target for target in nodes if source["backend"] != target["backend"]]
+    if not targets:
+        return checks, leaks, unknown
+    pairs = []
+    for target in targets:
+        address = str(target.get("address") or "") if target["inspect_ok"] else ""
+        port = max(0, int(target.get("handoff_port") or 0))
+        pairs.append((str(target["container"]), address, port))
+    probe_timeout = settings.command_timeout_status_sec
+    timeout_per_pair = min(2, probe_timeout) + min(4, probe_timeout)
+    source_timeout = min(
+        CANARY_SOURCE_TIMEOUT_MAX_SEC, timeout_per_pair * len(targets) + 1
+    )
+    batch = run_backend_guest_command(
+        str(source["backend"]),
+        settings,
+        ["python3", "-c", _CANARY_SOURCE_PROBE, json.dumps(pairs), str(probe_timeout)],
+        timeout_sec=source_timeout,
+        command_runner=services.run_command,
+        source="network_isolation",
+    )
+    observations = {}
+    for line in batch.stdout.splitlines():
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
             continue
-        dns_command = [
-            "getent",
-            "hosts",
-            str(target["container"]),
-        ]
-        dns_result = run_backend_guest_command(
-            str(source["backend"]),
-            settings,
-            dns_command,
-            timeout_sec=settings.command_timeout_status_sec,
-            command_runner=services.run_command,
-            source="network_isolation",
-        )
+        if isinstance(row, list) and len(row) == 3 and type(row[0]) is int:
+            observations[row[0]] = (row[1], row[2])
+
+    for index, (target, (_, address, port)) in enumerate(zip(targets, pairs)):
+        dns, connect = observations.get(index, (None, None))
+        dns_result = _batch_probe_result(dns, batch)
         dns_resolved = dns_result.ok and bool((dns_result.stdout or "").strip())
         if not dns_result.ok and _probe_unavailable(dns_result):
             unknown.append(
@@ -253,9 +317,7 @@ def _probe_from_source(
                 }
             )
 
-        target_address = str(target.get("address") or "")
-        target_port = int(target.get("handoff_port") or 0)
-        if not target["inspect_ok"] or not target_address or target_port <= 0:
+        if not address or not port:
             unknown.append(
                 {
                     "source": source["backend"],
@@ -265,27 +327,7 @@ def _probe_from_source(
             )
             continue
 
-        connect_command = [
-            "curl",
-            "-sS",
-            "-o",
-            "/dev/null",
-            "--connect-timeout",
-            "2",
-            "--max-time",
-            "3",
-            "-w",
-            "%{http_code}",
-            f"http://{target_address}:{target_port}/",
-        ]
-        connect_result = run_backend_guest_command(
-            str(source["backend"]),
-            settings,
-            connect_command,
-            timeout_sec=settings.command_timeout_status_sec,
-            command_runner=services.run_command,
-            source="network_isolation",
-        )
+        connect_result = _batch_probe_result(connect, batch)
         connected = connect_result.ok
         if not connect_result.ok and _probe_unavailable(connect_result):
             unknown.append(
@@ -321,18 +363,34 @@ def collect_app_network_isolation_canary(
     *,
     services: AppRuntimeServices | None = None,
 ) -> dict[str, object]:
+    use_batch_inspection = services is None
     services = services or default_app_runtime_services()
     nodes: list[dict[str, object]] = []
-    for backend in sorted(backends, key=lambda item: str(getattr(item, "name", ""))):
-        if str(getattr(backend, "kind", "")) != "app" or not bool(
-            getattr(backend, "enabled", False)
-        ):
-            continue
-        container = container_name(str(getattr(backend, "name", "")))
-        observation = services.inspect_container(
-            container, settings.command_timeout_status_sec
+    enabled = sorted(
+        (
+            backend
+            for backend in backends
+            if getattr(backend, "kind", "") == "app"
+            and getattr(backend, "enabled", False)
+        ),
+        key=lambda backend: str(getattr(backend, "name", "")),
+    )
+    containers = [
+        container_name(str(getattr(backend, "name", ""))) for backend in enabled
+    ]
+    timeout_sec = settings.command_timeout_status_sec
+    inspections = (
+        inspect_container_batch(
+            containers, timeout_sec, command_runner=services.run_command
         )
-        payload = observation.value if isinstance(observation, Present) else None
+        if use_batch_inspection and len(containers) > 1
+        else {}
+    )
+    for backend, container in zip(enabled, containers):
+        payload = inspections.get(container)
+        if payload is None:
+            observation = services.inspect_container(container, timeout_sec)
+            payload = observation.value if isinstance(observation, Present) else None
         address = _container_ipv4(payload)
         nodes.append(
             {
@@ -347,9 +405,7 @@ def collect_app_network_isolation_canary(
     checks: list[dict[str, object]] = []
     leaks: list[dict[str, object]] = []
     unknown: list[dict[str, object]] = []
-    # Probes from one guest stay sequential, behind that guest's exec guard;
-    # different guests are probed concurrently so the check scales with the
-    # number of apps rather than the number of pairs.
+    # Each guest holds one exec guard for its batch. Distinct guests run concurrently.
     with ThreadPoolExecutor(max_workers=CANARY_SOURCE_CONCURRENCY) as pool:
         for source_checks, source_leaks, source_unknown in pool.map(
             lambda source: _probe_from_source(source, nodes, settings, services),

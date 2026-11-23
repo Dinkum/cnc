@@ -4,6 +4,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import os
+import stat
 import tempfile
 from pathlib import Path
 from typing import Mapping
@@ -214,6 +215,23 @@ def _backend_authorized_keys_path(settings: Settings, backend: str) -> Path:
     return settings.ssh_backend_home_root / backend / ".ssh" / "authorized_keys"
 
 
+async def _sync_metadata(
+    path: Path,
+    *,
+    owner: str,
+    uid: str | None,
+    gid: str | None,
+    mode: int,
+) -> None:
+    current = path.stat()
+    if (str(current.st_uid), str(current.st_gid)) != (uid, gid):
+        await run_command_checked_async(["chown", owner, str(path)], timeout_sec=30)
+    if stat.S_IMODE(current.st_mode) != mode:
+        await run_command_checked_async(
+            ["chmod", f"{mode:04o}", str(path)], timeout_sec=30
+        )
+
+
 async def _sync_backend_authorized_key(
     access: BackendSshAccess, settings: Settings
 ) -> bool:
@@ -225,16 +243,12 @@ async def _sync_backend_authorized_key(
         return False
     ssh_dir = key_path.parent
     ssh_dir.mkdir(parents=True, exist_ok=True)
-    await run_command_checked_async(
-        ["chown", f"{access.name}:{settings.ssh_backend_group}", str(ssh_dir)],
-        timeout_sec=30,
-    )
-    await run_command_checked_async(["chmod", "0700", str(ssh_dir)], timeout_sec=30)
+    home = ssh_dir.parent.stat()
+    owner = f"{access.name}:{settings.ssh_backend_group}"
+    uid, gid = str(home.st_uid), str(home.st_gid)
+    await _sync_metadata(ssh_dir, owner=owner, uid=uid, gid=gid, mode=0o700)
     changed = _write_file_atomic(key_path, f"{access.public_key.strip()}\n", 0o600)
-    await run_command_checked_async(
-        ["chown", f"{access.name}:{settings.ssh_backend_group}", str(key_path)],
-        timeout_sec=30,
-    )
+    await _sync_metadata(key_path, owner=owner, uid=uid, gid=gid, mode=0o600)
     return changed
 
 
@@ -350,17 +364,6 @@ def _backend_user_exists(username: str) -> bool:
     return _passwd_entry(username) is not None
 
 
-async def _ensure_group(settings: Settings) -> None:
-    group = settings.ssh_backend_group
-    result = run_command(["getent", "group", group], timeout_sec=10)
-    if result.ok:
-        return None
-    await _run_retryable_account_command(
-        ["groupadd", "--system", group], settings=settings
-    )
-    return None
-
-
 async def _ensure_group_created(settings: Settings) -> bool:
     group = settings.ssh_backend_group
     result = run_command(["getent", "group", group], timeout_sec=10)
@@ -393,12 +396,14 @@ async def _run_retryable_account_command(
     )
 
 
-async def _ensure_backend_user(backend: str, settings: Settings) -> None:
+async def _ensure_backend_user(
+    backend: str,
+    settings: Settings,
+    entry: list[str] | None,
+    desired_gid: str | None,
+) -> None:
     group = settings.ssh_backend_group
     home_dir = settings.ssh_backend_home_root / backend
-    group_entry = _group_entry(group)
-    desired_gid = group_entry[2] if group_entry and len(group_entry) >= 3 else None
-    entry = _passwd_entry(backend)
     should_lock_password = True
     if entry is not None:
         gecos = entry[4]
@@ -450,10 +455,13 @@ async def _ensure_backend_user(backend: str, settings: Settings) -> None:
             ["passwd", "-l", backend], settings=settings
         )
     home_dir.mkdir(parents=True, exist_ok=True)
-    await run_command_checked_async(
-        ["chown", f"{backend}:{group}", str(home_dir)], timeout_sec=30
+    await _sync_metadata(
+        home_dir,
+        owner=f"{backend}:{group}",
+        uid=entry[2] if entry is not None else None,
+        gid=desired_gid,
+        mode=0o750,
     )
-    await run_command_checked_async(["chmod", "0750", str(home_dir)], timeout_sec=30)
 
 
 async def _remove_backend_user(backend: str) -> None:
@@ -523,15 +531,17 @@ async def reconcile_backend_ssh_access(
             settings.ssh_backend_home_root.mkdir(parents=True, exist_ok=True)
 
             existing = _existing_backend_ssh_users(settings)
+            group_entry = _group_entry(settings.ssh_backend_group)
+            desired_gid = group_entry[2] if group_entry is not None else None
             out_of_scope: list[str] = []
             for access in desired_access:
                 if scoped_to is not None and access.name not in scoped_to:
                     if not _backend_user_exists(access.name):
                         out_of_scope.append(access.name)
                     continue
-                existed_before = _backend_user_exists(access.name)
-                await _ensure_backend_user(access.name, settings)
-                if not existed_before and _backend_user_exists(access.name):
+                entry = _passwd_entry(access.name)
+                await _ensure_backend_user(access.name, settings, entry, desired_gid)
+                if entry is None and _backend_user_exists(access.name):
                     created_users.append(access.name)
                 changed = (
                     await _sync_backend_authorized_key(access, settings) or changed

@@ -129,29 +129,26 @@ def reconcile_follower_certificates(
     *,
     reload: bool = False,
 ) -> None:
-    from app.services.cluster_ingress import _ssh_checked
+    from app.services.remote_node import RemoteNodeExecutor
 
     hosts = origin_hosts(files, DEFAULT_CONTROL_DIR)
     if not hosts:
         return
+    executor = RemoteNodeExecutor(node_uid, node_ip, settings)
+
+    def _run_ssh(script: str) -> str:
+        return executor.ssh(script, retryable_as_unavailable=True)
+
     source = Path(__file__).with_name("origin_tls.py").read_bytes()
     encoded = base64.b64encode(source).decode()
-    _ssh_checked(
-        node_uid,
-        node_ip,
-        settings,
+    _run_ssh(
         "set -eu\ninstall -d -m 0755 /usr/local/lib/cnc\nprintf %s "
         + shlex.quote(encoded)
         + " | base64 -d > /usr/local/lib/cnc/origin_tls.py\nchmod 0644 /usr/local/lib/cnc/origin_tls.py",
     )
     helper = "python3 /usr/local/lib/cnc/origin_tls.py --control-dir /var/lib/cnc/app-control"
     for hostname in hosts:
-        output = _ssh_checked(
-            node_uid,
-            node_ip,
-            settings,
-            f"{helper} --origin-request {shlex.quote(hostname)}",
-        )
+        output = _run_ssh(f"{helper} --origin-request {shlex.quote(hostname)}")
         try:
             request: dict[str, Any] = json.loads(output)
         except ValueError:
@@ -168,16 +165,8 @@ def reconcile_follower_certificates(
                 raise CloudflareError("Follower returned an invalid CSR.")
             certificate = _issue(settings, hostname, csr, node_uid)
             data = base64.b64encode(certificate.encode()).decode()
-            _ssh_checked(
-                node_uid,
-                node_ip,
-                settings,
+            _run_ssh(
                 f"{helper} --origin-install {shlex.quote(hostname)} --certificate-data {shlex.quote(data)}",
             )
         if reload and changed:
-            _ssh_checked(
-                node_uid,
-                node_ip,
-                settings,
-                f"{helper} --origin-reload {shlex.quote(hostname)}",
-            )
+            _run_ssh(f"{helper} --origin-reload {shlex.quote(hostname)}")

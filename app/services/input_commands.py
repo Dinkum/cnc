@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -46,6 +47,17 @@ async def create_input(
     if payload.connection == "cloudflare_tunnel" and payload.kind != "domain":
         raise ValidationError("Cloudflare Tunnel is available for domain inputs only")
     value = ensure_input_value(payload.kind, payload.value)
+    existing_id = (
+        await session.execute(
+            select(Input.id).where(Input.hostname == value).limit(1)
+        )
+    ).scalar_one_or_none()
+    if existing_id is not None:
+        raise IntegrityError(
+            "INSERT INTO inputs",
+            {"hostname": value},
+            Exception(f"UNIQUE constraint failed: inputs.hostname ({value})"),
+        )
     item = Input(
         kind=payload.kind,
         hostname=value,

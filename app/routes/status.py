@@ -1,5 +1,6 @@
 import asyncio
 import json
+from contextlib import AsyncExitStack
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -14,6 +15,7 @@ from app.logger import logging_pipeline_status
 from app.models.entities import Operation
 from app.security import get_csrf_token
 from app.services.operation_progress import read_operation_progress
+from app.services.operations import operation_session_scope
 from app.services.outcome_presentation import present_mutation_outcome
 from app.services.operation_runtime import (
     CREATE_BACKEND_PROGRESS_POINTS,
@@ -77,7 +79,9 @@ async def status(
     settings: Settings = Depends(settings_dependency),
     session: AsyncSession = Depends(db_session_dependency),
 ) -> dict:
-    return await collect_status(session, settings, force_refresh=force_refresh)
+    return await collect_status(
+        session, settings, force_refresh=force_refresh, allow_stale=not force_refresh
+    )
 
 
 @router.get("/active-operations")
@@ -295,32 +299,44 @@ async def operation_events(
     session: AsyncSession = Depends(db_session_dependency),
 ) -> StreamingResponse:
     async def stream():
-        last_payload_json = ""
-        last_keepalive_at = 0.0
-        while True:
-            if await request.is_disconnected():
-                break
-            try:
-                payload = await operation_status_payload(
-                    operation_id, settings=settings, session=session
-                )
-            except HTTPException as exc:
-                error_payload = {"detail": exc.detail, "status_code": exc.status_code}
-                yield f"event: error\ndata: {json.dumps(error_payload, separators=(',', ':'))}\n\n"
-                break
-            payload_json = json.dumps(payload, separators=(",", ":"))
-            now = asyncio.get_running_loop().time()
-            if payload_json != last_payload_json:
-                yield f"event: operation\ndata: {payload_json}\n\n"
-                last_payload_json = payload_json
-                last_keepalive_at = now
-            elif now - last_keepalive_at >= 15:
-                yield ": keepalive\n\n"
-                last_keepalive_at = now
-            if str(payload.get("status") or "").lower() not in {"queued", "running"}:
-                break
-            await session.rollback()
-            await asyncio.sleep(0.5)
+        async with AsyncExitStack() as scopes:
+            last_payload_json = ""
+            last_keepalive_at = 0.0
+            command_scope = False
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    payload = await operation_status_payload(
+                        operation_id, settings=settings, session=session
+                    )
+                except HTTPException as exc:
+                    error_payload = {
+                        "detail": exc.detail,
+                        "status_code": exc.status_code,
+                    }
+                    await session.rollback()
+                    yield f"event: error\ndata: {json.dumps(error_payload, separators=(',', ':'))}\n\n"
+                    break
+                await session.rollback()
+                running = str(payload.get("status") or "").lower() in ACTIVE_OPERATION_STATUSES
+                if running and payload.get("kind") == "output_exec" and not command_scope:
+                    await scopes.enter_async_context(
+                        operation_session_scope(settings.database_url)
+                    )
+                    command_scope = True
+                payload_json = json.dumps(payload, separators=(",", ":"))
+                now = asyncio.get_running_loop().time()
+                if payload_json != last_payload_json:
+                    yield f"event: operation\ndata: {payload_json}\n\n"
+                    last_payload_json = payload_json
+                    last_keepalive_at = now
+                elif now - last_keepalive_at >= 15:
+                    yield ": keepalive\n\n"
+                    last_keepalive_at = now
+                if not running:
+                    break
+                await asyncio.sleep(0.5)
 
     return StreamingResponse(
         stream(),

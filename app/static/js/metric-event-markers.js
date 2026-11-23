@@ -204,40 +204,6 @@
     tooltip.style.top = `${top}px`;
   };
 
-  const handlePointerMove = (chart, nativeEvent) => {
-    const rect = chart.canvas.getBoundingClientRect();
-    const x = nativeEvent.clientX - rect.left;
-    const y = nativeEvent.clientY - rect.top;
-    const options = markerOptionsForChart(chart);
-    if (!isInsideMarkerHoverArea(chart, x, y, options)) {
-      const hadActiveEvent = Boolean(chart.$cncMetricActiveEvent);
-      hideTooltip(chart);
-      if (hadActiveEvent) chart.draw();
-      return;
-    }
-    const marker = nearestMarker(chart, options, x);
-    if (!marker) {
-      const hadActiveEvent = Boolean(chart.$cncMetricActiveEvent);
-      hideTooltip(chart);
-      if (hadActiveEvent) chart.draw();
-      return;
-    }
-    const tooltip = ensureTooltip(chart);
-    if (!tooltip) return;
-    const previousEvent = chart.$cncMetricActiveEvent;
-    tooltip.innerHTML = tooltipHtml(marker.event, options?.formatTimestamp);
-    chart.canvas.classList.add("has-metric-event-hover");
-    chart.$cncMetricActiveEvent = marker.event;
-    placeTooltip(chart, tooltip, marker, y);
-    if (previousEvent !== marker.event) chart.draw();
-  };
-
-  const handlePointerLeave = (chart) => {
-    const hadActiveEvent = Boolean(chart.$cncMetricActiveEvent);
-    hideTooltip(chart);
-    if (hadActiveEvent) chart.draw();
-  };
-
   const plugin = {
     id: "cncMetricEventMarkers",
     afterInit(chart) {

@@ -108,6 +108,7 @@ require_vars() {
   fi
   [[ -n "${GITHUB_REPO}" ]] || fail "GITHUB_REPO is not set and could not be inferred from git origin"
   [[ "${GITHUB_REPO}" == */* ]] || fail "invalid GITHUB_REPO=${GITHUB_REPO} (expected owner/repo)"
+  [[ -n "${DATABASE_URL:-}" ]] || fail "DATABASE_URL is required for release preflight. Set it in ${ENV_FILE}."
 }
 
 validate_path_guards() {
@@ -437,19 +438,13 @@ switch_release() {
   MIGRATION_BOUNDARY_CROSSED=1
   log "migration boundary crossed; old-release rollback is disabled after service restart begins"
   if ! systemctl restart "${CNC_SERVICE_NAME}"; then
-    log "service restart failed after migration boundary"
-    rollback_release_switch "${previous_target}" "${tmp_link}"
     fail "update failed while restarting ${CNC_SERVICE_NAME}"
   fi
 
   if ! systemctl is-active --quiet "${CNC_SERVICE_NAME}"; then
-    log "service active check failed after migration boundary"
-    rollback_release_switch "${previous_target}" "${tmp_link}"
     fail "${CNC_SERVICE_NAME} is not active"
   fi
   if ! verify_admin_service_write_paths; then
-    log "service write-path verification failed after migration boundary"
-    rollback_release_switch "${previous_target}" "${tmp_link}"
     fail "${CNC_SERVICE_NAME} cannot write required host runtime paths"
   fi
   if ! sync_backend_ssh_wrapper; then

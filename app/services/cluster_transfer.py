@@ -10,7 +10,7 @@ import shlex
 import shutil
 import tempfile
 import time
-from typing import Callable
+from typing import Any, Callable
 from uuid import uuid4
 
 from sqlalchemy import select
@@ -51,11 +51,13 @@ from app.services.replica_readiness import (
 )
 from app.services.operation_runtime import operation_progress_value
 from app.services.operations import OperationHandle, host_mutation_operation
+from app.services.app_healthchecks import probe_backend_health
 from app.services.placement_config import (
     apply_backend_placement,
     backend_has_local_runtime,
     read_backend_placement,
 )
+from app.services.remote_node import RemoteNodeExecutor
 from app.services.sandbox_profiles import app_sandbox_dir, get_app_sandbox_profile
 from app.services.ssh_options import SSH_BATCH_OPTIONS
 from app.services.thread_workers import HostMutationLifecycle
@@ -259,6 +261,7 @@ async def _transfer_backend(
         if pause_source:
             report(20, "Pausing source.")
             pause_started = True
+            _write_transfer_pause_marker(settings, backend.name, source_node)
             await lifecycle.run(
                 _set_source_paused, backend, settings, source_node, paused=True
             )
@@ -390,6 +393,8 @@ async def _transfer_backend(
                         f"host apply failed after transfer: {apply_response.message}"
                     )
                 lifecycle.mark_committed()
+                if pause_started:
+                    _clear_transfer_pause_marker(settings, backend.name)
                 if target_rollback is not None:
                     await lifecycle.finish(
                         _discard_target_rollback(
@@ -793,19 +798,10 @@ def _archive_local_backend(
     archive_guest(sandbox, bundle_path, container_name(backend.name))
 
 
-def _remote_guest_helper_script() -> str:
-    encoded = base64.b64encode(guest_helper_bytes()).decode("ascii")
-    return f"""python3 - <<'CNC_GUEST_HELPER'
-import base64, os
-from pathlib import Path
-path = Path('/usr/local/bin/cnc-prepare-guest')
-if path.is_symlink():
-    raise RuntimeError('Guest helper cannot be a symlink')
-temporary = path.with_name('.cnc-prepare-guest.tmp')
-temporary.write_bytes(base64.b64decode('{encoded}'))
-temporary.chmod(0o755)
-os.replace(temporary, path)
-CNC_GUEST_HELPER"""
+def _remote_executor(node: ClusterNode, settings: Settings) -> RemoteNodeExecutor:
+    return RemoteNodeExecutor(
+        str(node.node_uid), _node_ip(node), settings, run_command_fn=run_command
+    )
 
 
 def _archive_remote_backend(
@@ -815,18 +811,17 @@ def _archive_remote_backend(
     bundle_path: Path,
 ) -> None:
     remote_path = _remote_transfer_path(backend)
-    script = "\n".join(
-        [
-            "set -Eeuo pipefail",
-            _remote_guest_helper_script(),
-            "install -d -m 0755 /var/lib/cnc/cluster-transfers",
-            f"test -d {shlex.quote(str(Path('/var/lib/cnc/sandboxes') / backend.name))}",
-            f"/usr/local/bin/cnc-prepare-guest --archive /var/lib/cnc/sandboxes/{shlex.quote(backend.name)} --destination {shlex.quote(remote_path)} --name {shlex.quote(backend.name)}",
-        ]
-    )
+    executor = _remote_executor(node, settings)
     try:
-        _ssh_checked(node, settings, script)
-        _scp_checked(f"root@{_node_ip(node)}:{remote_path}", str(bundle_path), settings)
+        executor.invoke(
+            "archive_sandbox",
+            {
+                "backend": backend.name,
+                "remote_path": remote_path,
+                "guest_helper_b64": base64.b64encode(guest_helper_bytes()).decode("ascii"),
+            },
+        )
+        executor.scp_download(remote_path, bundle_path)
     finally:
         _cleanup_remote_transfer_path(node, settings, remote_path)
 
@@ -853,14 +848,23 @@ def _restore_local_backend(
             raise RuntimeError(
                 f"transfer bundle missing sandbox directory: {backend.name}"
             )
-        _stop_local_backend(backend, settings)
-        if target.exists():
-            shutil.move(str(target), str(rollback))
         try:
-            shutil.move(str(staged), str(target))
+            _stop_local_backend(backend, settings)
+            if target.exists():
+                target.rename(rollback)
+            staged.rename(target)
         except Exception:
             if rollback.exists() and not target.exists():
-                shutil.move(str(rollback), str(target))
+                rollback.rename(target)
+            if service_was_active:
+                _run_checked(
+                    ["systemctl", "start", quadlet_network_service_name(backend.name)],
+                    settings,
+                )
+                _run_checked(
+                    ["systemctl", "start", quadlet_container_service_name(backend.name)],
+                    settings,
+                )
             raise
         return TargetRollbackState(
             target_uid=LOCAL_NODE_UID,
@@ -870,6 +874,66 @@ def _restore_local_backend(
         )
     finally:
         shutil.rmtree(stage_parent, ignore_errors=True)
+
+
+def _remote_restore_payload(
+    backend: Backend,
+    settings: Settings,
+    node: ClusterNode,
+    remote_path: str,
+    *,
+    rollback: TargetRollbackState,
+) -> dict[str, object]:
+    network_asset_content, container_asset_content = _remote_quadlet_assets(
+        backend, settings, node
+    )
+    return {
+        "backend": backend.name,
+        "container": container_name(backend.name),
+        "network": network_name(backend.name),
+        "network_unit": quadlet_network_unit_name(backend.name),
+        "container_unit": quadlet_container_unit_name(backend.name),
+        "network_unit_content": network_asset_content,
+        "container_unit_content": container_asset_content,
+        "remote_path": remote_path,
+        "target_path": rollback.target_path,
+        "rollback_path": rollback.rollback_path,
+        "unit_backup_path": rollback.unit_backup_path,
+        "service_was_active": rollback.service_was_active,
+        "resource_mode": str(getattr(backend, "resource_mode", "auto") or "auto"),
+        "resource_size": str(getattr(backend, "resource_size", "small") or "small"),
+        "memory_high_override": getattr(backend, "memory_high_override", None),
+        "memory_max_override": getattr(backend, "memory_max_override", None),
+        "cpu_quota_override": getattr(backend, "cpu_quota_override", None),
+        "guest_helper_b64": base64.b64encode(guest_helper_bytes()).decode("ascii"),
+    }
+
+
+def _remote_fresh_setup_payload(
+    backend: Backend,
+    settings: Settings,
+    node: ClusterNode,
+    *,
+    rollback: TargetRollbackState,
+) -> dict[str, object]:
+    profile = get_app_sandbox_profile(backend.sandbox_profile)
+    payload = _remote_restore_payload(
+        backend, settings, node, "", rollback=rollback
+    )
+    payload.update(
+        {
+            "seed_image": profile.seed_image,
+            "provision_script": profile.provision_script,
+            "self_test_command": list(profile.self_test_command),
+            "profile_state": {
+                "sandbox_profile": profile.profile_id,
+                "seed_image": profile.seed_image,
+                "init_command": list(profile.init_command),
+                "seed_revision": profile.seed_revision,
+            },
+        }
+    )
+    return payload
 
 
 def _restore_remote_backend(
@@ -886,24 +950,16 @@ def _restore_remote_backend(
         prefix="transfer",
         service_was_active=_remote_backend_service_active(backend, settings, node),
     )
+    executor = _remote_executor(node, settings)
     remote_ready = False
     try:
-        _ssh_checked(
-            node,
-            settings,
-            "set -Eeuo pipefail\ninstall -d -m 0755 /var/lib/cnc/cluster-transfers",
-        )
+        executor.ssh("set -Eeuo pipefail\ninstall -d -m 0755 /var/lib/cnc/cluster-transfers")
         remote_ready = True
-        _scp_checked(str(bundle_path), f"root@{_node_ip(node)}:{remote_path}", settings)
-        _ssh_checked(
-            node,
-            settings,
-            _remote_restore_script(
-                backend,
-                settings,
-                node,
-                remote_path,
-                rollback=rollback,
+        executor.scp_upload(bundle_path, remote_path)
+        executor.invoke(
+            "restore_sandbox",
+            _remote_restore_payload(
+                backend, settings, node, remote_path, rollback=rollback
             ),
         )
     finally:
@@ -924,10 +980,9 @@ def _setup_remote_fresh_backend(
         prefix="fresh",
         service_was_active=_remote_backend_service_active(backend, settings, node),
     )
-    _ssh_checked(
-        node,
-        settings,
-        _remote_fresh_setup_script(backend, settings, node, rollback=rollback),
+    _remote_executor(node, settings).invoke(
+        "setup_fresh",
+        _remote_fresh_setup_payload(backend, settings, node, rollback=rollback),
     )
     return rollback
 
@@ -982,14 +1037,16 @@ def _observed_active(result: CommandResult) -> bool:
         return True
     if result.returncode in {3, 4} and state in {"inactive", "failed", "unknown"}:
         return False
-    raise RuntimeError(f"Cannot determine target service state: {result.stderr or state or result.returncode}")
+    raise RuntimeError(
+        f"Cannot determine target service state: {result.stderr or state or result.returncode}"
+    )
 
 
 def _cleanup_remote_transfer_path(
     node: ClusterNode, settings: Settings, remote_path: str
 ) -> None:
     try:
-        _ssh_checked(node, settings, f"rm -f {shlex.quote(remote_path)}")
+        _remote_executor(node, settings).ssh(f"rm -f {shlex.quote(remote_path)}")
     except Exception as exc:
         logger.warning(
             "cluster_transfer.remote_archive_cleanup_failed",
@@ -1045,278 +1102,44 @@ def _remote_quadlet_assets(
     )
 
 
-def _remote_restore_script(
-    backend: Backend,
-    settings: Settings,
-    node: ClusterNode,
-    remote_path: str,
-    *,
-    rollback: TargetRollbackState,
-) -> str:
-    container = container_name(backend.name)
-    network = network_name(backend.name)
-    network_unit = quadlet_network_unit_name(backend.name)
-    container_unit = quadlet_container_unit_name(backend.name)
-    network_asset_content, container_asset_content = _remote_quadlet_assets(
-        backend, settings, node
-    )
-    target_sandbox = str(Path("/var/lib/cnc/sandboxes") / backend.name)
-    return f"""set -Eeuo pipefail
-export DEBIAN_FRONTEND=noninteractive
-if ! command -v podman >/dev/null 2>&1 || ! command -v apparmor_parser >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
-  apt-get -qq update
-  apt-get -qq install -y podman curl ca-certificates apparmor python3 >/dev/null
-fi
-{_remote_guest_helper_script()}
-/usr/local/bin/cnc-prepare-guest
-install -d -m 0755 /var/lib/cnc/sandboxes /var/lib/cnc/cluster-transfers /etc/containers/systemd
-stage_dir="$(mktemp -d /var/lib/cnc/sandboxes/.cnc-transfer-stage-{shlex.quote(backend.name)}.XXXXXX)"
-rollback_dir={shlex.quote(rollback.rollback_path)}
-unit_backup_dir={shlex.quote(rollback.unit_backup_path)}
-target_sandbox={shlex.quote(target_sandbox)}
-network_asset=/etc/containers/systemd/{shlex.quote(network_unit)}
-container_asset=/etc/containers/systemd/{shlex.quote(container_unit)}
-previous_runtime_active={"1" if rollback.service_was_active else "0"}
-activated=0
-restore_previous_target() {{
-  set +e
-  systemctl stop {shlex.quote(container)}.service >/dev/null 2>&1 || true
-  podman rm -f {shlex.quote(container)} >/dev/null 2>&1 || true
-  systemctl stop {shlex.quote(network)}-network.service >/dev/null 2>&1 || true
-  if [ "$activated" = "1" ]; then
-    rm -rf "$target_sandbox"
-    if [ -e "$rollback_dir" ]; then
-      mv "$rollback_dir" "$target_sandbox"
-    fi
-    if [ -d "$unit_backup_dir" ]; then
-      if [ -e "$unit_backup_dir/{shlex.quote(network_unit)}" ]; then
-        cp -a "$unit_backup_dir/{shlex.quote(network_unit)}" "$network_asset"
-      else
-        rm -f "$network_asset"
-      fi
-      if [ -e "$unit_backup_dir/{shlex.quote(container_unit)}" ]; then
-        cp -a "$unit_backup_dir/{shlex.quote(container_unit)}" "$container_asset"
-      else
-        rm -f "$container_asset"
-      fi
-      systemctl daemon-reload >/dev/null 2>&1 || true
-      if [ "$previous_runtime_active" = "1" ]; then
-        systemctl start {shlex.quote(network)}-network.service >/dev/null 2>&1 || true
-        systemctl start {shlex.quote(container)}.service >/dev/null 2>&1 || true
-      fi
-    fi
-  fi
-  set -e
-}}
-cleanup() {{
-  status=$?
-  if [ "$status" -ne 0 ]; then
-    restore_previous_target || true
-  fi
-  rm -rf "$stage_dir"
-  exit "$status"
-}}
-trap cleanup EXIT
-{_remote_cleanup_command(f"systemctl stop {shlex.quote(container)}.service", "not loaded|not-found|not found|could not be found")}
-{_remote_cleanup_command(f"podman rm -f {shlex.quote(container)}", "no such container|does not exist|not found")}
-rm -rf "$rollback_dir" "$unit_backup_dir"
-mkdir -p "$unit_backup_dir"
-for asset in "$network_asset" "$container_asset"; do
-  if [ -e "$asset" ]; then
-    cp -a "$asset" "$unit_backup_dir/$(basename "$asset")"
-  fi
-done
-/usr/local/bin/cnc-prepare-guest --extract {shlex.quote(remote_path)} --destination "$stage_dir" --name {shlex.quote(backend.name)}
-test -d "$stage_dir/{shlex.quote(backend.name)}"
-if [ -e "$target_sandbox" ]; then
-  mv "$target_sandbox" "$rollback_dir"
-fi
-if ! mv "$stage_dir/{shlex.quote(backend.name)}" "$target_sandbox"; then
-  if [ -e "$rollback_dir" ] && [ ! -e "$target_sandbox" ]; then
-    mv "$rollback_dir" "$target_sandbox"
-  fi
-  exit 1
-fi
-activated=1
-cat > /etc/containers/systemd/{shlex.quote(network_unit)} <<'EOF'
-{network_asset_content}
-EOF
-cat > /etc/containers/systemd/{shlex.quote(container_unit)} <<'EOF'
-{container_asset_content}
-EOF
-systemctl daemon-reload
-systemctl start {shlex.quote(network)}-network.service >/dev/null
-systemctl start {shlex.quote(container)}.service >/dev/null
-"""
-
-
-def _remote_fresh_setup_script(
-    backend: Backend,
-    settings: Settings,
-    node: ClusterNode,
-    *,
-    rollback: TargetRollbackState,
-) -> str:
-    profile = get_app_sandbox_profile(backend.sandbox_profile)
-    container = container_name(backend.name)
-    network = network_name(backend.name)
-    network_unit = quadlet_network_unit_name(backend.name)
-    container_unit = quadlet_container_unit_name(backend.name)
-    network_asset_content, container_asset_content = _remote_quadlet_assets(
-        backend, settings, node
-    )
-    provision_line = (
-        'podman run --rm --rootfs "$stage_rootfs" /bin/bash -lc '
-        f"{shlex.quote(profile.provision_script)}"
-        if profile.provision_script.strip()
-        else ":"
-    )
-    self_test_line = (
-        'podman run --rm --rootfs "$stage_rootfs" '
-        + " ".join(shlex.quote(part) for part in profile.self_test_command)
-        if profile.self_test_command
-        else ":"
-    )
-    profile_state = json.dumps(
-        {
-            "sandbox_profile": profile.profile_id,
-            "seed_image": profile.seed_image,
-            "init_command": list(profile.init_command),
-            "seed_revision": profile.seed_revision,
-        },
-        indent=2,
-        sort_keys=True,
-    )
-    sandbox_dir = str(Path("/var/lib/cnc/sandboxes") / backend.name)
-    return f"""set -Eeuo pipefail
-export DEBIAN_FRONTEND=noninteractive
-if ! command -v podman >/dev/null 2>&1 || ! command -v apparmor_parser >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
-  apt-get -qq update
-  apt-get -qq install -y podman curl ca-certificates apparmor python3 >/dev/null
-fi
-{_remote_guest_helper_script()}
-/usr/local/bin/cnc-prepare-guest
-install -d -m 0755 /var/lib/cnc/sandboxes /etc/containers/systemd
-stage_dir="$(mktemp -d /var/lib/cnc/sandboxes/.cnc-fresh-stage-{container}.XXXXXX)"
-stage_sandbox="$stage_dir/{shlex.quote(backend.name)}"
-stage_rootfs="$stage_sandbox/rootfs"
-seed_container="{container}-seed-$$"
-rollback_dir={shlex.quote(rollback.rollback_path)}
-unit_backup_dir={shlex.quote(rollback.unit_backup_path)}
-target_sandbox={shlex.quote(sandbox_dir)}
-network_asset=/etc/containers/systemd/{shlex.quote(network_unit)}
-container_asset=/etc/containers/systemd/{shlex.quote(container_unit)}
-previous_runtime_active={"1" if rollback.service_was_active else "0"}
-activated=0
-restore_previous_target() {{
-  set +e
-  systemctl stop {shlex.quote(container)}.service >/dev/null 2>&1 || true
-  podman rm -f {shlex.quote(container)} >/dev/null 2>&1 || true
-  systemctl stop {shlex.quote(network)}-network.service >/dev/null 2>&1 || true
-  if [ "$activated" = "1" ]; then
-    rm -rf "$target_sandbox"
-    if [ -e "$rollback_dir" ]; then
-      mv "$rollback_dir" "$target_sandbox"
-    fi
-    if [ -d "$unit_backup_dir" ]; then
-      if [ -e "$unit_backup_dir/{shlex.quote(network_unit)}" ]; then
-        cp -a "$unit_backup_dir/{shlex.quote(network_unit)}" "$network_asset"
-      else
-        rm -f "$network_asset"
-      fi
-      if [ -e "$unit_backup_dir/{shlex.quote(container_unit)}" ]; then
-        cp -a "$unit_backup_dir/{shlex.quote(container_unit)}" "$container_asset"
-      else
-        rm -f "$container_asset"
-      fi
-      systemctl daemon-reload >/dev/null 2>&1 || true
-      if [ "$previous_runtime_active" = "1" ]; then
-        systemctl start {shlex.quote(network)}-network.service >/dev/null 2>&1 || true
-        systemctl start {shlex.quote(container)}.service >/dev/null 2>&1 || true
-      fi
-    fi
-  fi
-  set -e
-}}
-cleanup() {{
-  status=$?
-  if [ "$status" -ne 0 ]; then
-    restore_previous_target || true
-  fi
-  podman rm -f "$seed_container" >/dev/null 2>&1 || true
-  rm -rf "$stage_dir"
-  exit "$status"
-}}
-trap cleanup EXIT
-{_remote_cleanup_command(f"systemctl stop {shlex.quote(container)}.service", "not loaded|not-found|not found|could not be found")}
-{_remote_cleanup_command(f"podman rm -f {shlex.quote(container)}", "no such container|does not exist|not found")}
-{_remote_cleanup_command(f"systemctl stop {shlex.quote(network)}-network.service", "not loaded|not-found|not found|could not be found")}
-rm -rf "$rollback_dir" "$unit_backup_dir"
-mkdir -p "$unit_backup_dir"
-for asset in "$network_asset" "$container_asset"; do
-  if [ -e "$asset" ]; then
-    cp -a "$asset" "$unit_backup_dir/$(basename "$asset")"
-  fi
-done
-mkdir -p "$stage_rootfs"
-chmod 0700 "$stage_sandbox"
-podman pull {shlex.quote(profile.seed_image)} >/dev/null
-podman create --name "$seed_container" {shlex.quote(profile.seed_image)} /bin/true >/dev/null
-podman export "$seed_container" > "$stage_dir/seed.tar"
-/usr/local/bin/cnc-prepare-guest --extract-rootfs "$stage_dir/seed.tar" --destination "$stage_rootfs"
-podman rm -f "$seed_container" >/dev/null
-mkdir -p "$stage_rootfs/etc"
-test -e "$stage_rootfs/etc/machine-id" || : > "$stage_rootfs/etc/machine-id"
-{provision_line}
-{self_test_line}
-cat > "$stage_sandbox/profile.json" <<'EOF'
-{profile_state}
-EOF
-if [ -e "$target_sandbox" ]; then
-  mv "$target_sandbox" "$rollback_dir"
-fi
-if ! mv "$stage_sandbox" "$target_sandbox"; then
-  if [ -e "$rollback_dir" ] && [ ! -e "$target_sandbox" ]; then
-    mv "$rollback_dir" "$target_sandbox"
-  fi
-  exit 1
-fi
-activated=1
-cat > /etc/containers/systemd/{shlex.quote(network_unit)} <<'EOF'
-{network_asset_content}
-EOF
-cat > /etc/containers/systemd/{shlex.quote(container_unit)} <<'EOF'
-{container_asset_content}
-EOF
-systemctl daemon-reload
-systemctl start {shlex.quote(network)}-network.service >/dev/null
-systemctl start {shlex.quote(container)}.service >/dev/null
-"""
-
-
 def _verify_remote_backend(
     backend: Backend, settings: Settings, node: ClusterNode
 ) -> str:
-    return _verify_tcp(_node_ip(node), int(backend.port or 0), settings)
+    port = int(backend.port or 0)
+    if port <= 0:
+        raise RuntimeError("backend has no published port")
+    result = _remote_executor(node, settings).invoke(
+        "verify_health",
+        {
+            "host": _node_ip(node),
+            "port": port,
+            "container": container_name(backend.name),
+            "healthcheck_mode": str(backend.healthcheck_mode or "http"),
+            "healthcheck_path": str(backend.healthcheck_path or "/"),
+            "healthcheck_host_header": str(backend.healthcheck_host_header or ""),
+            "timeout_sec": max(15, min(int(settings.command_timeout_apply_sec), 90)),
+        },
+    )
+    return str(result.get("summary") or f"healthy at {_node_ip(node)}:{port}")
 
 
 def _verify_local_backend(backend: Backend, settings: Settings) -> str:
-    return _verify_tcp("127.0.0.1", int(backend.port or 0), settings)
-
-
-def _verify_tcp(host: str, port: int, settings: Settings) -> str:
+    port = int(backend.port or 0)
     if port <= 0:
         raise RuntimeError("backend has no published port")
-    script = f"timeout 8 bash -c '</dev/tcp/{shlex.quote(host)}/{port}'"
     deadline = time.monotonic() + max(
         15, min(int(settings.command_timeout_apply_sec), 90)
     )
-    last_message = "backend port is not reachable"
+    last_message = "backend healthcheck failed"
     while time.monotonic() < deadline:
-        result = run_command(["bash", "-lc", script], timeout_sec=10)
-        if result.ok:
-            return f"tcp reachable at {host}:{port}"
-        last_message = (result.stderr or result.stdout or last_message).strip()
+        probe = probe_backend_health(
+            backend, host="127.0.0.1", port=port, timeout_sec=5
+        )
+        if probe.ok:
+            if probe.http_status is not None:
+                return f"http {probe.http_status} at 127.0.0.1:{port}{probe.plan.path or '/'}"
+            return f"healthy at 127.0.0.1:{port}"
+        last_message = probe.error or last_message
         time.sleep(1)
     raise RuntimeError(last_message)
 
@@ -1328,13 +1151,108 @@ def _set_source_paused(
     *,
     paused: bool,
 ) -> None:
-    command = (
-        f"podman {'pause' if paused else 'unpause'} {container_name(backend.name)}"
-    )
     if node is None:
-        _run_checked(shlex.split(command), settings)
+        _run_checked(
+            ["podman", "pause" if paused else "unpause", container_name(backend.name)],
+            settings,
+        )
     else:
-        _ssh_checked(node, settings, command)
+        _remote_executor(node, settings).invoke(
+            "pause_container",
+            {"container": container_name(backend.name), "paused": paused},
+        )
+
+
+def _transfer_pause_marker_path(settings: Settings, backend_name: str) -> Path:
+    return settings.app_sandbox_dir / f".cnc-transfer-paused-{backend_name}.json"
+
+
+def _write_transfer_pause_marker(
+    settings: Settings, backend_name: str, source_node: ClusterNode | None
+) -> None:
+    path = _transfer_pause_marker_path(settings, backend_name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "backend": backend_name,
+        "container": container_name(backend_name),
+        "source_node_uid": str(source_node.node_uid) if source_node is not None else LOCAL_NODE_UID,
+        "source_node_ip": _node_ip(source_node) if source_node is not None else "",
+        "paused_at": datetime.now(UTC).isoformat(),
+    }
+    temp = path.with_name(f".{path.name}.tmp")
+    temp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    os.replace(temp, path)
+
+
+def _clear_transfer_pause_marker(settings: Settings, backend_name: str) -> None:
+    try:
+        _transfer_pause_marker_path(settings, backend_name).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def recover_interrupted_transfer_artifacts(settings: Settings) -> dict[str, Any]:
+    """Unpause any CNC-paused transfer source and remove stale rollback dirs on startup."""
+    unpaused: list[str] = []
+    removed_rollbacks: list[str] = []
+    errors: list[str] = []
+
+    if settings.app_sandbox_dir.is_dir():
+        for marker in sorted(settings.app_sandbox_dir.glob(".cnc-transfer-paused-*.json")):
+            if not marker.is_file():
+                continue
+            backend_name = marker.name.removeprefix(".cnc-transfer-paused-").removesuffix(".json")
+            try:
+                payload = json.loads(marker.read_text(encoding="utf-8"))
+                backend_name = str(payload.get("backend") or backend_name)
+                container = str(payload.get("container") or container_name(backend_name))
+                source_uid = str(payload.get("source_node_uid") or LOCAL_NODE_UID)
+                source_ip = str(payload.get("source_node_ip") or "").strip()
+                if source_uid == LOCAL_NODE_UID or not source_ip:
+                    result = run_command(
+                        ["podman", "unpause", container],
+                        timeout_sec=settings.command_timeout_status_sec,
+                    )
+                else:
+                    result = run_command(
+                        [
+                            "ssh",
+                            *SSH_BATCH_OPTIONS,
+                            f"root@{source_ip}",
+                            f"podman unpause {shlex.quote(container)}",
+                        ],
+                        timeout_sec=settings.command_timeout_apply_sec,
+                    )
+                if result.ok or "not paused" in (result.stderr or "").lower() or "no such container" in (result.stderr or "").lower():
+                    marker.unlink(missing_ok=True)
+                    unpaused.append(backend_name)
+                else:
+                    errors.append(
+                        f"unpause {backend_name}: {result.stderr or result.stdout}"
+                    )
+            except Exception as exc:
+                errors.append(f"unpause {backend_name}: {exc}")
+
+        for entry in sorted(settings.app_sandbox_dir.iterdir()):
+            if entry.is_dir() and entry.name.startswith(".cnc-transfer-rollback-"):
+                try:
+                    shutil.rmtree(entry)
+                    removed_rollbacks.append(str(entry))
+                except OSError as exc:
+                    errors.append(f"remove {entry}: {exc}")
+
+    if unpaused or removed_rollbacks or errors:
+        logger.warning(
+            "cluster_transfer.startup_recovery",
+            unpaused=unpaused,
+            removed_rollbacks=removed_rollbacks,
+            errors=errors,
+        )
+    return {
+        "unpaused": unpaused,
+        "removed_rollbacks": removed_rollbacks,
+        "errors": errors,
+    }
 
 
 async def _resume_source_after_failure(
@@ -1348,6 +1266,7 @@ async def _resume_source_after_failure(
         await lifecycle.run(
             _set_source_paused, backend, settings, node, paused=False
         )
+        _clear_transfer_pause_marker(settings, backend.name)
     except Exception as exc:
         # The transfer error stays the one raised; this one must still reach
         # the operator, since the source is left frozen until it is resumed.
@@ -1481,7 +1400,20 @@ def _restore_remote_target_rollback(
     node: ClusterNode,
     rollback: TargetRollbackState,
 ) -> None:
-    _ssh_checked(node, settings, _remote_restore_rollback_script(backend, rollback))
+    _remote_executor(node, settings).invoke(
+        "restore_rollback",
+        {
+            "backend": backend.name,
+            "container": container_name(backend.name),
+            "network": network_name(backend.name),
+            "network_unit": quadlet_network_unit_name(backend.name),
+            "container_unit": quadlet_container_unit_name(backend.name),
+            "target_path": rollback.target_path,
+            "rollback_path": rollback.rollback_path,
+            "unit_backup_path": rollback.unit_backup_path,
+            "service_was_active": rollback.service_was_active,
+        },
+    )
 
 
 def _discard_remote_target_rollback(
@@ -1489,92 +1421,27 @@ def _discard_remote_target_rollback(
     node: ClusterNode,
     rollback: TargetRollbackState,
 ) -> None:
-    paths = [rollback.rollback_path]
-    if rollback.unit_backup_path:
-        paths.append(rollback.unit_backup_path)
-    quoted_paths = " ".join(shlex.quote(path) for path in paths if path)
-    if quoted_paths:
-        _ssh_checked(node, settings, f"rm -rf {quoted_paths}")
-
-
-def _remote_restore_rollback_script(
-    backend: Backend, rollback: TargetRollbackState
-) -> str:
-    container = container_name(backend.name)
-    network = network_name(backend.name)
-    network_unit = f"{network}.network"
-    container_unit = f"{container}.container"
-    return f"""set -Eeuo pipefail
-target_path={shlex.quote(rollback.target_path)}
-rollback_path={shlex.quote(rollback.rollback_path)}
-unit_backup_dir={shlex.quote(rollback.unit_backup_path)}
-network_asset=/etc/containers/systemd/{shlex.quote(network_unit)}
-container_asset=/etc/containers/systemd/{shlex.quote(container_unit)}
-previous_runtime_active={"1" if rollback.service_was_active else "0"}
-systemctl stop {shlex.quote(container)}.service >/dev/null 2>&1 || true
-podman rm -f {shlex.quote(container)} >/dev/null 2>&1 || true
-systemctl stop {shlex.quote(network)}-network.service >/dev/null 2>&1 || true
-rm -rf "$target_path"
-if [ -e "$rollback_path" ]; then
-  mv "$rollback_path" "$target_path"
-fi
-if [ -d "$unit_backup_dir" ]; then
-  if [ -e "$unit_backup_dir/{shlex.quote(network_unit)}" ]; then
-    cp -a "$unit_backup_dir/{shlex.quote(network_unit)}" "$network_asset"
-  else
-    rm -f "$network_asset"
-  fi
-  if [ -e "$unit_backup_dir/{shlex.quote(container_unit)}" ]; then
-    cp -a "$unit_backup_dir/{shlex.quote(container_unit)}" "$container_asset"
-  else
-    rm -f "$container_asset"
-  fi
-  rm -rf "$unit_backup_dir"
-else
-  rm -f "$network_asset" "$container_asset"
-fi
-systemctl daemon-reload
-if [ "$previous_runtime_active" = "1" ]; then
-  systemctl start {shlex.quote(network)}-network.service >/dev/null
-  systemctl start {shlex.quote(container)}.service >/dev/null
-fi
-"""
+    _remote_executor(node, settings).invoke(
+        "discard_rollback",
+        {
+            "rollback_path": rollback.rollback_path,
+            "unit_backup_path": rollback.unit_backup_path,
+        },
+    )
 
 
 def _cleanup_remote_restored_target(
     backend: Backend, settings: Settings, node: ClusterNode
 ) -> None:
-    container = container_name(backend.name)
-    network = network_name(backend.name)
-    sandbox = str(Path("/var/lib/cnc/sandboxes") / backend.name)
-    _ssh_checked(
-        node,
-        settings,
-        "\n".join(
-            [
-                "set -Eeuo pipefail",
-                _remote_cleanup_command(
-                    f"systemctl stop {shlex.quote(container)}.service",
-                    "not loaded|not-found|not found|could not be found",
-                ),
-                _remote_cleanup_command(
-                    f"systemctl disable {shlex.quote(container)}.service",
-                    "not loaded|not-found|not found|could not be found",
-                ),
-                _remote_cleanup_command(
-                    f"podman rm -f {shlex.quote(container)}",
-                    "no such container|does not exist|not found",
-                ),
-                _remote_cleanup_command(
-                    f"systemctl stop {shlex.quote(network)}-network.service",
-                    "not loaded|not-found|not found|could not be found",
-                ),
-                f"rm -rf {shlex.quote(sandbox)}",
-                f"rm -f /etc/containers/systemd/{shlex.quote(network)}.network",
-                f"rm -f /etc/containers/systemd/{shlex.quote(container)}.container",
-                "systemctl daemon-reload",
-            ]
-        ),
+    _remote_executor(node, settings).invoke(
+        "cleanup_backend",
+        {
+            "backend": backend.name,
+            "container": container_name(backend.name),
+            "network": network_name(backend.name),
+            "network_unit": quadlet_network_unit_name(backend.name),
+            "container_unit": quadlet_container_unit_name(backend.name),
+        },
     )
 
 
@@ -1589,31 +1456,6 @@ def _run_cleanup_checked(
     if any(marker in lowered for marker in missing_markers):
         return
     raise RuntimeError(message)
-
-
-def _remote_cleanup_command(command: str, missing_pattern: str) -> str:
-    return (
-        f"if ! output=$({command} 2>&1); then "
-        f"printf '%s\\n' \"$output\" | grep -Eiq {shlex.quote(missing_pattern)} "
-        "|| { printf '%s\\n' \"$output\" >&2; exit 1; }; "
-        "fi"
-    )
-
-
-def _ssh_checked(node: ClusterNode, settings: Settings, script: str) -> None:
-    _run_checked(
-        [
-            "ssh",
-            *SSH_BATCH_OPTIONS,
-            f"root@{_node_ip(node)}",
-            f"bash -lc {shlex.quote(script)}",
-        ],
-        settings,
-    )
-
-
-def _scp_checked(source: str, destination: str, settings: Settings) -> None:
-    _run_checked(["scp", *SSH_BATCH_OPTIONS, source, destination], settings)
 
 
 def _run_checked(command: list[str], settings: Settings) -> None:

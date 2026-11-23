@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
+import stat
+import tempfile
 from typing import Iterator
 
 from app.services.apply_core import ApplyFailed, clip_output
@@ -23,6 +25,75 @@ tool_name = "nginx"
 phases = ("sync_files", "nginx_validate", "nginx_reload")
 
 PREFIX = "cnc-"
+
+
+HOST_NGINX_CONF_PATH = Path("/etc/nginx/nginx.conf")
+
+
+def _validate_managed_nginx_names(nginx_files: dict[str, str]) -> None:
+    for filename in sorted(nginx_files):
+        if not filename.startswith(PREFIX) or "/" in filename or "\\" in filename:
+            raise ApplyFailed(
+                f"invalid managed nginx filename: {filename}",
+                phase="sync_files",
+                details={"filename": filename},
+            )
+
+
+def _nginx_dir_differs(directory: Path, wanted: dict[str, str]) -> bool:
+    if not directory.exists():
+        return bool(wanted)
+    existing: dict[str, str] = {}
+    for entry in directory.iterdir():
+        if not entry.name.startswith(PREFIX):
+            continue
+        mode = entry.lstat().st_mode
+        if stat.S_ISDIR(mode):
+            continue
+        if not stat.S_ISREG(mode):
+            raise OSError(f"expected a regular managed file at {entry}")
+        existing[entry.name] = entry.read_text(encoding="utf-8")
+    return existing != dict(wanted)
+
+
+async def check(plan: Plan) -> None:
+    _validate_managed_nginx_names(plan.desired.nginx_files)
+    if plan.desired.nginx_container:
+        return
+    target_dir = plan.settings.nginx_generated_dir
+    with _staging_errors(plan, target_dir):
+        differs = _nginx_dir_differs(target_dir, plan.desired.nginx_files)
+    if not differs:
+        return
+    if not HOST_NGINX_CONF_PATH.is_file():
+        return
+    # Stage candidate generated files into a temp directory and validate with
+    # `nginx -t -c <temp_conf>` without touching live `/etc/nginx/generated`.
+    with tempfile.TemporaryDirectory(prefix="cnc-nginx-preflight-") as stage_name:
+        stage_dir = Path(stage_name)
+        generated_dir = stage_dir / "generated"
+        generated_dir.mkdir(parents=True, exist_ok=True)
+        for filename, content in sorted(plan.desired.nginx_files.items()):
+            (generated_dir / filename).write_text(content, encoding="utf-8")
+        try:
+            host_conf = HOST_NGINX_CONF_PATH.read_text(encoding="utf-8")
+        except OSError:
+            return
+        generated_pattern = str(plan.settings.nginx_generated_dir)
+        if generated_pattern not in host_conf:
+            return
+        staged_conf = stage_dir / "nginx.conf"
+        staged_conf.write_text(
+            host_conf.replace(generated_pattern, str(generated_dir)),
+            encoding="utf-8",
+        )
+        try:
+            await plan.services.runtime_services.run_command_checked_async(
+                ["nginx", "-t", "-c", str(staged_conf)],
+                timeout_sec=plan.settings.command_timeout_apply_sec,
+            )
+        except CommandError as exc:
+            raise _invalid_config(exc) from exc
 
 
 async def nginx(plan: Plan) -> bool:

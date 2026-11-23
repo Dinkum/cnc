@@ -23,10 +23,6 @@ tool_name = "shield"
 phases = ("shield_runtime",)
 
 
-def shield_wanted(desired: DesiredState, settings: Settings) -> bool:
-    return bool(desired.shield_required) or _assets_exist(settings)
-
-
 async def shield(plan: Plan) -> bool:
     if (
         not _assets_exist(plan.settings)

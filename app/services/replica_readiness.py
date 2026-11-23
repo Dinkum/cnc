@@ -226,7 +226,6 @@ async def backend_replica_readiness_status_map(
                 for uid in backend_node_uids.get(backend_id, ())
             )
         )
-        remote_uids = tuple(uid for uid in normalized_uids if uid != LOCAL_NODE_UID)
         contract_hash = replica_runtime_contract_hash(backend, settings)
         statuses: dict[str, ReplicaReadinessStatus] = {}
         for node_uid in normalized_uids:
@@ -243,15 +242,6 @@ async def backend_replica_readiness_status_map(
                 node=node,
                 row=row,
                 contract_hash=contract_hash,
-            )
-        for node_uid in remote_uids:
-            statuses.setdefault(
-                node_uid,
-                ReplicaReadinessStatus(
-                    node_uid=node_uid,
-                    ready=False,
-                    reason="node is not linked",
-                ),
             )
         result[backend_id] = statuses
     return result

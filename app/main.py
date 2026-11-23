@@ -15,6 +15,8 @@ from urllib.parse import urlparse
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.middleware.gzip import GZipMiddleware
+from starlette.types import ASGIApp, Receive, Scope, Send
 import uvicorn
 
 from app.access import build_access_required_response
@@ -522,6 +524,51 @@ async def _run_interrupted_cleanup_steps(settings) -> None:
     await fail_interrupted_operations(settings)
     await fail_interrupted_hardening_runs(settings)
     await fail_interrupted_backend_backups(settings)
+    await _run_startup_converge(settings)
+
+
+async def _run_startup_converge(settings: Settings) -> None:
+    """Heal any crash-interrupted transfer or host cutover toward committed DB state."""
+    from sqlalchemy import select
+    from app.database import SessionLocal
+    from app.models.entities import Backend, Input
+    from app.services.apply_service import run_apply
+    from app.services.cluster_transfer import recover_interrupted_transfer_artifacts
+    from app.services.config_change import full_reconcile
+
+    try:
+        await asyncio.to_thread(recover_interrupted_transfer_artifacts, settings)
+    except Exception as exc:
+        logger.warning("startup.transfer_recovery_failed", error=str(exc))
+
+    if not getattr(settings, "startup_converge_enabled", True):
+        return
+    try:
+        async with SessionLocal() as session:
+            has_backends = (
+                await session.execute(select(Backend.id).limit(1))
+            ).scalar_one_or_none()
+            has_inputs = (
+                await session.execute(select(Input.id).limit(1))
+            ).scalar_one_or_none()
+            if has_backends is None and has_inputs is None:
+                return
+            response = await run_apply(
+                session,
+                settings,
+                operation_kind="startup_converge",
+                actor="startup",
+                scope=full_reconcile("startup_converge").scope(),
+                emit_success_event=False,
+            )
+            if response.status != "success":
+                logger.warning(
+                    "startup.converge_failed",
+                    message=response.message,
+                    details=response.details,
+                )
+    except Exception as exc:
+        logger.warning("startup.converge_error", error=str(exc))
 
 
 async def _run_startup_runtime_asset_observation(app: FastAPI, settings) -> None:
@@ -703,6 +750,27 @@ async def _send_internal_error_notification(
         )
 
 
+class MetricsCompressionMiddleware:
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+        self.compressed = GZipMiddleware(app, minimum_size=1024, compresslevel=4)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        path = scope.get("path", "")
+        compress = (
+            scope["type"] == "http"
+            and scope.get("method") == "GET"
+            and (
+                path in {"/api/status", "/api/host/metrics-history"}
+                or (
+                    path.startswith("/api/backends/") and path.endswith("/metrics-history")
+                )
+            )
+            and not any(name == b"range" for name, _ in scope.get("headers", ()))
+        )
+        await (self.compressed if compress else self.app)(scope, receive, send)
+
+
 app = FastAPI(
     title="cnc admin",
     lifespan=lifespan,
@@ -714,6 +782,7 @@ app.add_middleware(
     RequestBodyLimitMiddleware,
     limits=ADMIN_UNAUTHENTICATED_BODY_LIMITS,
 )
+app.add_middleware(MetricsCompressionMiddleware)
 app.add_middleware(
     CNCTrustedHostMiddleware,
     allowed_hosts=list(_bootstrap_trusted_hosts(boot_settings)),

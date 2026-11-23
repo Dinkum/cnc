@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Callable
 
 from app.services.commands import (
     CommandError,
@@ -65,6 +65,44 @@ def inspect_container(container: str, timeout_sec: int) -> Inspection:
     return classify_inspection(
         run_command(["podman", "inspect", container], timeout_sec=timeout_sec)
     )
+
+
+def _container_rows_by_name(
+    result: CommandResult, containers: list[str], name_field: str
+) -> dict[str, dict[str, Any]]:
+    if result.timed_out:
+        return {}
+    names = set(containers)
+    rows = {}
+    for row in _parse_json_list(result.stdout) or []:
+        name = row.get(name_field)
+        if isinstance(name, str) and name.lstrip("/") in names:
+            rows[name.lstrip("/")] = row
+    return rows
+
+
+def inspect_container_batch(
+    containers: list[str],
+    timeout_sec: int,
+    *,
+    command_runner: Callable[[list[str], float], CommandResult] = run_command,
+) -> dict[str, dict[str, Any]]:
+    if not containers:
+        return {}
+    result = command_runner(["podman", "container", "inspect", *containers], timeout_sec)
+    return _container_rows_by_name(result, containers, "Name")
+
+
+def read_container_stats_batch(
+    containers: list[str], timeout_sec: int
+) -> dict[str, dict[str, Any]]:
+    if not containers:
+        return {}
+    result = run_command(
+        ["podman", "stats", "--no-stream", "--format", "json", *containers],
+        timeout_sec=timeout_sec,
+    )
+    return _container_rows_by_name(result, containers, "name")
 
 
 def inspect_network(network: str, timeout_sec: int) -> Inspection:

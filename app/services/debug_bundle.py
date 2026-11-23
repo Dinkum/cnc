@@ -10,6 +10,7 @@ from typing import Any
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from sqlalchemy import or_, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
@@ -36,7 +37,7 @@ from app.services.update_service import current_app_version
 ERROR_INST_RE = re.compile(r"^[0-9A-HJKMNPQRSTVWXYZ]{8}$")
 SECRET_KEY_RE = re.compile(
     r"(token|secret|password|passwd|cookie|csrf|access[_-]?code|access[_-]?key|"
-    r"shield[_-]?code|hash|private[_-]?key)",
+    r"shield[_-]?code|hash|private[_-]?key|user[_-]key|github[_-]readonly[_-]pat)",
     re.IGNORECASE,
 )
 MAX_TEXT_VALUE_CHARS = 4000
@@ -131,10 +132,36 @@ async def build_error_debug_bundle(
 async def build_support_debug_bundle(
     session: AsyncSession,
     settings: Settings,
+    *,
+    startup: dict[str, Any] | None = None,
+    cached_status: dict[str, Any] | None = None,
 ) -> DebugBundle:
     created_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
-    state = await _collect_support_state(session)
+    state_files = {
+        "backends": "backends",
+        "inputs": "inputs",
+        "operations": "operations",
+        "apply_runs": "apply-runs",
+        "control_events": "control-events",
+        "update_runs": "update-runs",
+        "update_checks": "update-checks",
+        "backups": "backups",
+        "cluster_nodes": "cluster-nodes",
+        "host_apply_state": "host-apply-state",
+        "backend_hardening_runs": "backend-hardening-runs",
+        "backend_resource_samples": "backend-resource-samples",
+        "host_resource_samples": "host-resource-samples",
+    }
+    try:
+        state = await _collect_support_state(session)
+        database_available = True
+    except SQLAlchemyError:
+        state = {key: [] for key in state_files}
+        database_available = False
     report = _build_support_report(settings, created_at, state)
+    if not database_available:
+        report["database"] = "unavailable"
+    runtime = {"startup": startup, "cached_status": cached_status}
     manifest = {
         "artifact": "cnc-support-bundle",
         "created_at": created_at,
@@ -145,20 +172,9 @@ async def build_support_debug_bundle(
             "report.json",
             "logs/app.log",
             "logs/app.events.jsonl",
-            "state/backends.json",
-            "state/inputs.json",
-            "state/operations.json",
-            "state/apply-runs.json",
-            "state/control-events.json",
-            "state/update-runs.json",
-            "state/update-checks.json",
-            "state/backups.json",
-            "state/cluster-nodes.json",
-            "state/host-apply-state.json",
-            "state/backend-hardening-runs.json",
-            "state/backend-resource-samples.json",
-            "state/host-resource-samples.json",
+            *(f"state/{name}.json" for name in state_files.values()),
             "diagnostics/host.json",
+            "diagnostics/runtime.json",
             "redaction.json",
         ],
     }
@@ -178,32 +194,10 @@ async def build_support_debug_bundle(
         _write_json(bundle, "report.json", report)
         bundle.writestr("logs/app.log", _redacted_log_tail(app_log_path))
         bundle.writestr("logs/app.events.jsonl", _redacted_log_tail(events_log_path))
-        _write_json(bundle, "state/backends.json", state["backends"])
-        _write_json(bundle, "state/inputs.json", state["inputs"])
-        _write_json(bundle, "state/operations.json", state["operations"])
-        _write_json(bundle, "state/apply-runs.json", state["apply_runs"])
-        _write_json(bundle, "state/control-events.json", state["control_events"])
-        _write_json(bundle, "state/update-runs.json", state["update_runs"])
-        _write_json(bundle, "state/update-checks.json", state["update_checks"])
-        _write_json(bundle, "state/backups.json", state["backups"])
-        _write_json(bundle, "state/cluster-nodes.json", state["cluster_nodes"])
-        _write_json(bundle, "state/host-apply-state.json", state["host_apply_state"])
-        _write_json(
-            bundle,
-            "state/backend-hardening-runs.json",
-            state["backend_hardening_runs"],
-        )
-        _write_json(
-            bundle,
-            "state/backend-resource-samples.json",
-            state["backend_resource_samples"],
-        )
-        _write_json(
-            bundle,
-            "state/host-resource-samples.json",
-            state["host_resource_samples"],
-        )
+        for key, name in state_files.items():
+            _write_json(bundle, f"state/{name}.json", state[key])
         _write_json(bundle, "diagnostics/host.json", _support_host_payload(settings))
+        _write_json(bundle, "diagnostics/runtime.json", _redact(runtime))
         _write_json(bundle, "redaction.json", redaction)
 
     stamp = created_at.replace("-", "").replace(":", "").replace("Z", "Z")

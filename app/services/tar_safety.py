@@ -42,7 +42,7 @@ def validate_safe_tar(
     }
     metadata_paths: set[PurePosixPath] = set()
 
-    for member in members or archive.getmembers():
+    for member in archive.getmembers() if members is None else members:
         relative_path = _validated_member_path(
             member, allow_relative_symlinks=allow_relative_symlinks
         )
@@ -138,7 +138,7 @@ def safe_extract_tar(
     metadata: list[tuple[tarfile.TarInfo, Path]] = []
     metadata_paths: set[PurePosixPath] = set()
 
-    for member in members or archive.getmembers():
+    for member in archive.getmembers() if members is None else members:
         relative_path = _validated_member_path(
             member, allow_relative_symlinks=allow_relative_symlinks
         )

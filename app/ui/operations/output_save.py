@@ -48,10 +48,6 @@ class _OutputSaveResult:
     extra_details: dict[str, object]
 
 
-def operator_validation_error(exc: ValidationError) -> str:
-    return str(exc)
-
-
 async def _update_output_save_operation_progress(
     operation: OperationHandle,
     *,

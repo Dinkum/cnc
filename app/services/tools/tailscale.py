@@ -34,6 +34,27 @@ def _default_services() -> Any:
     return default_apply_services()
 
 
+async def check(plan: Plan) -> None:
+    if converged(plan.desired, plan.settings, services=plan.services):
+        return
+    state_path = plan.settings.tailscale_serve_state_path
+    owned = read_tailscale_state(state_path) or read_tailscale_service_state(state_path)
+    if not plan.desired.tailscale_paths and not plan.desired.tailscale_services and not owned:
+        return
+    await _run_retryable_checked_command(
+        ["tailscale", "ip", "-4"],
+        timeout_sec=plan.settings.command_timeout_status_sec,
+        settings=plan.settings,
+        services=plan.services,
+    )
+    if plan.desired.tailscale_services:
+        await verify_tailscale_service_host_precheck(
+            plan.desired.tailscale_services,
+            plan.settings,
+            services=plan.services,
+        )
+
+
 async def tailscale(plan: Plan) -> bool:
     if converged(plan.desired, plan.settings, services=plan.services):
         plan.details["tailscale_paths"] = [

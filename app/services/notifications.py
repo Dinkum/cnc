@@ -16,7 +16,6 @@ from urllib import request as urllib_request
 from app.services.thread_workers import BoundedThreadWorker
 from app.config import Settings
 from app.logger import get_logger, redact_sensitive_text
-from app.services.file_locks import FileLock
 from app.services.retry import is_retryable_http_exception
 
 
@@ -30,6 +29,8 @@ PUSHOVER_EMERGENCY_RETRY_SEC = 300
 PUSHOVER_EMERGENCY_EXPIRE_SEC = 3600
 PUSHOVER_STATE_RETRY_TIMEOUT_SEC = 2.0
 PUSHOVER_TRANSIENT_RETRY_SEC = 5
+PUSHOVER_MAX_RETRY_SEC = 300
+PUSHOVER_OUTBOX_MAX_AGE_SEC = 3600
 PUSHOVER_DEDUPE_WINDOW_SEC = 300
 SENSITIVE_FACT_LABEL_RE = re.compile(
     r"(?:^|[ _-])(?:authorization|cookie|password|secret|token|access key|api key|csrf)(?:$|[ _-])",
@@ -373,109 +374,130 @@ def _enqueue_pushover_notification(
     return intent_id, False
 
 
-def _pushover_dispatch_lock_path(settings: Settings):
-    return settings.host_state_path.with_name(
-        f"{settings.host_state_path.name}.pushover-dispatch.lock"
-    )
+def _pushover_claim_expiration(settings: Settings, now: datetime) -> str:
+    return (now + timedelta(seconds=max(30, settings.command_timeout_status_sec * 3))).isoformat()
+
+
+def _pushover_retry_delay(attempts: int) -> timedelta:
+    return timedelta(seconds=min(
+        PUSHOVER_MAX_RETRY_SEC,
+        PUSHOVER_TRANSIENT_RETRY_SEC * (2 ** min(6, max(0, attempts - 1))),
+    ))
 
 
 def _dispatch_pushover_intent(settings: Settings, intent_id: str) -> PushoverResponse:
     from app.services.notification_state import NotificationStateTransaction
 
-    with FileLock(
-        settings.host_state_path,
-        lock_path=_pushover_dispatch_lock_path(settings),
-        timeout_sec=PUSHOVER_STATE_RETRY_TIMEOUT_SEC,
-    ):
-        with NotificationStateTransaction(
-            settings, lock_timeout_sec=PUSHOVER_STATE_RETRY_TIMEOUT_SEC
-        ) as state:
-            intent = state.get_pushover_outbox().get(intent_id)
-        if not isinstance(intent, dict):
+    now = datetime.now(UTC)
+    claim = _pushover_claim_expiration(settings, now)
+    with NotificationStateTransaction(
+        settings, lock_timeout_sec=PUSHOVER_STATE_RETRY_TIMEOUT_SEC
+    ) as state:
+        outbox = state.get_pushover_outbox()
+        intent = outbox.get(intent_id)
+        if intent is None:
             return PushoverResponse(accepted=True)
-        next_attempt_at = _parse_timestamp(intent.get("next_attempt_at"))
-        if next_attempt_at is not None and next_attempt_at > datetime.now(UTC):
+        emergency_key = str(intent.get("emergency_key") or "")
+        if emergency_key and state.get_pushover_receipt(emergency_key).get("cancel_requested"):
+            raise PushoverTransientError("previous pushover emergency cancellation is pending")
+        if any(
+            _timestamp_in_future(item.get("dispatch_until"), now)
+            for item in outbox.values()
+        ):
+            raise PushoverTransientError("pushover delivery is already in progress")
+        if _timestamp_in_future(intent.get("next_attempt_at"), now):
             raise PushoverTransientError("pushover notification is queued for retry")
-        try:
-            result = _send_pushover_notification(
-                settings,
-                title=str(intent.get("title") or ""),
-                message=str(intent.get("message") or ""),
-                priority=int(intent.get("priority") or 0),
-                url=str(intent.get("url") or "") or None,
-                url_title=str(intent.get("url_title") or "") or None,
-                monospace=bool(intent.get("monospace", True)),
-                retry=(
-                    int(intent["retry"])
-                    if isinstance(intent.get("retry"), int)
-                    else None
-                ),
-                expire=(
-                    int(intent["expire"])
-                    if isinstance(intent.get("expire"), int)
-                    else None
-                ),
-                return_result=True,
-            )
-            response = (
-                result
-                if isinstance(result, PushoverResponse)
-                else PushoverResponse(accepted=bool(result))
-            )
-        except Exception as exc:
-            with NotificationStateTransaction(
-                settings, lock_timeout_sec=PUSHOVER_STATE_RETRY_TIMEOUT_SEC
-            ) as state:
-                current = state.get_pushover_outbox().get(intent_id)
-                if isinstance(current, dict):
-                    if _pushover_error_is_retryable(exc):
-                        current["attempts"] = int(current.get("attempts") or 0) + 1
-                        current["next_attempt_at"] = (
-                            datetime.now(UTC)
-                            + timedelta(seconds=PUSHOVER_TRANSIENT_RETRY_SEC)
-                        ).isoformat(timespec="seconds")
-                        current["last_error"] = _single_line(
-                            redact_sensitive_text(exc), 240
-                        )
-                        state.set_pushover_outbox_entry(intent_id, current)
-                    else:
-                        state.remove_pushover_outbox_entry(intent_id)
-            raise
+        created_at = _parse_timestamp(intent.get("created_at"))
+        max_age = PUSHOVER_OUTBOX_MAX_AGE_SEC
+        if intent.get("priority") == 2 and isinstance(intent.get("expire"), int):
+            max_age = min(max_age, intent["expire"])
+        expired = created_at is not None and now - created_at > timedelta(seconds=max_age)
+        if expired or intent.get("cancel_requested"):
+            state.remove_pushover_outbox_entry(intent_id)
+        else:
+            intent["dispatch_until"] = claim
+            state.set_pushover_outbox_entry(intent_id, intent)
+    if expired:
+        raise PushoverRejectedError("pushover notification expired before delivery")
+    if intent.get("cancel_requested"):
+        raise PushoverRejectedError("pushover notification was cancelled")
 
+    try:
+        result = _send_pushover_notification(
+            settings,
+            title=str(intent.get("title") or ""),
+            message=str(intent.get("message") or ""),
+            priority=int(intent.get("priority") or 0),
+            url=str(intent.get("url") or "") or None,
+            url_title=str(intent.get("url_title") or "") or None,
+            monospace=bool(intent.get("monospace", True)),
+            retry=intent["retry"] if isinstance(intent.get("retry"), int) else None,
+            expire=intent["expire"] if isinstance(intent.get("expire"), int) else None,
+            return_result=True,
+        )
+        response = (
+            result if isinstance(result, PushoverResponse)
+            else PushoverResponse(accepted=bool(result))
+        )
+    except Exception as exc:
         with NotificationStateTransaction(
             settings, lock_timeout_sec=PUSHOVER_STATE_RETRY_TIMEOUT_SEC
         ) as state:
-            state.remove_pushover_outbox_entry(intent_id)
-            normalized_dedupe_key = str(intent.get("dedupe_key") or "")
-            if normalized_dedupe_key:
-                state.set_pushover_delivery(
-                    normalized_dedupe_key,
-                    {
-                        "intent_id": intent_id,
-                        "delivered_at": _utc_timestamp(),
-                        "provider_request_id": response.request_id,
-                    },
-                )
-            normalized_emergency_key = str(intent.get("emergency_key") or "").strip()
-            if normalized_emergency_key and response.receipt:
-                state.set_pushover_receipt(
-                    normalized_emergency_key,
-                    {
-                        "receipt": response.receipt,
-                        "intent_id": intent_id,
-                        "created_at": _utc_timestamp(),
-                    },
-                )
-        return response
+            current = state.get_pushover_outbox().get(intent_id)
+            if current and current.get("dispatch_until") == claim:
+                if _pushover_error_is_retryable(exc) and not current.get("cancel_requested"):
+                    attempts = int(current.get("attempts") or 0) + 1
+                    current.pop("dispatch_until", None)
+                    current.update(
+                        attempts=attempts,
+                        next_attempt_at=(datetime.now(UTC) + _pushover_retry_delay(attempts)).isoformat(),
+                        last_error=_single_line(redact_sensitive_text(exc), 240),
+                    )
+                    state.set_pushover_outbox_entry(intent_id, current)
+                else:
+                    state.remove_pushover_outbox_entry(intent_id)
+        raise
+
+    with NotificationStateTransaction(
+        settings, lock_timeout_sec=PUSHOVER_STATE_RETRY_TIMEOUT_SEC
+    ) as state:
+        current = state.get_pushover_outbox().get(intent_id)
+        if not current or current.get("dispatch_until") != claim:
+            return response
+        state.remove_pushover_outbox_entry(intent_id)
+        cancelled = bool(current.get("cancel_requested"))
+        dedupe_key = str(intent.get("dedupe_key") or "")
+        if dedupe_key and not cancelled and response.accepted:
+            state.set_pushover_delivery(dedupe_key, {
+                "intent_id": intent_id,
+                "delivered_at": _utc_timestamp(),
+                "provider_request_id": response.request_id,
+            })
+        if emergency_key and response.receipt:
+            state.set_pushover_receipt(emergency_key, {
+                "receipt": response.receipt,
+                "intent_id": intent_id,
+                "created_at": _utc_timestamp(),
+                "expire": intent.get("expire") or PUSHOVER_EMERGENCY_EXPIRE_SEC,
+                "cancel_requested": cancelled,
+            })
+    return response
 
 
-def _pending_pushover_intents(settings: Settings) -> list[dict[str, Any]]:
+def _timestamp_in_future(value: object, now: datetime) -> bool:
+    timestamp = _parse_timestamp(value)
+    return timestamp is not None and timestamp > now
+
+
+def _pending_pushover_work(
+    settings: Settings,
+) -> tuple[list[str], list[dict[str, Any]]]:
     from app.services.notification_state import NotificationStateTransaction
 
     with NotificationStateTransaction(
         settings, lock_timeout_sec=PUSHOVER_STATE_RETRY_TIMEOUT_SEC
     ) as state:
-        return sorted(
+        return state.pending_pushover_cancellations(), sorted(
             state.get_pushover_outbox().values(),
             key=lambda entry: str(entry.get("created_at") or ""),
         )
@@ -487,7 +509,9 @@ async def dispatch_pending_pushover_notifications_async(
     if not pushover_is_configured(settings):
         return 0
     try:
-        pending = await _notification_workers.run(_pending_pushover_intents, settings)
+        cancellations, pending = await _notification_workers.run(
+            _pending_pushover_work, settings
+        )
     except Exception as exc:
         logger.error(
             "notification.pushover.outbox_read_failed",
@@ -498,6 +522,16 @@ async def dispatch_pending_pushover_notifications_async(
     delivered = 0
     now = datetime.now(UTC)
     attempted = 0
+    for emergency_key in cancellations[:max(0, limit)]:
+        try:
+            await _notification_workers.run(
+                _cancel_pushover_emergency, settings, emergency_key, request_cancel=False
+            )
+        except Exception as exc:
+            logger.warning(
+                "notification.pushover.pending_cancel_failed",
+                emergency_key=emergency_key, **_notification_error_context(exc),
+            )
     for intent in pending:
         if attempted >= max(0, limit):
             break
@@ -509,16 +543,30 @@ async def dispatch_pending_pushover_notifications_async(
             continue
         attempted += 1
         try:
-            await _notification_workers.run(
+            response = await _notification_workers.run(
                 _dispatch_pushover_intent, settings, intent_id
             )
-            delivered += 1
+            delivered += int(response.accepted)
         except Exception as exc:
             logger.warning(
                 "notification.pushover.pending_failed",
                 intent_id=intent_id,
                 **_notification_error_context(exc),
             )
+            if not _pushover_error_is_retryable(exc):
+                await _notification_workers.run(
+                    _record_pushover_delivery_state,
+                    settings,
+                    status="failed",
+                    event=str(intent.get("event") or ""),
+                    source=str(intent.get("source") or ""),
+                    backend=str(intent.get("backend") or ""),
+                    run_id=intent.get("run_id"),
+                    title=str(intent.get("title") or ""),
+                    priority=int(intent.get("priority") or 0),
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                )
     return delivered
 
 
@@ -600,6 +648,19 @@ def _send_pushover_notification_once(
         ) as response:
             body = response.read().decode("utf-8")
     except urllib_error.HTTPError as exc:
+        if exc.code == 429:
+            reset = exc.headers.get("X-Limit-App-Reset") if exc.headers else ""
+            suffix = ""
+            if reset and reset.isdigit():
+                try:
+                    reset_at = datetime.fromtimestamp(int(reset), UTC)
+                except (ValueError, OverflowError, OSError):
+                    pass
+                else:
+                    suffix = f". Quota resets at {reset_at.isoformat()}"
+            raise PushoverRejectedError(
+                f"pushover message quota exhausted (HTTP 429){suffix}"
+            ) from exc
         if 500 <= int(exc.code) <= 599:
             raise PushoverTransientError(
                 f"pushover temporarily unavailable (HTTP {exc.code})"
@@ -647,87 +708,106 @@ async def cancel_pushover_emergency_async(
     return cancelled
 
 
-def _cancel_pushover_emergency(settings: Settings, emergency_key: str) -> bool:
+def _cancel_pushover_emergency(
+    settings: Settings, emergency_key: str, *, request_cancel: bool = True
+) -> bool:
     from app.services.notification_state import NotificationStateTransaction
 
-    with FileLock(
-        settings.host_state_path,
-        lock_path=_pushover_dispatch_lock_path(settings),
-        timeout_sec=PUSHOVER_STATE_RETRY_TIMEOUT_SEC,
-    ):
-        with NotificationStateTransaction(
-            settings, lock_timeout_sec=PUSHOVER_STATE_RETRY_TIMEOUT_SEC
-        ) as state:
-            pending_removed = False
+    now = datetime.now(UTC)
+    claim = _pushover_claim_expiration(settings, now)
+    pending_removed = False
+    with NotificationStateTransaction(
+        settings, lock_timeout_sec=PUSHOVER_STATE_RETRY_TIMEOUT_SEC
+    ) as state:
+        if request_cancel:
             for intent_id, intent in state.get_pushover_outbox().items():
-                if str(intent.get("emergency_key") or "") == emergency_key:
+                if intent.get("emergency_key") != emergency_key:
+                    continue
+                if _timestamp_in_future(intent.get("dispatch_until"), now):
+                    intent["cancel_requested"] = True
+                    state.set_pushover_outbox_entry(intent_id, intent)
+                else:
                     state.remove_pushover_outbox_entry(intent_id)
-                    pending_removed = True
-            receipt_entry = state.get_pushover_receipt(emergency_key)
-        receipt = str(receipt_entry.get("receipt") or "").strip()
-        if not receipt:
+                pending_removed = True
+        entry = state.get_pushover_receipt(emergency_key)
+        receipt = str(entry.get("receipt") or "").strip()
+        if not receipt or not (request_cancel or entry.get("cancel_requested")):
             return pending_removed
-        data = urllib_parse.urlencode(
-            {"token": str(settings.pushover_app_token).strip()}
-        ).encode("utf-8")
-        request = urllib_request.Request(
-            PUSHOVER_RECEIPT_CANCEL_URL.format(
-                receipt=urllib_parse.quote(receipt, safe="")
-            ),
-            data=data,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            method="POST",
-        )
-        try:
-            with urllib_request.urlopen(
-                request, timeout=settings.command_timeout_status_sec
-            ) as response:
-                body = response.read().decode("utf-8")
-        except urllib_error.HTTPError as exc:
-            if 500 <= int(exc.code) <= 599:
-                raise PushoverTransientError(
-                    f"pushover receipt cancellation unavailable (HTTP {exc.code})"
-                ) from exc
-            with NotificationStateTransaction(
-                settings, lock_timeout_sec=PUSHOVER_STATE_RETRY_TIMEOUT_SEC
-            ) as state:
-                state.remove_pushover_receipt(emergency_key)
-            raise PushoverRejectedError(
-                f"pushover rejected receipt cancellation (HTTP {exc.code})"
-            ) from exc
-        except (urllib_error.URLError, TimeoutError, OSError) as exc:
-            raise PushoverTransientError(
-                "pushover receipt cancellation failed transiently"
-            ) from exc
-        try:
-            decoded = json.loads(body)
-        except json.JSONDecodeError as exc:
-            raise PushoverRejectedError(
-                "pushover returned an invalid cancellation response"
-            ) from exc
-        if int(decoded.get("status") or 0) != 1:
-            raise PushoverRejectedError("pushover rejected receipt cancellation")
+        created_at = _parse_timestamp(entry.get("created_at"))
+        expire = entry.get("expire")
+        if not isinstance(expire, int):
+            expire = PUSHOVER_EMERGENCY_EXPIRE_SEC
+        if created_at is not None and now - created_at > timedelta(seconds=expire):
+            state.remove_pushover_receipt(emergency_key)
+            return pending_removed
+        if _timestamp_in_future(entry.get("cancel_until"), now):
+            return pending_removed
+        if _timestamp_in_future(entry.get("next_cancel_at"), now):
+            return pending_removed
+        entry.update(cancel_requested=True, cancel_until=claim)
+        state.set_pushover_receipt(emergency_key, entry)
+
+    try:
+        _cancel_pushover_receipt(settings, receipt)
+    except PushoverDeliveryError as exc:
         with NotificationStateTransaction(
             settings, lock_timeout_sec=PUSHOVER_STATE_RETRY_TIMEOUT_SEC
         ) as state:
+            current = state.get_pushover_receipt(emergency_key)
+            if current.get("cancel_until") == claim:
+                if exc.retryable:
+                    attempts = int(current.get("cancel_attempts") or 0) + 1
+                    current.pop("cancel_until", None)
+                    current.update(
+                        cancel_attempts=attempts,
+                        next_cancel_at=(datetime.now(UTC) + _pushover_retry_delay(attempts)).isoformat(),
+                    )
+                    state.set_pushover_receipt(emergency_key, current)
+                else:
+                    state.remove_pushover_receipt(emergency_key)
+        raise
+    with NotificationStateTransaction(
+        settings, lock_timeout_sec=PUSHOVER_STATE_RETRY_TIMEOUT_SEC
+    ) as state:
+        current = state.get_pushover_receipt(emergency_key)
+        if current.get("cancel_until") == claim:
             state.remove_pushover_receipt(emergency_key)
-        return True
+    return True
 
 
-def build_failure_message(
-    *,
-    summary: str,
-    details: dict[str, Any] | None = None,
-) -> str:
-    details = details if isinstance(details, dict) else {}
-    phase = str(details.get("phase") or details.get("failed_phase") or "").strip()
-    error = str(details.get("error") or details.get("stderr") or "").strip()
-    parts = [summary.strip()]
-    if phase:
-        parts.append(f"phase: {phase}")
-    if error:
-        parts.append(f"error: {_single_line(error, 240)}")
-    return "\n".join(part for part in parts if part)
+def _cancel_pushover_receipt(settings: Settings, receipt: str) -> None:
+    data = urllib_parse.urlencode(
+        {"token": str(settings.pushover_app_token).strip()}
+    ).encode("utf-8")
+    request = urllib_request.Request(
+        PUSHOVER_RECEIPT_CANCEL_URL.format(
+            receipt=urllib_parse.quote(receipt, safe="")
+        ),
+        data=data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with urllib_request.urlopen(
+            request, timeout=settings.command_timeout_status_sec
+        ) as response:
+            body = response.read().decode("utf-8")
+    except urllib_error.HTTPError as exc:
+        if 500 <= int(exc.code) <= 599:
+            raise PushoverTransientError(
+                f"pushover receipt cancellation unavailable (HTTP {exc.code})"
+            ) from exc
+        raise PushoverRejectedError(
+            f"pushover rejected receipt cancellation (HTTP {exc.code})"
+        ) from exc
+    except (urllib_error.URLError, TimeoutError, OSError) as exc:
+        raise PushoverTransientError("pushover receipt cancellation failed transiently") from exc
+    try:
+        accepted = int(json.loads(body).get("status") or 0) == 1
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise PushoverRejectedError("pushover returned an invalid cancellation response") from exc
+    if not accepted:
+        raise PushoverRejectedError("pushover rejected receipt cancellation")
 
 
 def build_operator_message(

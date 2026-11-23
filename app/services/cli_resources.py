@@ -1,16 +1,15 @@
 
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
-from collections.abc import AsyncIterator
+from contextlib import AbstractAsyncContextManager
 
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import Settings
 from app.services.config_change import converge_change, input_edit, output_edit
-from app.database import create_configured_async_engine
+from app.database import isolated_database_session
 from app.models.entities import Backend, Input
 from app.schemas.backends import BackendIn, BackendOut, BackendUpdate
 from app.schemas.inputs import InputIn, InputOut, InputUpdate
@@ -18,14 +17,8 @@ from app.services import backend_commands, input_commands
 from app.services.operations import host_mutation_operation
 
 
-@asynccontextmanager
-async def resource_session(settings: Settings) -> AsyncIterator[AsyncSession]:
-    engine = create_configured_async_engine(settings.database_url)
-    try:
-        async with async_sessionmaker(engine, expire_on_commit=False)() as session:
-            yield session
-    finally:
-        await engine.dispose()
+def resource_session(settings: Settings) -> AbstractAsyncContextManager[AsyncSession]:
+    return isolated_database_session(settings.database_url)
 
 
 def output_payload(item: Backend) -> dict[str, object]:

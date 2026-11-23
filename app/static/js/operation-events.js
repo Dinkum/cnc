@@ -1,6 +1,7 @@
 (() => {
   const RUNNING_STATUSES = new Set(["queued", "running"]);
   const TERMINAL_STATUSES = new Set(["success", "failed", "unknown"]);
+  const activeRequests = new Map();
 
   const operationUrl = (operationId) => `/api/operations/${encodeURIComponent(operationId)}`;
   const operationEventsUrl = (operationId) => `/api/operations/${encodeURIComponent(operationId)}/events`;
@@ -119,16 +120,27 @@
     const handleRetry = async (error, meta = {}) => {
       if (settle.isTerminal()) return;
       pollFailures += 1;
+      const exhausted = Number.isFinite(maxPollFailures) && pollFailures >= maxPollFailures;
       const nextRetryDelayMs = retryDelay();
-      await handlers.onRetry?.({
-        error,
-        attempt: pollFailures,
-        maxAttempts: maxPollFailures,
-        retryDelayMs: nextRetryDelayMs,
-        exhausted: Number.isFinite(maxPollFailures) && pollFailures > maxPollFailures,
-        ...meta,
-      });
-      schedulePoll(nextRetryDelayMs);
+      if (exhausted) settle.beginTerminal();
+      try {
+        await handlers.onRetry?.({
+          error,
+          attempt: pollFailures,
+          maxAttempts: maxPollFailures,
+          retryDelayMs: nextRetryDelayMs,
+          exhausted,
+          ...meta,
+        });
+        if (exhausted) {
+          await handlers.onError?.(error);
+          settle.reject(error);
+          return;
+        }
+        schedulePoll(nextRetryDelayMs);
+      } catch (callbackError) {
+        settle.reject(callbackError);
+      }
     };
 
     const poll = async () => {
@@ -150,9 +162,9 @@
           await handleRetry(error, { status: response.status, transport: "poll" });
           return;
         }
-        pollFailures = 0;
         const payload = await response.json();
         const done = await dispatchPayload(payload, handlers, settle);
+        pollFailures = 0;
         if (!done) schedulePoll(pollIntervalMs);
       } catch (error) {
         await handleRetry(error instanceof Error ? error : new Error("operation poll failed"), { transport: "poll" });
@@ -195,14 +207,23 @@
     }
   });
 
-  const activeOperations = async (params = {}) => {
-    const response = await fetch(activeOperationsUrl(params), {
-      credentials: "same-origin",
-      headers: { Accept: "application/json" },
-    });
-    if (!response.ok) throw await responseError(response);
-    const payload = await response.json();
-    return Array.isArray(payload.operations) ? payload.operations : [];
+  const activeOperations = (params = {}) => {
+    const url = activeOperationsUrl(params);
+    if (!activeRequests.has(url)) {
+      const request = fetch(url, {
+        credentials: "same-origin",
+        headers: { Accept: "application/json" },
+      }).then(async (response) => {
+        if (!response.ok) throw await responseError(response);
+        const payload = await response.json();
+        return Array.isArray(payload.operations) ? payload.operations : [];
+      }).catch((error) => {
+        activeRequests.delete(url);
+        throw error;
+      });
+      activeRequests.set(url, request);
+    }
+    return activeRequests.get(url);
   };
 
   window.CNCOperations = {

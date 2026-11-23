@@ -11,10 +11,9 @@ from uuid import uuid4
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
-from app.database import create_configured_async_engine
 from app.logger import get_logger
 from app.models.entities import Backend, CommandJob, Operation
 from app.services import command_job_runtime as runtime
@@ -30,7 +29,11 @@ from app.services.guest_exec import (
     open_guest_exec_circuit,
     read_guest_exec_circuit,
 )
-from app.services.operations import try_acquire_host_mutation_lock
+from app.services.operations import (
+    _operation_session,
+    operation_session_scope,
+    try_acquire_host_mutation_lock,
+)
 
 
 logger = get_logger("command.jobs")
@@ -63,12 +66,8 @@ def submission_guard(settings: Settings) -> Iterator[None]:
 
 @asynccontextmanager
 async def job_session(settings: Settings) -> AsyncIterator[AsyncSession]:
-    engine = create_configured_async_engine(settings.database_url)
-    try:
-        async with async_sessionmaker(engine, expire_on_commit=False)() as session:
-            yield session
-    finally:
-        await engine.dispose()
+    async with _operation_session(settings.database_url) as session:
+        yield session
 
 
 async def _bounded_thread(function, *args):
@@ -313,43 +312,53 @@ async def submit_job(
     return await get_job(settings, operation_id, observe=False)
 
 
+def _job_payload(job: CommandJob, operation: Operation) -> dict:
+    return {
+        **json.loads(operation.details_json),
+        "operation_id": operation.id,
+        "kind": operation.kind,
+        "output": job.output_name,
+        "status": operation.status,
+        "phase": operation.phase,
+        "error": operation.error,
+        "request_key": job.request_key,
+        "cancel_requested": job.cancel_requested,
+    }
+
+
 async def get_job(
     settings: Settings, operation_id: int, *, observe: bool = True
 ) -> dict:
-    from sqlalchemy import case, update
-
-    def payload(job: CommandJob, operation: Operation) -> dict:
-        return {
-            **json.loads(operation.details_json),
-            "operation_id": operation_id,
-            "kind": operation.kind,
-            "output": job.output_name,
-            "status": operation.status,
-            "phase": operation.phase,
-            "error": operation.error,
-            "request_key": job.request_key,
-            "cancel_requested": job.cancel_requested,
-        }
-
-    async with job_session(settings) as session:
-        job = await session.get(CommandJob, operation_id)
-        operation = await session.get(Operation, operation_id)
-        if job is None or operation is None:
+    async with operation_session_scope(settings.database_url):
+        async with job_session(settings) as session:
+            record = (
+                await session.execute(
+                    select(CommandJob, Operation)
+                    .join(Operation, Operation.id == CommandJob.operation_id)
+                    .where(CommandJob.operation_id == operation_id)
+                )
+            ).one_or_none()
+        if record is None:
             raise CommandJobError(
                 "operation_not_found", "command operation not found", operation_id
             )
-        if operation.status not in ACTIVE:
-            release_job(
-                settings,
-                job.output_name,
-                operation_id,
-                execution_token=job.execution_token,
-            )
-            return payload(job, operation)
-        output = job.output_name
-        container_id = job.container_id
-        container_started_at = job.container_started_at
-        execution_token = job.execution_token
+        job, operation = record
+        return await _observe_job(settings, job, operation, observe=observe)
+
+
+async def _observe_job(
+    settings: Settings, job: CommandJob, operation: Operation, *, observe: bool
+) -> dict:
+    from sqlalchemy import case, update
+
+    operation_id = operation.id
+    output = job.output_name
+    execution_token = job.execution_token
+    if operation.status not in ACTIVE:
+        release_job(settings, output, operation_id, execution_token=execution_token)
+        return _job_payload(job, operation)
+    container_id = job.container_id
+    container_started_at = job.container_started_at
 
     result = None
     unreadable = False
@@ -377,7 +386,7 @@ async def get_job(
                 "operation_not_found", "command operation not found", operation_id
             )
         if job.execution_token != execution_token:
-            return payload(job, operation)
+            return _job_payload(job, operation)
         values = {}
         if operation.status in ACTIVE:
             if result is not None:
@@ -443,7 +452,7 @@ async def get_job(
                 await session.rollback()
             await session.refresh(operation)
             await session.refresh(job)
-        response = payload(job, operation)
+        response = _job_payload(job, operation)
     if response["status"] not in ACTIVE:
         release_job(settings, output, operation_id, execution_token=execution_token)
     return response
@@ -523,19 +532,20 @@ async def job_logs(
 async def list_jobs(settings: Settings, output: str, limit: int = 20) -> dict:
     if type(limit) is not int or not 1 <= limit <= 100:
         raise CommandJobError("invalid_limit", "limit must be between 1 and 100")
-    async with job_session(settings) as session:
-        ids = list(
-            (
+    async with operation_session_scope(settings.database_url):
+        async with job_session(settings) as session:
+            records = (
                 await session.execute(
-                    select(CommandJob.operation_id)
+                    select(CommandJob, Operation)
+                    .join(Operation, Operation.id == CommandJob.operation_id)
                     .where(CommandJob.output_name == output)
                     .order_by(CommandJob.operation_id.desc())
                     .limit(limit)
                 )
-            ).scalars()
-        )
-    return {
-        "operations": [
-            await get_job(settings, operation_id, observe=False) for operation_id in ids
-        ]
-    }
+            ).all()
+        return {
+            "operations": [
+                await _observe_job(settings, job, operation, observe=False)
+                for job, operation in records
+            ]
+        }

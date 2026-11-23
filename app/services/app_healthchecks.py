@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import http.client
+import io
+import socket
+import time
 from typing import Callable
 
 from app.models.entities import Backend, Input
@@ -166,6 +170,62 @@ def _http_probe_command(
     return command
 
 
+class _HealthcheckResponseReader(io.RawIOBase):
+    def __init__(self, connection: socket.socket, deadline: float) -> None:
+        self.connection = connection
+        self.deadline = deadline
+
+    def makefile(self, _mode: str) -> io.BufferedReader:
+        return io.BufferedReader(self)
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer) -> int:
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("healthcheck deadline exceeded")
+        self.connection.settimeout(remaining)
+        return self.connection.recv_into(buffer)
+
+
+def _probe_local_health(
+    plan: BackendHealthcheckPlan, host: str, port: int, timeout_sec: int
+) -> BackendHealthcheckProbeResult:
+    timeout = min(2, timeout_sec)
+    deadline = time.monotonic() + timeout
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as connection:
+            if plan.effective_mode == HEALTHCHECK_MODE_TCP:
+                return BackendHealthcheckProbeResult(ok=True, error="", plan=plan)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("healthcheck deadline exceeded")
+            connection.settimeout(remaining)
+            request = http.client.HTTPConnection(host, port)
+            request.sock = connection
+            headers = {"Accept": "*/*"}
+            if plan.host_header:
+                headers["Host"] = plan.host_header
+            request.request("GET", plan.path or "/", headers=headers)
+            reader = _HealthcheckResponseReader(connection, deadline)
+            with http.client.HTTPResponse(reader) as response:
+                response.begin()
+                while 100 <= response.status < 200 and response.status != 101:
+                    response.headers = None
+                    response.begin()
+                status = response.status
+    except (OSError, ValueError, http.client.HTTPException) as exc:
+        return BackendHealthcheckProbeResult(ok=False, error=str(exc), plan=plan)
+    ok = 200 <= status < 400
+    return BackendHealthcheckProbeResult(
+        ok=ok,
+        error="" if ok else f"http probe returned {status}",
+        plan=plan,
+        http_status=status,
+    )
+
+
 def probe_backend_health(
     backend: Backend,
     *,
@@ -183,6 +243,9 @@ def probe_backend_health(
             error=f"invalid healthcheck port: {port}",
             plan=plan,
         )
+
+    if command_runner is run_command:
+        return _probe_local_health(plan, host, port, timeout_sec)
 
     if plan.effective_mode == HEALTHCHECK_MODE_TCP:
         result = command_runner(_tcp_probe_command(host, port), timeout_sec)

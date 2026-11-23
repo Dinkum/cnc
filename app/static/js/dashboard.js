@@ -8,6 +8,7 @@
     loadDeferredScript,
     readJsonResponse,
     readJsonScript,
+    refreshCsrfTokens,
     renderLocalTimes,
     withRequestDeadline,
   } = window.CNCUI;
@@ -109,6 +110,11 @@
   const refreshHostMetricRefs = () => {
     hostMetricsShell = document.getElementById("host-metrics-shell");
     hostMetricsChart = document.getElementById("host-metrics-chart");
+    if (hostMetricsChartInstance && hostMetricsChartInstance.canvas !== hostMetricsChart) {
+      hostMetricsChartInstance.destroy();
+      hostMetricsChartInstance = null;
+      lastHostMetricPayload = null;
+    }
     hostMetricsSummary = document.getElementById("host-metrics-summary");
     hostMetricsEmpty = document.getElementById("host-metrics-empty");
     hostMetricSelect = document.getElementById("host-metric-select");
@@ -430,10 +436,6 @@
       renderHostMetricsSummary(payload);
       return;
     }
-    if (hostMetricsChartInstance) {
-      hostMetricsChartInstance.destroy();
-      hostMetricsChartInstance = null;
-    }
     if (!isFallback && !preservePayload) {
       lastHostMetricPayload = payload;
       syncHostMetricExport();
@@ -571,7 +573,7 @@
           },
         ];
 
-    hostMetricsChartInstance = new Chart(hostMetricsChart.getContext("2d"), {
+    const config = {
       type: "line",
       data: { datasets },
       plugins: [window.cncMetricEventMarkers?.plugin].filter(Boolean),
@@ -664,7 +666,14 @@
           },
         },
       },
-    });
+    };
+    if (hostMetricsChartInstance) {
+      hostMetricsChartInstance.data = config.data;
+      hostMetricsChartInstance.options = config.options;
+      hostMetricsChartInstance.update("none");
+    } else {
+      hostMetricsChartInstance = new Chart(hostMetricsChart.getContext("2d"), config);
+    }
   };
 
   const showHostMetricHistoryError = () => {
@@ -678,15 +687,12 @@
 
   const loadHostMetricHistory = async () => {
     refreshHostMetricRefs();
-    if (!hostMetricSelect || !hostTimeframeSelect || !hostMetricsChart || !hostMetricsEmpty) return;
+    if (!settingsMetricsPanelActive() || !hostMetricSelect || !hostTimeframeSelect || !hostMetricsChart || !hostMetricsEmpty) return;
     const requestId = ++hostMetricsRequestId;
     hostMetricsAbortController?.abort();
     const controller = new AbortController();
     hostMetricsAbortController = controller;
     try {
-      await ensureMetricChartAssets();
-      if (controller.signal.aborted || requestId !== hostMetricsRequestId) return;
-      renderLiveHostMetricsFallback("Loading host metric history.");
       const chartWidth = Math.round(
         hostMetricsChart.parentElement?.clientWidth || hostMetricsChart.clientWidth || 720
       );
@@ -695,16 +701,24 @@
         timeframe: hostTimeframeSelect.value,
         width: String(chartWidth),
       });
-      const response = await fetch(`/api/host/metrics-history?${query.toString()}`, {
+      const history = fetch(`/api/host/metrics-history?${query.toString()}`, {
         headers: { Accept: "application/json" },
         signal: controller.signal,
+      }).then((response) => {
+        if (!response.ok) throw new Error(`host metric history request failed: ${response.status}`);
+        return response.json();
       });
-      if (!response.ok) throw new Error(`host metric history request failed: ${response.status}`);
-      const payload = await response.json();
+      const chartAssets = ensureMetricChartAssets().then(() => {
+        if (!controller.signal.aborted && !hostMetricsChartInstance) {
+          renderLiveHostMetricsFallback("Loading host metric history.");
+        }
+      });
+      const [payload] = await Promise.all([history, chartAssets]);
       if (requestId !== hostMetricsRequestId) return;
       renderHostMetricsPayload(payload);
     } catch (error) {
       if (error?.name === "AbortError") return;
+      controller.abort();
       if (requestId === hostMetricsRequestId) showHostMetricHistoryError();
     } finally {
       if (hostMetricsAbortController === controller) hostMetricsAbortController = null;
@@ -744,23 +758,22 @@
     }
   };
 
-  const initializeHostMetricsPanel = async () => {
+  const initializeHostMetricsPanel = () => {
     refreshHostMetricRefs();
     if (!settingsMetricsPanelActive()) return;
     bindHostMetricControls(document);
-    if (hostMetricsShell.dataset.hostMetricsInitialized === "1") return;
+    if (hostMetricsShell.dataset.hostMetricsInitialized === "1") {
+      if (hostMetricsAbortController?.signal.aborted || (!lastHostMetricPayload && !hostMetricsAbortController)) loadHostMetricHistory();
+      else if (hostMetricsChartInstance) renderHostMetricsFromStatus(lastHostMetrics);
+      return;
+    }
+    hostMetricsShell.dataset.hostMetricsInitialized = "1";
     try {
-      await ensureMetricChartAssets();
-      if (!settingsMetricsPanelActive()) return;
-      hostMetricsShell.dataset.hostMetricsInitialized = "1";
       renderHostMetricsFromStatus(JSON.parse(hostMetricsShell.dataset.hostMetrics || "{}"));
     } catch (error) {
-      if (!settingsMetricsPanelActive()) return;
-      hostMetricsShell.dataset.hostMetricsInitialized = "1";
       console.error("host metric bootstrap failed", error);
       renderHostMetricsFromStatus({});
     }
-    if (!settingsMetricsPanelActive()) return;
     loadHostMetricHistory();
   };
 
@@ -770,6 +783,7 @@
     const nextMetrics = metrics && typeof metrics === "object" ? metrics : {};
     lastHostMetrics = nextMetrics;
     pushHostMetricSample(nextMetrics);
+    if (!settingsMetricsPanelActive() || !window.Chart) return;
     const metricKey = selectedHostMetricKey();
     const priorSummary = hostPayloadMatchesCurrentSelection(lastHostMetricPayload) && lastHostMetricPayload?.summary
       ? lastHostMetricPayload.summary
@@ -1566,20 +1580,6 @@
     hostMutationUiBusy = Math.max(0, hostMutationUiBusy - 1);
   };
 
-  const refreshCsrfTokens = async () => {
-    const response = await fetch("/api/csrf", {
-      credentials: "same-origin",
-      headers: { Accept: "application/json" },
-    });
-    const payload = await response.json().catch(() => ({}));
-    const token = String(payload.csrf_token || "").trim();
-    if (!response.ok || !token) return "";
-    document.querySelectorAll("input[name='csrf_token']").forEach((input) => {
-      input.value = token;
-    });
-    return token;
-  };
-
   const formatDuration = (value) => {
     const seconds = Number(value);
     if (!Number.isFinite(seconds)) return "";
@@ -1775,26 +1775,9 @@
     return Number.isFinite(progress) ? progress : fallback;
   };
 
-  const operationStage = (payload, fallbackTitle, steps) => {
-    const phase = String(payload?.phase || "").replace(/_/g, " ").trim();
-    const substate = String(payload?.details?.substate || "").trim();
-    const message = String(payload?.details?.message || payload?.error || "").trim();
-    const knownStep = knownProgressStep(steps, phase, substate) || knownProgressStep(steps, phase, message);
-    return {
-      headline: phase || knownStep?.headline || fallbackTitle,
-      note: substate || knownStep?.substep || message || knownStep?.note || "",
-      progress: knownStep ? Number(knownStep.progress) : null,
-    };
-  };
-
   const watchDashboardOperation = (operationId, { successTitle, errorTitle, startedAt, pipeline = "saveInput", refreshTab = "outputs", runningTitle = successTitle }) => new Promise((resolve, reject) => {
     const steps = saveProgressPipelines[pipeline] || saveProgressPipelines.saveInput;
-    const firstStep = steps[0] || {};
-    let lastProgress = Number(firstStep.progress) || 0;
-    let lastStage = {
-      headline: firstStep.headline || successTitle,
-      note: firstStep.substep || firstStep.note || "",
-    };
+    const tracker = window.CNCProgress.createTracker({ steps, fallbackTitle: runningTitle, startedAt });
     let lastPayload = null;
     let elapsedTimer = null;
 
@@ -1806,34 +1789,8 @@
 
     const renderOperationProgress = (payload) => {
       lastPayload = payload;
-      const details = payload.details || {};
-      const stage = operationStage(payload, successTitle, steps);
-      const progress = Number(details.progress);
-      const stageProgress = Number(stage.progress);
-      const progressCandidate = Number.isFinite(progress)
-        ? progress
-        : (Number.isFinite(stageProgress) ? stageProgress : lastProgress);
-      const progressRegressed = progressCandidate < lastProgress;
-      const stageRegressed = Number.isFinite(stageProgress) && stageProgress < lastProgress;
-      const displayProgress = !progressRegressed ? progressCandidate : lastProgress;
-      const displayStage = progressRegressed || stageRegressed ? lastStage : stage;
-      if (!progressRegressed) {
-        lastProgress = progressCandidate;
-      }
-      if (!progressRegressed && !stageRegressed) {
-        lastStage = stage;
-      }
-      showFloatingSave({
-        tone: "running",
-        title: runningTitle,
-        headline: displayStage.headline,
-        substep: displayStage.note,
-        note: displayStage.note,
-        meta: operationMeta(payload, startedAt),
-        progress: displayProgress,
-        steps,
-        activeIndex: progressStepIndex(steps, displayProgress),
-      });
+      const frame = tracker.frame(payload, { tone: "running" });
+      showFloatingSave({ ...frame, substep: frame.note, steps });
     };
 
     elapsedTimer = window.setInterval(() => {
@@ -1845,20 +1802,11 @@
       retryIntervalMs: 1800,
       maxPollFailures: 40,
       rejectOnFailure: true,
-      onRetry: ({ status }) => {
-        showFloatingSave({
-          tone: "running",
-          title: runningTitle,
-          headline: "Waiting for CNC",
-          substep: status ? `status poll returned ${status}; retrying` : "status stream interrupted; retrying",
-          note: status
-            ? `Status poll returned ${status}; retrying without stopping the operation.`
-            : "Status stream was interrupted; retrying without stopping the operation.",
-          meta: [],
-          progress: lastProgress,
-          steps,
-          activeIndex: progressStepIndex(steps, lastProgress),
-        });
+      onRetry: ({ status, exhausted }) => {
+        lastPayload = null;
+        const frame = tracker.retryFrame({ status });
+        if (exhausted) frame.note = "Progress updates paused. Reload to check the operation.";
+        showFloatingSave({ ...frame, substep: frame.note, steps });
       },
       onProgress: renderOperationProgress,
       onSuccess: async (payload) => {
@@ -2006,7 +1954,7 @@
 
 
   const clearBanners = ({ successOnly = false } = {}) => {
-    document.querySelectorAll(".banner").forEach((banner) => {
+    document.querySelectorAll(".banner:not([data-startup-warning])").forEach((banner) => {
       if (successOnly && !banner.classList.contains("success")) return;
       banner.remove();
     });
@@ -2097,7 +2045,7 @@
     clearBanners();
     const tabbar = document.querySelector(".tabbar");
     if (!tabbar || !tabbar.parentNode) return;
-    const nextBanners = Array.from(nextDocument.querySelectorAll(".banner")).filter(
+    const nextBanners = Array.from(nextDocument.querySelectorAll(".banner:not([data-startup-warning])")).filter(
       (banner) => !banner.classList.contains("success"),
     );
     if (!nextBanners.length) return;
@@ -2125,6 +2073,7 @@
       bindInputUpdateForms(nextInputsPanel);
       bindOutputAttachForms(nextInputsPanel);
       bindToggleSwitches(nextInputsPanel);
+      window.CNCCloudflare?.bind(nextInputsPanel);
     }
     if (nextOutputsPanel) {
       bindEditorToggles(nextOutputsPanel);
@@ -2152,7 +2101,6 @@
       }
     };
     const selectLoadedPanel = (nextDocument) => {
-      replaceFromDocument(".site-header", nextDocument);
       syncBannersFromDocument(nextDocument);
       selectTab(targetName);
     };
@@ -2175,7 +2123,7 @@
       return;
     }
     const request = withRequestDeadline(async (signal) => {
-      const response = await fetch(`/?tab=${encodeURIComponent(targetName)}`, {
+      const response = await fetch(`/?tab=${encodeURIComponent(targetName)}&panel=1`, {
         signal,
         credentials: "same-origin",
         headers: { Accept: "text/html" },
@@ -2375,18 +2323,9 @@
   };
 
   const syncResourceSizeControls = (form) => {
-    const sizeSelect = form.querySelector("[data-resource-size-control]");
-    if (!sizeSelect) return;
     const kindSelect = form.querySelector("select[name='kind']");
     const selectedKind = kindSelect && ["static", "shield"].includes(kindSelect.value) ? kindSelect.value : "app";
-    const isCustom = sizeSelect.value === "custom";
-    form.querySelectorAll("[data-custom-resource-limit]").forEach((section) => {
-      const kindHidden = section.dataset.backendKindSection && section.dataset.backendKindSection !== selectedKind;
-      section.hidden = !isCustom || Boolean(kindHidden);
-      section.querySelectorAll("input, select, textarea").forEach((field) => {
-        field.disabled = !isCustom || section.hidden;
-      });
-    });
+    window.CNCUI.syncResourceSizeControls(form, selectedKind);
   };
 
   const bindBackendKindForms = (root = document) => {
@@ -2919,6 +2858,16 @@
     }
   };
 
+  let joinCountdownTimer = null;
+  let currentJoinCommand = "";
+  let latestClusterNodes = null;
+  const stopJoinCountdown = () => {
+    if (joinCountdownTimer !== null) {
+      window.clearInterval(joinCountdownTimer);
+      joinCountdownTimer = null;
+    }
+  };
+
   const bindNodeControls = (root = document) => {
     const addModal = document.getElementById("node-add-modal");
     const detailsModal = document.getElementById("node-details-modal");
@@ -2930,9 +2879,6 @@
     const installCopy = document.querySelector("[data-node-install-copy]");
     const joinStatus = document.querySelector("[data-node-join-status]");
     const joinCountdown = document.querySelector("[data-node-join-countdown] strong");
-    let joinCountdownTimer = null;
-    let currentJoinCommand = "";
-    let latestClusterNodes = null;
     const nodeFields = {
       name: document.querySelector("[data-node-details-name]"),
       summary: document.querySelector("[data-node-details-summary]"),
@@ -2947,12 +2893,6 @@
     };
     const removeButton = document.querySelector("[data-node-remove]");
     const removeNote = document.querySelector("[data-node-remove-note]");
-    const stopJoinCountdown = () => {
-      if (joinCountdownTimer !== null) {
-        window.clearInterval(joinCountdownTimer);
-        joinCountdownTimer = null;
-      }
-    };
     const startJoinCountdown = () => {
       stopJoinCountdown();
       let remainingSeconds = 15 * 60;
@@ -3183,6 +3123,7 @@
     bindAccessKeyResetModal(root);
     bindNodeControls(root);
     bindHostMetricControls(root);
+    window.CNCCloudflare?.bind(root);
     renderLocalTimes(root);
     renderRouteGraphs(root);
     initializeHostMetricsPanel();
@@ -3217,33 +3158,12 @@
     });
   });
 
-  document.querySelectorAll("[data-run-toggle]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const id = button.dataset.runToggle;
-      const detail = id ? document.getElementById(id) : null;
-      if (!detail) return;
-      const nextHidden = !detail.hidden;
-      detail.hidden = nextHidden;
-      button.setAttribute("aria-expanded", nextHidden ? "false" : "true");
-    });
-  });
-
-  document.querySelectorAll("[data-copy-target]").forEach((button) => {
-    button.addEventListener("click", async () => {
-      const id = button.dataset.copyTarget;
-      const detail = id ? document.getElementById(id) : null;
-      if (!detail || !navigator.clipboard) return;
-      const original = button.textContent;
-      try {
-        await navigator.clipboard.writeText(detail.textContent || "");
-        button.textContent = "Copied";
-      } catch (_error) {
-        button.textContent = "Failed";
-      }
-      window.setTimeout(() => {
-        button.textContent = original;
-      }, 1200);
-    });
+  document.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-run-toggle]");
+    const detail = button && document.getElementById(button.dataset.runToggle);
+    if (!detail) return;
+    detail.hidden = !detail.hidden;
+    button.setAttribute("aria-expanded", String(!detail.hidden));
   });
 
   let updateCheckForm = null;
@@ -3408,10 +3328,11 @@
     }
   };
   document.querySelectorAll(".banner.error").forEach(enhanceErrorBanner);
-  document.querySelectorAll("[data-support-bundle-button]").forEach((button) => {
-    button.addEventListener("click", () => {
+  document.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-support-bundle-button]");
+    if (button) {
       downloadBundle("/api/support/bundle.zip", "cnc-support.zip", button);
-    });
+    }
   });
 
     const setUpdatePending = (pending) => {
@@ -3853,6 +3774,7 @@
     scheduleServerLoadPoll();
   });
   window.addEventListener("pagehide", () => {
+    stopJoinCountdown();
     hostMetricsAbortController?.abort();
   });
 })();

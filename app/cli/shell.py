@@ -97,12 +97,6 @@ def run_shell(container: str) -> int:
     return int(completed.returncode)
 
 
-def normalize_exec_args(command_args: list[str]) -> list[str]:
-    if command_args and command_args[0] == "--":
-        return command_args[1:]
-    return command_args
-
-
 def exec_command(container: str, command_args: list[str]) -> list[str]:
     command = ["podman", "exec"]
     if sys.stdin.isatty():

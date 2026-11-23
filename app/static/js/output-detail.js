@@ -21,14 +21,7 @@
 
   const syncResourceSizeControls = (root = document) => {
     root.querySelectorAll("[data-resource-size-control]").forEach((select) => {
-      const form = select.closest("form") || document;
-      const isCustom = select.value === "custom";
-      form.querySelectorAll("[data-custom-resource-limit]").forEach((section) => {
-        section.hidden = !isCustom;
-        section.querySelectorAll("input, select, textarea").forEach((field) => {
-          field.disabled = !isCustom;
-        });
-      });
+      window.CNCUI.syncResourceSizeControls(select.closest("form") || document);
     });
   };
 
@@ -879,8 +872,6 @@
     window.CNCOutputSettings?.render(form, { kind, step });
   };
 
-  const stopOutputSaveProgress = () => {};
-
   const showShieldCodeError = (message) => {
     renderFlashBanner("error", message);
     const copy = shieldCodeErrorModal?.querySelector("[data-shield-error-copy]");
@@ -928,17 +919,8 @@
 
 
   const refreshCsrfTokens = async () => {
-    const response = await fetch("/api/csrf", {
-      credentials: "same-origin",
-      headers: { Accept: "application/json" },
-    });
-    const { payload } = await readResponsePayload(response);
-    const token = String(payload.csrf_token || "").trim();
-    if (!response.ok || !token) return "";
-    document.querySelectorAll("input[name='csrf_token']").forEach((input) => {
-      input.value = token;
-    });
-    csrfToken = token;
+    const token = await window.CNCUI.refreshCsrfTokens();
+    if (token) csrfToken = token;
     return token;
   };
 
@@ -958,7 +940,7 @@
   const shouldAppendBackupNarrative = (message) => {
     const text = String(message || "").trim();
     if (!text) return false;
-    return !/^Exporting path .+: .* of .*\\.$/.test(text);
+    return !/^Exporting path .+: .* of .*\.$/.test(text);
   };
 
   const appendBackupNarrative = (message) => {
@@ -1259,7 +1241,6 @@
         refreshRuntimeSignals().catch(() => {});
       }
     } catch (error) {
-      stopOutputSaveProgress();
       renderInlineOutputSaveProgress(form, {
         kind: "error",
         title: "Save failed",
@@ -2360,6 +2341,8 @@
   });
   window.addEventListener("pagehide", () => {
     if (runtimeRefreshTimer !== null) window.clearTimeout(runtimeRefreshTimer);
+    if (hardeningPollTimer !== null) window.clearTimeout(hardeningPollTimer);
+    closeHardeningPhase2Events();
     runtimeRefreshAbortController?.abort();
     metricsAbortController?.abort();
   });
@@ -2489,10 +2472,6 @@
     frame?.classList.toggle("is-loading", isLoading);
     frame?.toggleAttribute("aria-busy", isLoading);
   };
-
-  const waitForMetricsLoadingPaint = () => new Promise((resolve) => {
-    window.requestAnimationFrame(() => window.requestAnimationFrame(resolve));
-  });
 
   const renderMetricsSummary = (payload) => {
     if (!metricsSummary) return;
@@ -2950,9 +2929,6 @@
     metricsEmpty.hidden = true;
     setMetricsLoading(!refreshing);
     try {
-      await ensureMetricChartAssets();
-      if (controller.signal.aborted || requestId !== metricsRequestId) return;
-      if (!refreshing) await waitForMetricsLoadingPaint();
       const chartWidth = Math.round(
         metricsChart.parentElement?.clientWidth || metricsChart.clientWidth || 720
       );
@@ -2961,18 +2937,24 @@
         timeframe: timeframeSelect.value,
         width: String(chartWidth),
       });
-      const response = await fetch(`/api/backends/${backendId}/metrics-history?${query.toString()}`, {
+      const history = fetch(`/api/backends/${backendId}/metrics-history?${query.toString()}`, {
         headers: { Accept: "application/json" },
         signal: controller.signal,
+      }).then((response) => {
+        if (!response.ok) throw new Error(`metric history request failed: ${response.status}`);
+        return response.json();
       });
-      if (!response.ok) throw new Error(`metric history request failed: ${response.status}`);
-      const payload = await response.json();
-      if (requestId !== metricsRequestId) return;
+      const chartAssets = ensureMetricChartAssets().then(() => {
+        if (!controller.signal.aborted && !refreshing) hydrateOutputMetrics();
+      });
+      const [payload] = await Promise.all([history, chartAssets]);
+      if (controller.signal.aborted || requestId !== metricsRequestId) return;
       writeCachedMetricPayload(payload);
       if (requestId !== metricsRequestId) return;
       renderMetricsChart(payload);
     } catch (error) {
       if (error?.name === "AbortError") return;
+      controller.abort();
       if (requestId === metricsRequestId) showMetricHistoryError();
     } finally {
       if (metricsAbortController === controller) metricsAbortController = null;
@@ -2980,28 +2962,9 @@
   };
 
   if (outputHasMetrics() && metricSelect && timeframeSelect && metricsChart) {
-    const refreshOutputMetrics = () => {
-      hydrateOutputMetrics();
-      loadMetricHistory();
-    };
-    const initializeOutputMetrics = async () => {
-      metricSelect.addEventListener("change", () => {
-        refreshOutputMetrics();
-      });
-      timeframeSelect.addEventListener("change", () => {
-        refreshOutputMetrics();
-      });
-
-      try {
-        await ensureMetricChartAssets();
-      } catch {
-        showMetricHistoryError();
-        return;
-      }
-      hydrateOutputMetrics();
-      afterInitialLoad(() => loadMetricHistory());
-    };
-    initializeOutputMetrics();
+    metricSelect.addEventListener("change", loadMetricHistory);
+    timeframeSelect.addEventListener("change", loadMetricHistory);
+    loadMetricHistory();
   }
   bindHardening();
 

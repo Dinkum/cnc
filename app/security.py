@@ -70,11 +70,6 @@ def _is_tailscale_client_host(host: str | None) -> bool:
     return ip in _TAILSCALE_IPV4 or ip in _TAILSCALE_IPV6
 
 
-def _is_tailscale_dns_host(host: str | None) -> bool:
-    normalized = _normalize_host(host)
-    return bool(normalized and normalized.endswith(".ts.net"))
-
-
 def parse_host_port(value: str | None) -> tuple[str | None, int | None]:
     if not value:
         return None, None

@@ -5,17 +5,14 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
-from app.services.hardening_policy import read_hardening_policy
 from app.config import Settings
-from app.services import nginx_runtime
-from app.services.change_scope import Scope, ToolScope
-from app.services.cloudflare_connection import section
-from app.services.cloudflare_tunnel import TUNNEL_METRICS_PORT, TUNNEL_ORIGIN_PORT
+from app.database import create_configured_async_engine
 from app.logger import get_logger
 from app.models.entities import Backend, ClusterNode, Input
+from app.services import nginx_runtime
 from app.services.app_containers import runtime_spec
 from app.services.app_healthchecks import display_backend_healthcheck_mode
 from app.services.apply_core import (
@@ -23,7 +20,14 @@ from app.services.apply_core import (
     DesiredState,
     RuntimeAppBackend,
     RuntimeGraph,
+    desired_state_snapshot,
+    desired_state_snapshot_hash,
+    desired_state_snapshot_json,
 )
+from app.services.change_scope import Scope, ToolScope
+from app.services.cloudflare_connection import section
+from app.services.cloudflare_tunnel import TUNNEL_METRICS_PORT, TUNNEL_ORIGIN_PORT
+from app.services.hardening_policy import read_hardening_policy
 from app.services.cluster_topology import leader_tailnet_ip
 from app.services.inter_app_interfaces import (
     RuntimeInterAppInterface,
@@ -62,6 +66,7 @@ from app.services.renderers import (
 from app.services.resource_profile import build_resource_profile
 from app.services.tailscale_urls import tailscale_service_url
 from app.services.tailscale_admin import current_tailscale_admin_hostnames
+from app.services.thread_workers import BoundedThreadWorker
 from app.services.validators import (
     ValidationError,
     validate_backend_collection,
@@ -70,6 +75,7 @@ from app.services.validators import (
 
 
 logger = get_logger("apply")
+_static_hash_workers = BoundedThreadWorker(2)
 
 
 def _tailnet_service_route_label(input_value: str, settings: Settings) -> str:
@@ -171,7 +177,7 @@ async def _validate_remote_placement_readiness(
     failures: list[dict[str, str]] = []
     backend_node_uids: dict[int, tuple[str, ...]] = {}
     for backend in backends:
-        if backend.kind != "app" or not backend.enabled:
+        if backend.kind != "app" or not backend.enabled or backend.id is None:
             continue
         backend_node_uids[int(backend.id)] = tuple(
             node_uid
@@ -179,14 +185,16 @@ async def _validate_remote_placement_readiness(
                 backend, multi_node_enabled=settings.multi_node_enabled
             )
         )
+    if not backend_node_uids:
+        return
     statuses_by_backend = await backend_replica_readiness_status_map(
         session,
         settings,
-        backends=backends,
+        backends=[b for b in backends if b.id is not None],
         backend_node_uids=backend_node_uids,
     )
     for backend in backends:
-        if backend.kind != "app" or not backend.enabled:
+        if backend.kind != "app" or not backend.enabled or backend.id is None:
             continue
         node_uids = backend_node_uids.get(int(backend.id), ())
         statuses = statuses_by_backend.get(int(backend.id), {})
@@ -338,14 +346,14 @@ def _static_replica_root(backend: Backend) -> str:
     return f"/var/lib/cnc/static-replicas/{safe_slug(backend.name)}"
 
 
-def _hash_static_root(static_root: str, *, backend: Backend, hostname: str) -> str:
+def _hash_static_root(static_root: str, *, backend_name: str, hostname: str) -> str:
     root = Path(static_root)
     if not root.exists() or not root.is_dir():
         raise ApplyFailed(
-            f"static backend {backend.name} root does not exist: {static_root}",
+            f"static backend {backend_name} root does not exist: {static_root}",
             phase="render_cluster_followers",
             details={
-                "backend": backend.name,
+                "backend": backend_name,
                 "hostname": hostname,
                 "static_root": static_root,
             },
@@ -361,7 +369,9 @@ def _hash_static_root(static_root: str, *, backend: Backend, hostname: str) -> s
             digest.update(b"symlink:")
             digest.update(path.readlink().as_posix().encode("utf-8"))
         else:
-            digest.update(path.read_bytes())
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
         digest.update(b"\0")
     return digest.hexdigest()
 
@@ -664,7 +674,7 @@ def _runtime_graph(
     )
 
 
-def _build_cluster_follower_ingress(
+async def _build_cluster_follower_ingress(
     *,
     settings: Settings,
     cluster_nodes: list[ClusterNode],
@@ -791,8 +801,11 @@ def _build_cluster_follower_ingress(
                 )
                 root = Path(static_root)
                 if root not in static_hashes:
-                    static_hashes[root] = _hash_static_root(
-                        static_root, backend=primary_backend, hostname=hostname
+                    static_hashes[root] = await _static_hash_workers.run(
+                        _hash_static_root,
+                        static_root,
+                        backend_name=primary_backend.name,
+                        hostname=hostname,
                     )
                 replica_root = _static_replica_root(primary_backend)
                 static_replicas[primary_backend.name] = {
@@ -830,34 +843,134 @@ def _build_cluster_follower_ingress(
     )
 
 
+class _FilteredRelationProxy:
+    def __init__(self, target, attr_name: str, filtered: list) -> None:
+        self._target = target
+        self._attr_name = attr_name
+        self._filtered = filtered
+
+    def __getattr__(self, name: str):
+        if name == self._attr_name:
+            return self._filtered
+        return getattr(self._target, name)
+
+
+async def _load_graph_in_memory(
+    session: AsyncSession,
+) -> tuple[list[Backend], list[Input], list[ClusterNode]]:
+    """Read committed rows and overlay pending session edits without flushing SQLite."""
+    deleted = set(getattr(session, "deleted", ()))
+    new_objects = tuple(getattr(session, "new", ()))
+    with session.no_autoflush:
+        db_backends = list(
+            (await session.execute(select(Backend).options(selectinload(Backend.inputs))))
+            .scalars()
+            .unique()
+            .all()
+        )
+        db_inputs = list(
+            (
+                await session.execute(
+                    select(Input)
+                    .options(selectinload(Input.backends))
+                    .order_by(Input.id.asc())
+                )
+            )
+            .scalars()
+            .unique()
+            .all()
+        )
+        db_nodes = list(
+            (
+                await session.execute(
+                    select(ClusterNode).where(ClusterNode.removed_at.is_(None))
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    backends = [backend for backend in db_backends if backend not in deleted]
+    seen_backends = set(backends)
+    for obj in new_objects:
+        if isinstance(obj, Backend) and obj not in seen_backends and obj not in deleted:
+            backends.append(obj)
+            seen_backends.add(obj)
+
+    inputs = [item for item in db_inputs if item not in deleted]
+    seen_inputs = set(inputs)
+    for obj in new_objects:
+        if isinstance(obj, Input) and obj not in seen_inputs and obj not in deleted:
+            inputs.append(obj)
+            seen_inputs.add(obj)
+
+    if deleted:
+        inputs = [
+            _FilteredRelationProxy(
+                item,
+                "backends",
+                [backend for backend in item.backends if backend not in deleted],
+            )
+            if any(backend in deleted for backend in item.backends)
+            else item
+            for item in inputs
+        ]
+        backends = [
+            _FilteredRelationProxy(
+                backend,
+                "inputs",
+                [item for item in backend.inputs if item not in deleted],
+            )
+            if any(item in deleted for item in backend.inputs)
+            else backend
+            for backend in backends
+        ]
+
+    cluster_nodes = [node for node in db_nodes if node not in deleted]
+    seen_nodes = set(cluster_nodes)
+    for obj in new_objects:
+        if (
+            isinstance(obj, ClusterNode)
+            and obj not in seen_nodes
+            and obj not in deleted
+            and getattr(obj, "removed_at", None) is None
+        ):
+            cluster_nodes.append(obj)
+            seen_nodes.add(obj)
+    return backends, inputs, cluster_nodes
+
+
+async def committed_desired_state_and_hash(
+    session: AsyncSession,
+    settings: Settings,
+    *,
+    scope: Scope = Scope.everything(),
+) -> tuple[DesiredState, str]:
+    """Read only committed DB state on an independent read session and return (DesiredState, hash)."""
+    raw_session = getattr(session, "_session", session)
+    bind = getattr(raw_session, "bind", None)
+    temp_engine = None
+    if bind is None:
+        temp_engine = create_configured_async_engine(settings.database_url, future=True)
+        maker = async_sessionmaker(temp_engine, expire_on_commit=False, class_=AsyncSession)
+    else:
+        maker = async_sessionmaker(bind=bind, expire_on_commit=False, class_=AsyncSession)
+    try:
+        async with maker() as read_session:
+            desired = await build_desired_state(read_session, settings, scope=scope)
+            state_hash = desired_state_snapshot_hash(
+                desired_state_snapshot_json(desired_state_snapshot(desired))
+            )
+            return desired, state_hash
+    finally:
+        if temp_engine is not None:
+            await temp_engine.dispose()
+
+
 async def build_desired_state(
     session: AsyncSession, settings: Settings, *, scope: Scope = Scope.everything()
 ) -> DesiredState:
-    backends = (
-        (await session.execute(select(Backend).options(selectinload(Backend.inputs))))
-        .scalars()
-        .all()
-    )
-    inputs = (
-        (
-            await session.execute(
-                select(Input)
-                .options(selectinload(Input.backends))
-                .order_by(Input.id.asc())
-            )
-        )
-        .scalars()
-        .all()
-    )
-    cluster_nodes = (
-        (
-            await session.execute(
-                select(ClusterNode).where(ClusterNode.removed_at.is_(None))
-            )
-        )
-        .scalars()
-        .all()
-    )
+    backends, inputs, cluster_nodes = await _load_graph_in_memory(session)
     nodes_by_uid = _cluster_node_map(list(cluster_nodes))
     active_cluster_nodes = (
         _active_cluster_nodes(list(cluster_nodes))
@@ -917,7 +1030,6 @@ async def build_desired_state(
         )
 
     runtime_backends = [backend for backend in backends if backend.kind == "app"]
-    ports_before_allocation = {backend.id: backend.port for backend in runtime_backends}
 
     try:
         allocate_ports(
@@ -933,12 +1045,6 @@ async def build_desired_state(
     except PortAllocationError as exc:
         raise ApplyFailed(str(exc), phase="allocate_ports") from exc
 
-    if any(
-        backend.port != ports_before_allocation.get(backend.id)
-        for backend in runtime_backends
-    ):
-        await session.flush()
-
     try:
         validated_bindings = validate_input_bindings(inputs)
     except ValidationError as exc:
@@ -948,7 +1054,7 @@ async def build_desired_state(
     hostname_to_input: dict[str, Input] = {}
     tailscale_path_to_backends: dict[str, list[Backend]] = {}
     tailscale_service_to_backends: dict[str, list[Backend]] = {}
-    published_backend_ids: set[int] = set()
+    published_backend_names: set[str] = set()
     for binding in validated_bindings:
         public = binding.input_kind in {"domain", "shield"}
         if public and ToolScope.NGINX not in scope.tools:
@@ -956,7 +1062,7 @@ async def build_desired_state(
         if not public and ToolScope.TAILSCALE not in scope.tools:
             continue
         for backend in binding.attached_enabled_backends:
-            published_backend_ids.add(backend.id)
+            published_backend_names.add(backend.name)
             if backend.kind == "app" and backend.port is None:
                 raise ApplyFailed(
                     f"Output {backend.name} needs a host port before publishing a route. Run host reconcile.",
@@ -995,7 +1101,7 @@ async def build_desired_state(
                 b
                 for b in backends
                 if scope.is_full
-                or b.id in published_backend_ids
+                or b.name in published_backend_names
                 or (runtime_selected and scope.covers(b.name))
             ],
         )
@@ -1145,7 +1251,7 @@ async def build_desired_state(
         cluster_node_app_nginx_files,
         cluster_node_admin_nginx_files,
         static_replicas,
-    ) = _build_cluster_follower_ingress(
+    ) = await _build_cluster_follower_ingress(
         settings=settings,
         cluster_nodes=list(cluster_nodes) if ToolScope.CLUSTER in scope.tools else [],
         hostname_to_backends=hostname_to_backends,
